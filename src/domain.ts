@@ -57,6 +57,13 @@ export const LIMITS = {
    * leaves roughly 600KB of the ceiling spare for members and future fields.
    */
   groupBytes: 1_600_000,
+  /**
+   * The stop line for anything else appended to the stored value. Quotes stop
+   * at `groupBytes` so the remaining headroom stays free for members; this cap
+   * is what keeps members themselves from walking the group into the ~2.2MB
+   * Durable Object ceiling, where every later write would fail for good.
+   */
+  groupBytesHardCap: 1_900_000,
   groupsPerUser: 50,
 } as const;
 
@@ -66,9 +73,21 @@ export const LIMITS = {
  */
 export const groupByteSize = (group: GroupState): number => new TextEncoder().encode(JSON.stringify(group)).length;
 
-/** Whether keeping `quote` would push the group past the storage budget. */
+const sizeWith = (group: GroupState, addition: Quote | Member): number =>
+  groupByteSize(group) + new TextEncoder().encode(JSON.stringify(addition)).length + 1;
+
+/** Whether keeping `quote` would push the group past the quote budget. */
 export const exceedsGroupBudget = (group: GroupState, quote: Quote): boolean =>
-  groupByteSize(group) + new TextEncoder().encode(JSON.stringify(quote)).length + 1 > LIMITS.groupBytes;
+  sizeWith(group, quote) > LIMITS.groupBytes;
+
+/**
+ * Whether adding `member` would push the group past the hard cap. Deliberately
+ * a looser line than `exceedsGroupBudget`: a group whose quotes have filled
+ * their budget must still be able to take on members, or filling it would brick
+ * the group in a different way.
+ */
+export const exceedsGroupHardCap = (group: GroupState, member: Member): boolean =>
+  sizeWith(group, member) > LIMITS.groupBytesHardCap;
 
 export const getRevealAtIso = (revealYear: number): string =>
   new Date(Date.UTC(revealYear + 1, 0, 1, 0, 0, 0)).toISOString();

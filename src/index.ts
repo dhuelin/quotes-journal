@@ -528,6 +528,11 @@ const forwardWrite = async (c: Context<AppEnv>, path: string): Promise<Response>
 };
 
 app.post('/api/groups/:groupId/members', (c) => forwardWrite(c, '/members'));
+// Owner-only member management. Claiming binds a guest row to someone who has
+// joined, which is the safe replacement for the display-name auto-claim.
+app.post('/api/groups/:groupId/members/claim', (c) => forwardWrite(c, '/members/claim'));
+app.post('/api/groups/:groupId/members/rename', (c) => forwardWrite(c, '/members/rename'));
+app.post('/api/groups/:groupId/members/remove', (c) => forwardWrite(c, '/members/remove'));
 app.post('/api/groups/:groupId/quotes', (c) => forwardWrite(c, '/quotes'));
 
 app.get('/api/groups/:groupId/invite', async (c) => {
@@ -598,6 +603,9 @@ app.post('/api/invites/accept', async (c) => {
 
   const response = await callGroupStore(c.env, invite.groupId, '/join', user, 'POST', {
     inviteVersion: invite.version,
+    // Optional: how the joiner wants to be known in *this* group, used when
+    // their account's display name is already taken here.
+    memberName: body.value.memberName,
   });
 
   if (!response.ok) {

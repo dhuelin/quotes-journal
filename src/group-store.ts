@@ -1,6 +1,7 @@
 import {
   areQuotesVisible,
   exceedsGroupBudget,
+  exceedsGroupHardCap,
   buildProgress,
   buildQuiz,
   buildStats,
@@ -102,7 +103,27 @@ export class GroupStore {
     }
 
     if (url.pathname === '/members' && request.method === 'POST') {
-      return this.addGuestMember(request, group);
+      return member.role === 'owner'
+        ? this.addGuestMember(request, group)
+        : jsonResponse({ error: 'Only the group owner can add members' }, 403);
+    }
+
+    if (url.pathname === '/members/claim' && request.method === 'POST') {
+      return member.role === 'owner'
+        ? this.claimGuest(request, group, member)
+        : jsonResponse({ error: 'Only the group owner can confirm who someone is' }, 403);
+    }
+
+    if (url.pathname === '/members/rename' && request.method === 'POST') {
+      return member.role === 'owner'
+        ? this.renameMember(request, group, member)
+        : jsonResponse({ error: 'Only the group owner can rename a member' }, 403);
+    }
+
+    if (url.pathname === '/members/remove' && request.method === 'POST') {
+      return member.role === 'owner'
+        ? this.removeMember(request, group, member)
+        : jsonResponse({ error: 'Only the group owner can remove a member' }, 403);
     }
 
     if (url.pathname === '/quotes' && request.method === 'POST') {
@@ -198,18 +219,41 @@ export class GroupStore {
 
     // Joining never adopts an existing member row. Matching on the display name
     // would let anyone holding the invite code register under a guest's name and
-    // inherit that guest's quotes, counts and quiz answers.
-    if (hasMemberNamed(group, caller.displayName)) {
-      return jsonResponse({ error: 'That name is already taken in this group' }, 409);
+    // inherit that guest's quotes, counts and quiz answers. The owner binds a
+    // guest slot to an account instead, via /members/claim.
+    //
+    // A joiner whose name is taken picks a different one for this group rather
+    // than being turned away, so a squatted name is an inconvenience and not a
+    // locked door.
+    const requested = body.value.memberName === undefined
+      ? { ok: true as const, value: caller.displayName }
+      : validateText(body.value.memberName, 'Name', LIMITS.memberName);
+
+    if (!requested.ok) {
+      return jsonResponse({ error: requested.error }, 400);
+    }
+
+    if (hasMemberNamed(group, requested.value)) {
+      return jsonResponse(
+        {
+          error: 'Someone in this group already goes by that name. Pick another to join with.',
+          nameTaken: true,
+        },
+        409,
+      );
     }
 
     const member: Member = {
       id: crypto.randomUUID(),
-      name: caller.displayName,
+      name: requested.value,
       userId: caller.userId,
       role: 'member',
       joinedAt: new Date().toISOString(),
     };
+
+    if (exceedsGroupHardCap(group, member)) {
+      return jsonResponse({ error: 'This group has run out of room' }, 409);
+    }
 
     group.members.push(member);
     await this.ctx.storage.put('group', group);
@@ -243,9 +287,144 @@ export class GroupStore {
       joinedAt: new Date().toISOString(),
     };
 
+    if (exceedsGroupHardCap(group, member)) {
+      return jsonResponse({ error: 'This group has run out of room' }, 409);
+    }
+
     group.members.push(member);
     await this.ctx.storage.put('group', group);
     return jsonResponse({ member: { id: member.id, name: member.name } }, 201);
+  }
+
+  /**
+   * Binds a guest row to an account that has already joined, on the owner's say-so.
+   *
+   * This is the safe half of the auto-claim that used to happen on a display
+   * name match: the same outcome, but a human who knows who Bob really is
+   * decides, rather than whoever holds the invite link. The guest row survives
+   * so every quote already recorded about them keeps pointing at it; the
+   * joiner's own row is folded in and its quote references re-pointed.
+   */
+  private async claimGuest(request: Request, group: GroupState, owner: Member): Promise<Response> {
+    const body = await readJsonBody(request);
+    if (!body.ok) {
+      return jsonResponse({ error: body.error }, 400);
+    }
+
+    const { guestMemberId, memberId } = body.value;
+    if (typeof guestMemberId !== 'string' || typeof memberId !== 'string') {
+      return jsonResponse({ error: 'Invalid claim payload' }, 400);
+    }
+
+    const guest = group.members.find((entry) => entry.id === guestMemberId);
+    const joined = group.members.find((entry) => entry.id === memberId);
+
+    if (!guest || !joined) {
+      return jsonResponse({ error: 'That member is not part of this group' }, 404);
+    }
+
+    if (guest.userId !== null) {
+      return jsonResponse({ error: 'That member has already been claimed' }, 409);
+    }
+
+    if (joined.userId === null) {
+      return jsonResponse({ error: 'Only someone who has joined can claim a guest' }, 400);
+    }
+
+    if (guest.id === joined.id) {
+      return jsonResponse({ error: 'A member cannot claim themselves' }, 400);
+    }
+
+    if (joined.role === 'owner') {
+      return jsonResponse({ error: 'The group owner cannot be folded into a guest' }, 409);
+    }
+
+    guest.userId = joined.userId;
+    guest.joinedAt = joined.joinedAt;
+    group.members = group.members.filter((entry) => entry.id !== joined.id);
+
+    for (const quote of group.quotes) {
+      if (quote.saidByMemberId === joined.id) {
+        quote.saidByMemberId = guest.id;
+      }
+      if (quote.recordedByMemberId === joined.id) {
+        quote.recordedByMemberId = guest.id;
+      }
+      quote.involvedMemberIds = [
+        ...new Set(quote.involvedMemberIds.map((id) => (id === joined.id ? guest.id : id))),
+      ];
+    }
+
+    await this.ctx.storage.put('group', group);
+    return jsonResponse({ group: this.overview(group, owner) });
+  }
+
+  /** Owner-only, so a squatted or misspelled name can be corrected in place. */
+  private async renameMember(request: Request, group: GroupState, owner: Member): Promise<Response> {
+    const body = await readJsonBody(request);
+    if (!body.ok) {
+      return jsonResponse({ error: body.error }, 400);
+    }
+
+    const name = validateText(body.value.name, 'Member name', LIMITS.memberName);
+    if (!name.ok) {
+      return jsonResponse({ error: name.error }, 400);
+    }
+
+    const target = group.members.find((entry) => entry.id === body.value.memberId);
+    if (!target) {
+      return jsonResponse({ error: 'That member is not part of this group' }, 404);
+    }
+
+    const collides = group.members.some(
+      (entry) => entry.id !== target.id && entry.name.toLowerCase() === name.value.toLowerCase(),
+    );
+    if (collides) {
+      return jsonResponse({ error: 'Someone in this group already goes by that name' }, 409);
+    }
+
+    target.name = name.value;
+    await this.ctx.storage.put('group', group);
+    return jsonResponse({ group: this.overview(group, owner) });
+  }
+
+  /**
+   * Owner-only. Refused once the member appears in a quote: dropping the row
+   * would leave quotes pointing at nobody, and silently deleting someone's
+   * quotes is never the intent. Renaming covers that case instead.
+   */
+  private async removeMember(request: Request, group: GroupState, owner: Member): Promise<Response> {
+    const body = await readJsonBody(request);
+    if (!body.ok) {
+      return jsonResponse({ error: body.error }, 400);
+    }
+
+    const target = group.members.find((entry) => entry.id === body.value.memberId);
+    if (!target) {
+      return jsonResponse({ error: 'That member is not part of this group' }, 404);
+    }
+
+    if (target.role === 'owner') {
+      return jsonResponse({ error: 'The group owner cannot be removed' }, 409);
+    }
+
+    const appearsInAQuote = group.quotes.some(
+      (quote) =>
+        quote.saidByMemberId === target.id ||
+        quote.recordedByMemberId === target.id ||
+        quote.involvedMemberIds.includes(target.id),
+    );
+
+    if (appearsInAQuote) {
+      return jsonResponse(
+        { error: 'This member appears in a quote already. Rename them instead of removing them.' },
+        409,
+      );
+    }
+
+    group.members = group.members.filter((entry) => entry.id !== target.id);
+    await this.ctx.storage.put('group', group);
+    return jsonResponse({ group: this.overview(group, owner) });
   }
 
   private async addQuote(request: Request, group: GroupState, author: Member): Promise<Response> {

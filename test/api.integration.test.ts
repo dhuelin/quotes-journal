@@ -559,7 +559,8 @@ describe('guest slots cannot be claimed by joining (H1)', () => {
     });
 
     expect(joined.status).toBe(409);
-    expect(joined.body.error).toContain('already taken');
+    expect(joined.body.error).toContain('already goes by that name');
+    expect(joined.body.nameTaken).toBe(true);
 
     const after = await request(`/api/groups/${group.id}`, { token: alice.token });
     const stillGuest = after.body.group.members.find((member: { name: string }) => member.name === 'Bob');
@@ -610,7 +611,7 @@ describe('duplicate display names (M3)', () => {
 
     expect(accepted.status).toBe(201);
     expect(duplicate.status).toBe(409);
-    expect(duplicate.body.error).toContain('already taken');
+    expect(duplicate.body.error).toContain('already goes by that name');
     expect(accepted.body.group.members).toHaveLength(2);
   });
 });
@@ -815,6 +816,211 @@ describe('password hash upgrades (M1)', () => {
 
     expect(login.status).toBe(200);
     expect(await storedHash(user)).toBe(before);
+  });
+});
+
+describe('owner-approved guest claims (S2)', () => {
+  /** Owner with a guest row, plus a second account that has joined the group. */
+  const groupWithGuestAndJoiner = async () => {
+    const owner = await registerUser('Owner');
+    const joiner = await registerUser('Joiner');
+    const group = await createGroup(owner, 'Claimable', nextYear);
+
+    const guest = await request(`/api/groups/${group.id}/members`, {
+      method: 'POST',
+      token: owner.token,
+      body: { name: 'Bob' },
+    });
+    expect(guest.status).toBe(201);
+
+    const inviteCode = await inviteCodeFor(owner, group.id);
+    const joined = await request('/api/invites/accept', {
+      method: 'POST',
+      token: joiner.token,
+      body: { inviteCode, memberName: 'Bob (new)' },
+    });
+    expect(joined.status).toBe(201);
+
+    return { owner, joiner, group, guestMemberId: guest.body.member.id as string, joined };
+  };
+
+  it('lets a joiner past a taken name by choosing another one', async () => {
+    const owner = await registerUser('Owner');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(owner, 'Name clash', nextYear);
+
+    await request(`/api/groups/${group.id}/members`, {
+      method: 'POST',
+      token: owner.token,
+      body: { name: 'Bob' },
+    });
+    const inviteCode = await inviteCodeFor(owner, group.id);
+
+    // The bare join collides, and says so in a way the client can act on.
+    const collision = await request('/api/invites/accept', {
+      method: 'POST',
+      token: bob.token,
+      body: { inviteCode },
+    });
+    expect(collision.status).toBe(409);
+    expect(collision.body.nameTaken).toBe(true);
+
+    // Naming himself differently for this group gets him in.
+    const retry = await request('/api/invites/accept', {
+      method: 'POST',
+      token: bob.token,
+      body: { inviteCode, memberName: 'Bob B' },
+    });
+    expect(retry.status).toBe(201);
+    expect(retry.body.group.you.name).toBe('Bob B');
+  });
+
+  it('folds a joined account into the guest row, carrying its quotes across', async () => {
+    const { owner, joiner, group, guestMemberId, joined } = await groupWithGuestAndJoiner();
+    const joinerMemberId = joined.body.group.you.memberId as string;
+
+    // A quote said by the guest and one recorded by the joiner's own row.
+    await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: owner.token,
+      body: { text: 'Said before he signed up', saidByMemberId: guestMemberId },
+    });
+    await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: joiner.token,
+      body: { text: 'Recorded after he signed up', saidByMemberId: guestMemberId },
+    });
+
+    const claim = await request(`/api/groups/${group.id}/members/claim`, {
+      method: 'POST',
+      token: owner.token,
+      body: { guestMemberId, memberId: joinerMemberId },
+    });
+    expect(claim.status).toBe(200);
+
+    // One row survives, and it is the guest's.
+    const members = claim.body.group.members as Array<{ id: string; isGuest: boolean }>;
+    expect(members.map((entry) => entry.id)).toContain(guestMemberId);
+    expect(members.map((entry) => entry.id)).not.toContain(joinerMemberId);
+    expect(members.find((entry) => entry.id === guestMemberId)?.isGuest).toBe(false);
+
+    // The joiner now reaches the group through the guest's row.
+    const asJoiner = await request(`/api/groups/${group.id}`, { token: joiner.token });
+    expect(asJoiner.status).toBe(200);
+    expect(asJoiner.body.group.you.memberId).toBe(guestMemberId);
+
+    // Both quotes point at the surviving row, so nothing was orphaned.
+    await unlockGroup(group.id);
+    const stats = await request(`/api/groups/${group.id}/stats`, { token: owner.token });
+    expect(stats.body.saidBy[guestMemberId]).toBe(2);
+    expect(stats.body.persistedBy[guestMemberId]).toBe(1);
+  });
+
+  it('only lets the owner claim, rename or remove', async () => {
+    const { joiner, group, guestMemberId, joined } = await groupWithGuestAndJoiner();
+    const joinerMemberId = joined.body.group.you.memberId as string;
+
+    const attempts = [
+      ['/members/claim', { guestMemberId, memberId: joinerMemberId }],
+      ['/members/rename', { memberId: guestMemberId, name: 'Renamed' }],
+      ['/members/remove', { memberId: guestMemberId }],
+      ['/members', { name: 'Sneaky' }],
+    ] as const;
+
+    for (const [path, body] of attempts) {
+      const response = await request(`/api/groups/${group.id}${path}`, {
+        method: 'POST',
+        token: joiner.token,
+        body,
+      });
+      expect(response.status, path).toBe(403);
+    }
+  });
+
+  it('refuses to claim a row that already belongs to an account', async () => {
+    const { owner, group, guestMemberId, joined } = await groupWithGuestAndJoiner();
+    const joinerMemberId = joined.body.group.you.memberId as string;
+
+    await request(`/api/groups/${group.id}/members/claim`, {
+      method: 'POST',
+      token: owner.token,
+      body: { guestMemberId, memberId: joinerMemberId },
+    });
+
+    const again = await request(`/api/groups/${group.id}/members/claim`, {
+      method: 'POST',
+      token: owner.token,
+      body: { guestMemberId, memberId: joinerMemberId },
+    });
+
+    expect(again.status).toBe(404);
+  });
+
+  it('frees a squatted name by renaming or removing the squatter', async () => {
+    const owner = await registerUser('Owner');
+    const group = await createGroup(owner, 'Squatted', nextYear);
+
+    const squatter = await request(`/api/groups/${group.id}/members`, {
+      method: 'POST',
+      token: owner.token,
+      body: { name: 'Dave' },
+    });
+    const squatterId = squatter.body.member.id as string;
+
+    const renamed = await request(`/api/groups/${group.id}/members/rename`, {
+      method: 'POST',
+      token: owner.token,
+      body: { memberId: squatterId, name: 'Not Dave' },
+    });
+    expect(renamed.status).toBe(200);
+
+    const removed = await request(`/api/groups/${group.id}/members/remove`, {
+      method: 'POST',
+      token: owner.token,
+      body: { memberId: squatterId },
+    });
+    expect(removed.status).toBe(200);
+    expect(removed.body.group.members).toHaveLength(1);
+  });
+
+  it('refuses to remove a member who already appears in a quote', async () => {
+    const owner = await registerUser('Owner');
+    const group = await createGroup(owner, 'Quoted member', nextYear);
+
+    const guest = await request(`/api/groups/${group.id}/members`, {
+      method: 'POST',
+      token: owner.token,
+      body: { name: 'Quoted' },
+    });
+    const guestId = guest.body.member.id as string;
+
+    await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: owner.token,
+      body: { text: 'Something memorable', saidByMemberId: guestId },
+    });
+
+    const removed = await request(`/api/groups/${group.id}/members/remove`, {
+      method: 'POST',
+      token: owner.token,
+      body: { memberId: guestId },
+    });
+
+    expect(removed.status).toBe(409);
+    expect(removed.body.error).toContain('Rename them instead');
+  });
+
+  it('will not remove the owner', async () => {
+    const owner = await registerUser('Owner');
+    const group = await createGroup(owner, 'Self removal', nextYear);
+
+    const response = await request(`/api/groups/${group.id}/members/remove`, {
+      method: 'POST',
+      token: owner.token,
+      body: { memberId: group.you.memberId },
+    });
+
+    expect(response.status).toBe(409);
   });
 });
 
