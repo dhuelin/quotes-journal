@@ -19,12 +19,21 @@ A Cloudflare Worker app with web (`/`) and app-style (`/app`) interfaces to mana
 - Hono (routing)
 - Vitest + Cloudflare workers pool (unit and integration tests)
 - GitHub Actions + Wrangler deployment to Cloudflare
+- Docker support for local startup
+- PWA support for Android and iOS (installable mobile experience)
 
 ## Local development
 
 ```bash
 npm install
 npm run dev
+```
+
+## Run with Docker
+
+```bash
+docker build -t quotes-journal .
+docker run --rm -p 8787:8787 quotes-journal
 ```
 
 ## Test

@@ -10,6 +10,14 @@ describe('quotes journal API', () => {
     const app = await SELF.fetch('https://example.com/app');
     expect(app.status).toBe(200);
     expect(await app.text()).toContain('Quotes Journal (App Interface)');
+
+    const manifest = await SELF.fetch('https://example.com/manifest.webmanifest');
+    expect(manifest.status).toBe(200);
+    expect(await manifest.json()).toMatchObject({ start_url: '/app', display: 'standalone' });
+
+    const serviceWorker = await SELF.fetch('https://example.com/sw.js');
+    expect(serviceWorker.status).toBe(200);
+    expect(await serviceWorker.text()).toContain('self.addEventListener');
   });
 
   it('creates a group and enforces quote lock until year-end', async () => {

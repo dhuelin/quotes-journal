@@ -24,8 +24,41 @@ const proxyToGroup = (groupId: string, c: { env: Env['Bindings']; req: { raw: Re
   return stub.fetch(new Request(`https://group${path}`, c.req.raw));
 };
 
+const appManifest = {
+  name: 'Quotes Journal',
+  short_name: 'Quotes',
+  start_url: '/app',
+  display: 'standalone',
+  background_color: '#ffffff',
+  theme_color: '#111111',
+  icons: [
+    {
+      src: '/icon.svg',
+      type: 'image/svg+xml',
+      sizes: 'any',
+      purpose: 'any maskable',
+    },
+  ],
+};
+
+const serviceWorkerScript = `self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));`;
+
+const appIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Quotes Journal">
+  <rect width="256" height="256" fill="#111111"/>
+  <text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="#ffffff" font-size="112" font-family="Arial, sans-serif">“”</text>
+</svg>`;
+
 app.get('/', (c) => c.html(webHtml));
 app.get('/app', (c) => c.html(appHtml));
+app.get('/manifest.webmanifest', (c) => c.json(appManifest));
+app.get('/sw.js', (c) =>
+  c.body(serviceWorkerScript, 200, {
+    'content-type': 'application/javascript; charset=utf-8',
+    'cache-control': 'no-cache',
+  }),
+);
+app.get('/icon.svg', (c) => c.body(appIcon, 200, { 'content-type': 'image/svg+xml; charset=utf-8' }));
 
 app.post('/api/groups', async (c) => {
   const body = await c.req.json().catch(() => null);

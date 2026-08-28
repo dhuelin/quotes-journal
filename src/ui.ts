@@ -3,6 +3,11 @@ const createHtml = (title: string) => `<!doctype html>
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#111111" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
     <title>${title}</title>
     <style>
       body { font-family: sans-serif; max-width: 900px; margin: 1rem auto; padding: 0 1rem; }
@@ -67,6 +72,10 @@ const createHtml = (title: string) => `<!doctype html>
     <pre id="output">Ready</pre>
 
     <script>
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/sw.js').catch(() => {});
+      }
+
       const output = document.getElementById('output');
 
       async function callApi(method, path, payload) {
