@@ -2,13 +2,14 @@ import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { GroupStore } from './group-store';
 import { UserStore } from './user-store';
 import { RateLimiter, type RateLimitDecision } from './rate-limiter';
-import { appHtml } from './ui';
+import { renderAppHtml } from './ui';
 import { LIMITS } from './domain';
 import {
   createInviteCode,
   createSessionToken,
   hashPassword,
   readInviteCode,
+  resolvePbkdf2Iterations,
   verifySessionToken,
   type SessionUser,
 } from './auth';
@@ -23,7 +24,11 @@ export type Env = {
   /** Set with `wrangler secret put AUTH_SECRET`; locally via .dev.vars. */
   AUTH_SECRET?: string;
   RATE_LIMIT_AUTH?: string;
+  RATE_LIMIT_AUTH_ACCOUNT?: string;
   RATE_LIMIT_WRITE?: string;
+  RATE_LIMIT_READ?: string;
+  /** PBKDF2 rounds; see `DEFAULT_PBKDF2_ITERATIONS` for the free-plan trade-off. */
+  PBKDF2_ITERATIONS?: string;
 };
 
 type AppEnv = { Bindings: Env; Variables: { user: SessionUser } };
@@ -39,10 +44,16 @@ const jsonError = (message: string, status: number, extra: Record<string, unknow
 const requireSecret = (env: Env): string | null => env.AUTH_SECRET ?? null;
 
 /**
- * Behind Cloudflare, `cf-connecting-ip` is set by the edge and overwrites any
- * value the client sent, so it is safe to key rate limit buckets on.
+ * Behind the Cloudflare edge `cf-connecting-ip` is overwritten by the edge, but
+ * the Dockerfile also ships `wrangler dev` as a supported way to run this, and
+ * there the header is whatever the client sends. So this is a useful bucket key,
+ * not a trustworthy one: auth routes pair it with `accountKey` below, which no
+ * header can rotate.
  */
 const clientKey = (request: Request): string => request.headers.get('cf-connecting-ip') ?? 'unknown';
+
+/** Header-independent bucket key: the normalised address being signed in to. */
+const accountKey = (email: string): string => `auth:account:${email}`;
 
 const checkRateLimit = async (
   env: Env,
@@ -61,7 +72,18 @@ const numberFromEnv = (raw: string | undefined, fallback: number): number => {
 };
 
 const authLimit = (env: Env) => ({ limit: numberFromEnv(env.RATE_LIMIT_AUTH, 10), windowMs: 10 * 60 * 1000 });
+const accountAuthLimit = (env: Env) => ({
+  limit: numberFromEnv(env.RATE_LIMIT_AUTH_ACCOUNT, 5),
+  windowMs: 15 * 60 * 1000,
+});
 const writeLimit = (env: Env) => ({ limit: numberFromEnv(env.RATE_LIMIT_WRITE, 60), windowMs: 60 * 1000 });
+const readLimit = (env: Env) => ({ limit: numberFromEnv(env.RATE_LIMIT_READ, 120), windowMs: 60 * 1000 });
+
+/** Consumes the per-address auth bucket. Blocked looks the same as a blocked IP. */
+const checkAccountLimit = async (env: Env, email: string): Promise<RateLimitDecision> => {
+  const { limit, windowMs } = accountAuthLimit(env);
+  return checkRateLimit(env, accountKey(email), limit, windowMs);
+};
 
 const tooManyRequests = (decision: RateLimitDecision): Response =>
   new Response(JSON.stringify({ error: 'Too many requests, please slow down' }), {
@@ -105,6 +127,23 @@ const callGroupStore = (
   );
 };
 
+/**
+ * A group is recorded twice — in the group object and on the account — and only
+ * the account side carries the cap. Checking it before the group object is
+ * written keeps an over-cap creation from leaving a group nobody can reach.
+ * `groupId` exempts a group the account already lists, so re-accepting an invite
+ * stays idempotent at the cap.
+ */
+const accountHasGroupCapacity = async (env: Env, user: SessionUser, groupId?: string): Promise<boolean> => {
+  const response = await callUserStore(env, user.email, '/account');
+  if (!response.ok) {
+    return false;
+  }
+
+  const account = (await response.json()) as { groups: { groupId: string }[] };
+  return account.groups.length < LIMITS.groupsPerUser || account.groups.some((ref) => ref.groupId === groupId);
+};
+
 const passThrough = async (response: Response): Promise<Response> =>
   new Response(await response.text(), {
     status: response.status,
@@ -136,9 +175,44 @@ const appIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" r
   <text x="50%" y="58%" dominant-baseline="middle" text-anchor="middle" fill="#f8c630" font-size="140" font-family="Georgia, serif">&#8220;&#8221;</text>
 </svg>`;
 
-app.get('/', (c) => c.html(appHtml));
-app.get('/app', (c) => c.html(appHtml));
-app.get('/join', (c) => c.html(appHtml));
+/**
+ * The client is one inline `<script>` and one inline `<style>`, so the policy is
+ * carried by a nonce minted per response and injected into both tags — cleaner
+ * than keeping hashes in step with the markup. Everything else is denied:
+ * nothing here loads a third-party origin.
+ */
+const htmlResponse = (): Response => {
+  const nonce = crypto.randomUUID().replaceAll('-', '');
+  const policy = [
+    "default-src 'none'",
+    `script-src 'nonce-${nonce}'`,
+    `style-src 'nonce-${nonce}'`,
+    "connect-src 'self'",
+    "img-src 'self' data:",
+    "manifest-src 'self'",
+    // The app registers /sw.js; without this it would fall back to script-src
+    // and the service worker would be blocked by its own nonce policy.
+    "worker-src 'self'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+  ].join('; ');
+
+  return new Response(renderAppHtml(nonce), {
+    headers: {
+      'content-type': 'text/html; charset=utf-8',
+      'content-security-policy': policy,
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'no-referrer',
+      'x-frame-options': 'DENY',
+      'strict-transport-security': 'max-age=31536000; includeSubDomains',
+    },
+  });
+};
+
+app.get('/', () => htmlResponse());
+app.get('/app', () => htmlResponse());
+app.get('/join', () => htmlResponse());
 app.get('/manifest.webmanifest', (c) => c.json(appManifest));
 app.get('/sw.js', (c) =>
   c.body(serviceWorkerScript, 200, {
@@ -164,6 +238,15 @@ const requireUser: MiddlewareHandler<AppEnv> = async (c, next) => {
   const user = await verifySessionToken(secret, token);
   if (!user) {
     return jsonError('Your session has expired, please sign in again', 401);
+  }
+
+  // Authenticated reads had no ceiling at all, and /quiz and /stats rebuild over
+  // the whole quote array on every call. Every authenticated route passes
+  // through here, so this bucket also backstops the write routes.
+  const { limit, windowMs } = readLimit(c.env);
+  const decision = await checkRateLimit(c.env, `read:${user.id}`, limit, windowMs);
+  if (!decision.allowed) {
+    return tooManyRequests(decision);
   }
 
   c.set('user', user);
@@ -208,7 +291,12 @@ app.post('/api/auth/register', async (c) => {
     return jsonError(password.error, 400);
   }
 
-  const passwordHash = await hashPassword(password.value);
+  const accountDecision = await checkAccountLimit(c.env, email.value);
+  if (!accountDecision.allowed) {
+    return tooManyRequests(accountDecision);
+  }
+
+  const passwordHash = await hashPassword(password.value, resolvePbkdf2Iterations(c.env.PBKDF2_ITERATIONS));
   const response = await callUserStore(c.env, email.value, '/register', {
     id: crypto.randomUUID(),
     email: email.value,
@@ -216,6 +304,10 @@ app.post('/api/auth/register', async (c) => {
     passwordHash,
   });
 
+  // A taken address still answers 409: with no email provider wired up, a
+  // neutral "check your inbox" would leave the user unable to finish signing up.
+  // The per-account bucket above is what stops that 409 being a usable
+  // enumeration oracle; the neutral response waits on email delivery (issue #6).
   if (!response.ok) {
     return passThrough(response);
   }
@@ -247,7 +339,17 @@ app.post('/api/auth/login', async (c) => {
     return jsonError('Email or password is incorrect', 401);
   }
 
-  const response = await callUserStore(c.env, email.value, '/login', { password: body.value.password });
+  const accountDecision = await checkAccountLimit(c.env, email.value);
+  if (!accountDecision.allowed) {
+    return tooManyRequests(accountDecision);
+  }
+
+  const response = await callUserStore(c.env, email.value, '/login', {
+    password: body.value.password,
+    // Passed down so the account object can re-hash an outdated password on a
+    // successful sign-in; the Worker owns the configuration.
+    iterations: resolvePbkdf2Iterations(c.env.PBKDF2_ITERATIONS),
+  });
   if (!response.ok) {
     return jsonError('Email or password is incorrect', 401);
   }
@@ -301,6 +403,10 @@ app.post('/api/groups', async (c) => {
     return jsonError(revealYear.error, 400);
   }
 
+  if (!(await accountHasGroupCapacity(c.env, user))) {
+    return jsonError(`You can belong to at most ${LIMITS.groupsPerUser} groups`, 409);
+  }
+
   const groupId = crypto.randomUUID();
   const response = await callGroupStore(c.env, groupId, '/init', user, 'POST', {
     id: groupId,
@@ -312,12 +418,16 @@ app.post('/api/groups', async (c) => {
     return passThrough(response);
   }
 
-  await callUserStore(c.env, user.email, '/groups', {
+  const linked = await callUserStore(c.env, user.email, '/groups', {
     groupId,
     name: name.value,
     revealYear: revealYear.value,
     role: 'owner',
   });
+
+  if (!linked.ok) {
+    return passThrough(linked);
+  }
 
   return passThrough(response);
 });
@@ -372,8 +482,10 @@ app.get('/api/groups/:groupId/invite', async (c) => {
   }
 
   const overview = (await response.json()) as { group: { inviteVersion: number } };
+  // Only the code: a link built here would take its host from the client's Host
+  // header. The client composes the URL from its own origin instead.
   const inviteCode = await createInviteCode(secret, groupId, overview.group.inviteVersion);
-  return c.json({ inviteCode, inviteUrl: new URL(`/join?invite=${inviteCode}`, c.req.url).toString() });
+  return c.json({ inviteCode });
 });
 
 app.post('/api/groups/:groupId/invite/rotate', async (c) => {
@@ -390,7 +502,7 @@ app.post('/api/groups/:groupId/invite/rotate', async (c) => {
 
   const rotated = (await response.json()) as { inviteVersion: number };
   const inviteCode = await createInviteCode(secret, groupId, rotated.inviteVersion);
-  return c.json({ inviteCode, inviteUrl: new URL(`/join?invite=${inviteCode}`, c.req.url).toString() });
+  return c.json({ inviteCode });
 });
 
 app.post('/api/invites/accept', async (c) => {
@@ -412,9 +524,15 @@ app.post('/api/invites/accept', async (c) => {
   }
 
   const inviteCode = typeof body.value.inviteCode === 'string' ? body.value.inviteCode.trim() : '';
-  const invite = inviteCode ? await readInviteCode(secret, inviteCode) : null;
-  if (!invite) {
-    return jsonError('This invite link is not valid', 400);
+  const invite = inviteCode ? await readInviteCode(secret, inviteCode) : ({ ok: false, reason: 'invalid' } as const);
+  if (!invite.ok) {
+    return invite.reason === 'expired'
+      ? jsonError('This invite link has expired, ask for a new one', 410)
+      : jsonError('This invite link is not valid', 400);
+  }
+
+  if (!(await accountHasGroupCapacity(c.env, user, invite.groupId))) {
+    return jsonError(`You can belong to at most ${LIMITS.groupsPerUser} groups`, 409);
   }
 
   const response = await callGroupStore(c.env, invite.groupId, '/join', user, 'POST', {
@@ -426,12 +544,16 @@ app.post('/api/invites/accept', async (c) => {
   }
 
   const joined = (await response.json()) as { group: { id: string; name: string; revealYear: number } };
-  await callUserStore(c.env, user.email, '/groups', {
+  const linked = await callUserStore(c.env, user.email, '/groups', {
     groupId: joined.group.id,
     name: joined.group.name,
     revealYear: joined.group.revealYear,
     role: 'member',
   });
+
+  if (!linked.ok) {
+    return passThrough(linked);
+  }
 
   // 201 the first time, 200 when the caller was already a member.
   return c.json(joined, response.status === 201 ? 201 : 200);

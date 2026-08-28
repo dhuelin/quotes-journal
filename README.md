@@ -28,10 +28,37 @@ talks to the same API on Android and iOS.
   HMAC-signed bearer tokens valid for 30 days.
 - Every group route requires membership. A non-member gets `404`, not `403`, so
   group ids cannot be probed.
-- Invite codes are signed and carry a version number; rotating the link
-  invalidates every code issued before.
-- Writes are rate limited per account and authentication per IP, and every body
-  is size- and shape-checked before it reaches storage.
+- Invite codes are signed, carry a version number and expire after 7 days;
+  rotating the link invalidates every code issued before. They travel in the URL
+  fragment (`/join#invite=…`), which browsers never send to a server, so they
+  stay out of access logs, referrers and proxies.
+- Joining a group always creates a new member row. A display name matching an
+  existing guest is rejected rather than merged, and names are unique within a
+  group so the member list stays unambiguous.
+- Authentication is rate limited twice: per client IP, and per email address.
+  The second bucket matters because `cf-connecting-ip` is only trustworthy
+  behind the Cloudflare edge — under `wrangler dev` the client sets it. Writes
+  and authenticated reads are limited per account.
+- Every body is size- and shape-checked before it reaches storage, and a group
+  is refused new quotes before it can outgrow the Durable Object value ceiling.
+- The app shell is served with a strict `Content-Security-Policy`
+  (`default-src 'none'`, a per-response nonce for the one inline script and
+  style), plus `nosniff`, `no-referrer`, `frame-ancestors 'none'` and HSTS.
+
+### PBKDF2 cost
+
+`PBKDF2_ITERATIONS` sets the round count, defaulting to 30,000. That is below
+OWASP's recommended 600,000, deliberately: 600k costs roughly 90ms of CPU and
+the Workers **free** plan allows 10ms per request, so a free-tier deploy cannot
+run it. On a **paid** plan set it to `600000`:
+
+```bash
+wrangler secret put PBKDF2_ITERATIONS   # or a [vars] entry
+```
+
+Raising it is safe at any time. Each stored hash records the count it was made
+with, and a successful login re-hashes a password whose count is below the
+configured one, so accounts upgrade themselves as people sign in.
 
 Rotating `AUTH_SECRET` invalidates all sessions and all outstanding invite
 links at once.
@@ -113,13 +140,13 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | `POST` | `/api/groups` | `{ name, revealYear }`; the creator becomes owner |
 | `GET` | `/api/groups/:groupId` | members, your role, and progress while locked |
 | `POST` | `/api/groups/:groupId/members` | `{ name }`, for friends without an account |
-| `POST` | `/api/groups/:groupId/quotes` | `{ text, saidByMemberId, involvedMemberIds }` |
+| `POST` | `/api/groups/:groupId/quotes` | `{ text, saidByMemberId, involvedMemberIds }`; `409` after the reveal |
 | `GET` | `/api/groups/:groupId/quotes` | `423` until the reveal |
 | `GET` | `/api/groups/:groupId/quiz` | `423` until the reveal |
 | `GET` | `/api/groups/:groupId/stats` | `423` until the reveal |
-| `GET` | `/api/groups/:groupId/invite` | current invite code and link |
+| `GET` | `/api/groups/:groupId/invite` | current invite code; the client builds the link |
 | `POST` | `/api/groups/:groupId/invite/rotate` | owner only; invalidates old links |
-| `POST` | `/api/invites/accept` | `{ inviteCode }` |
+| `POST` | `/api/invites/accept` | `{ inviteCode }`; `410` if expired or rotated |
 
 ## What is still open
 

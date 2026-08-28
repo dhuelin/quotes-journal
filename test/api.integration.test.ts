@@ -1,9 +1,44 @@
 import { describe, expect, it } from 'vitest';
-import { SELF } from 'cloudflare:test';
-import { LIMITS } from '../src/domain';
-import { createGroup, registerUser, request, unlockGroup, uniqueIp } from './helpers';
+import { env, runInDurableObject, SELF } from 'cloudflare:test';
+import { groupByteSize, LIMITS, type GroupState, type Quote } from '../src/domain';
+import {
+  createInviteCode,
+  DEFAULT_PBKDF2_ITERATIONS,
+  hashPassword,
+  INVITE_TTL_SECONDS,
+  readHashIterations,
+} from '../src/auth';
+import type { UserRecord } from '../src/user-store';
+import type { GroupStore } from '../src/group-store';
+import { createGroup, registerUser, request, unlockGroup, uniqueIp, type TestUser } from './helpers';
 
 const nextYear = new Date().getUTCFullYear();
+
+/** Matches the AUTH_SECRET the workers pool binds in vitest.config.ts. */
+const TEST_SECRET = 'test-secret-not-used-in-production';
+
+const inviteCodeFor = async (owner: TestUser, groupId: string): Promise<string> => {
+  const response = await request(`/api/groups/${groupId}/invite`, { token: owner.token });
+  expect(response.status).toBe(200);
+  return response.body.inviteCode as string;
+};
+
+const accountStub = (user: TestUser) => env.USERS.get(env.USERS.idFromName(user.user.email));
+
+/** Fills an account to the group cap without paying for 50 real groups. */
+const fillAccountToGroupCap = async (user: TestUser): Promise<void> => {
+  await runInDurableObject(accountStub(user), async (_instance, state) => {
+    const record = (await state.storage.get<UserRecord>('user')) as UserRecord;
+    record.groups = Array.from({ length: LIMITS.groupsPerUser }, (_unused, index) => ({
+      groupId: `filler-${index}`,
+      name: 'Filler',
+      revealYear: nextYear,
+      role: 'member' as const,
+      joinedAt: new Date().toISOString(),
+    }));
+    await state.storage.put('user', record);
+  });
+};
 
 describe('static surface', () => {
   it('serves the app shell on every entry point', async () => {
@@ -191,10 +226,10 @@ describe('groups', () => {
 });
 
 describe('invites', () => {
-  const invite = async (owner: { token: string }, groupId: string) => {
+  const invite = async (owner: TestUser, groupId: string) => {
     const response = await request(`/api/groups/${groupId}/invite`, { token: owner.token });
     expect(response.status).toBe(200);
-    return response.body as { inviteCode: string; inviteUrl: string };
+    return response.body as { inviteCode: string };
   };
 
   it('lets an invited user join and see the group', async () => {
@@ -202,8 +237,7 @@ describe('invites', () => {
     const bob = await registerUser('Bob');
     const group = await createGroup(alice, 'Invite crew', nextYear);
 
-    const { inviteCode, inviteUrl } = await invite(alice, group.id);
-    expect(inviteUrl).toContain('/join?invite=');
+    const { inviteCode } = await invite(alice, group.id);
 
     const joined = await request('/api/invites/accept', {
       method: 'POST',
@@ -495,5 +529,469 @@ describe('rate limiting', () => {
 
     expect(first.status).toBe(401);
     expect(second.status).toBe(401);
+  });
+});
+
+
+describe('guest slots cannot be claimed by joining (H1)', () => {
+  it('refuses a joiner whose display name matches a guest, leaving the guest intact', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Guest slot', nextYear);
+
+    await request(`/api/groups/${group.id}/members`, { method: 'POST', token: alice.token, body: { name: 'Bob' } });
+    const before = await request(`/api/groups/${group.id}`, { token: alice.token });
+    const guest = before.body.group.members.find((member: { name: string }) => member.name === 'Bob');
+
+    // The quote the hijack used to inherit along with the member id.
+    await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { text: 'Something guest Bob said', saidByMemberId: guest.id },
+    });
+
+    // Trimmed and case-folded to exactly the guest's name.
+    const impostor = await registerUser('  bob  ');
+    const inviteCode = await inviteCodeFor(alice, group.id);
+    const joined = await request('/api/invites/accept', {
+      method: 'POST',
+      token: impostor.token,
+      body: { inviteCode },
+    });
+
+    expect(joined.status).toBe(409);
+    expect(joined.body.error).toContain('already taken');
+
+    const after = await request(`/api/groups/${group.id}`, { token: alice.token });
+    const stillGuest = after.body.group.members.find((member: { name: string }) => member.name === 'Bob');
+    expect(after.body.group.members).toHaveLength(2);
+    expect(stillGuest.id).toBe(guest.id);
+    expect(stillGuest.isGuest).toBe(true);
+
+    // The impostor is not in the group at all, so the quote is still the guest's.
+    const peek = await request(`/api/groups/${group.id}`, { token: impostor.token });
+    expect(peek.status).toBe(404);
+  });
+
+  it('always gives a joining account a member row of its own', async () => {
+    const alice = await registerUser('Alice');
+    const dana = await registerUser('Dana');
+    const group = await createGroup(alice, 'Fresh rows', nextYear);
+
+    await request(`/api/groups/${group.id}/members`, { method: 'POST', token: alice.token, body: { name: 'Cleo' } });
+    const before = await request(`/api/groups/${group.id}`, { token: alice.token });
+    const cleo = before.body.group.members.find((member: { name: string }) => member.name === 'Cleo');
+
+    const inviteCode = await inviteCodeFor(alice, group.id);
+    const joined = await request('/api/invites/accept', { method: 'POST', token: dana.token, body: { inviteCode } });
+
+    expect(joined.status).toBe(201);
+    expect(joined.body.group.you.memberId).not.toBe(cleo.id);
+    expect(joined.body.group.members).toHaveLength(3);
+
+    const guestAfter = joined.body.group.members.find((member: { name: string }) => member.name === 'Cleo');
+    expect(guestAfter.isGuest).toBe(true);
+  });
+});
+
+describe('duplicate display names (M3)', () => {
+  it('refuses a second member arriving under a name already in the group', async () => {
+    const alice = await registerUser('Alice');
+    const first = await registerUser('Sam');
+    const second = await registerUser('Sam');
+    const group = await createGroup(alice, 'One Sam only', nextYear);
+    const inviteCode = await inviteCodeFor(alice, group.id);
+
+    const accepted = await request('/api/invites/accept', { method: 'POST', token: first.token, body: { inviteCode } });
+    const duplicate = await request('/api/invites/accept', {
+      method: 'POST',
+      token: second.token,
+      body: { inviteCode },
+    });
+
+    expect(accepted.status).toBe(201);
+    expect(duplicate.status).toBe(409);
+    expect(duplicate.body.error).toContain('already taken');
+    expect(accepted.body.group.members).toHaveLength(2);
+  });
+});
+
+describe('auth rate limiting per account (H2, M4)', () => {
+  it('blocks a password flood that rotates the client IP header', async () => {
+    const email = `rotator${Date.now()}@example.com`;
+
+    let sawTooMany = false;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      // A new address every time: the per-IP bucket can never fire here.
+      const response = await request('/api/auth/login', {
+        method: 'POST',
+        ip: uniqueIp(),
+        body: { email, password: 'a long enough password' },
+      });
+
+      if (response.status === 429) {
+        sawTooMany = true;
+        break;
+      }
+      expect(response.status).toBe(401);
+    }
+
+    expect(sawTooMany).toBe(true);
+  });
+
+  it('answers a blocked account exactly like a blocked address', async () => {
+    const email = `twins${Date.now()}@example.com`;
+    let byAccount: { status: number; body: any } | null = null;
+    for (let attempt = 0; attempt < 10 && !byAccount; attempt += 1) {
+      const response = await request('/api/auth/login', {
+        method: 'POST',
+        ip: uniqueIp(),
+        body: { email, password: 'a long enough password' },
+      });
+      byAccount = response.status === 429 ? response : null;
+    }
+
+    const ip = uniqueIp();
+    let byAddress: { status: number; body: any } | null = null;
+    for (let attempt = 0; attempt < 16 && !byAddress; attempt += 1) {
+      const response = await request('/api/auth/login', {
+        method: 'POST',
+        ip,
+        body: { email: `flood${Date.now()}x${attempt}@example.com`, password: 'a long enough password' },
+      });
+      byAddress = response.status === 429 ? response : null;
+    }
+
+    expect(byAccount).not.toBeNull();
+    expect(byAddress).not.toBeNull();
+    expect(byAccount?.status).toBe(byAddress?.status);
+    expect(byAccount?.body).toEqual(byAddress?.body);
+  });
+
+  it('puts the taken-email 409 behind the per-account bucket', async () => {
+    const email = `enumerate${Date.now()}@example.com`;
+    const body = { displayName: 'Probe', email, password: 'a long enough password' };
+
+    const statuses: number[] = [];
+    for (let attempt = 0; attempt < 7; attempt += 1) {
+      statuses.push((await request('/api/auth/register', { method: 'POST', ip: uniqueIp(), body })).status);
+    }
+
+    expect(statuses[0]).toBe(201);
+    expect(statuses).toContain(409);
+    // Probing the address is no longer free, however many addresses it comes from.
+    expect(statuses[statuses.length - 1]).toBe(429);
+  });
+});
+
+describe('password hash upgrades (M1)', () => {
+  const storedHash = async (user: TestUser): Promise<string> =>
+    runInDurableObject(
+      accountStub(user),
+      async (_instance, state) => ((await state.storage.get<UserRecord>('user')) as UserRecord).passwordHash,
+    );
+
+  it('re-hashes on login when the stored rounds are below the configured count', async () => {
+    const user = await registerUser('Upgradable');
+    const outdated = await hashPassword('correct horse battery staple', 11_000);
+
+    await runInDurableObject(accountStub(user), async (_instance, state) => {
+      const record = (await state.storage.get<UserRecord>('user')) as UserRecord;
+      record.passwordHash = outdated;
+      await state.storage.put('user', record);
+    });
+
+    const login = await request('/api/auth/login', {
+      method: 'POST',
+      body: { email: user.user.email, password: 'correct horse battery staple' },
+    });
+
+    expect(login.status).toBe(200);
+    expect(readHashIterations(await storedHash(user))).toBe(DEFAULT_PBKDF2_ITERATIONS);
+  });
+
+  it('leaves a hash that already matches the configured count alone', async () => {
+    const user = await registerUser('Current');
+    const before = await storedHash(user);
+
+    const login = await request('/api/auth/login', {
+      method: 'POST',
+      body: { email: user.user.email, password: 'correct horse battery staple' },
+    });
+
+    expect(login.status).toBe(200);
+    expect(await storedHash(user)).toBe(before);
+  });
+});
+
+describe('the stored-value ceiling (M2)', () => {
+  it('refuses a quote past the byte budget without bricking the rest of the group', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Nearly full', nextYear);
+
+    await runInDurableObject(env.GROUPS.get(env.GROUPS.idFromName(group.id)), async (_instance, state) => {
+      const stored = (await state.storage.get<GroupState>('group')) as GroupState;
+      // Worst-case shape: maximum text plus a full involved-member list. This is
+      // what walks past the ceiling long before the 2000-quote count cap bites.
+      const filler = (): Quote => ({
+        id: crypto.randomUUID(),
+        text: 'x'.repeat(LIMITS.quoteText),
+        saidByMemberId: group.you.memberId,
+        recordedByMemberId: group.you.memberId,
+        involvedMemberIds: Array.from({ length: LIMITS.involvedMembers }, () => crypto.randomUUID()),
+        createdAt: new Date().toISOString(),
+      });
+
+      const perQuote = new TextEncoder().encode(JSON.stringify(filler())).length;
+      const room = LIMITS.groupBytes - groupByteSize(stored);
+      const count = Math.ceil(room / perQuote);
+      expect(count).toBeLessThan(LIMITS.quotesPerGroup);
+      stored.quotes = Array.from({ length: count }, filler);
+      await state.storage.put('group', stored);
+    });
+
+    const rejected = await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { text: 'One quote too many', saidByMemberId: group.you.memberId },
+    });
+
+    expect(rejected.status).toBe(409);
+    expect(rejected.body.error).toContain('run out of room');
+
+    // The point of the budget: the other write paths still work.
+    const member = await request(`/api/groups/${group.id}/members`, {
+      method: 'POST',
+      token: alice.token,
+      body: { name: 'Cleo' },
+    });
+    expect(member.status).toBe(201);
+
+    const rotated = await request(`/api/groups/${group.id}/invite/rotate`, {
+      method: 'POST',
+      token: alice.token,
+      body: {},
+    });
+    expect(rotated.status).toBe(200);
+  });
+
+  it('answers JSON, not plain text, when a storage write fails outright', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Broken storage', nextYear);
+
+    const response = await runInDurableObject(
+      env.GROUPS.get(env.GROUPS.idFromName(group.id)),
+      async (instance, state) => {
+        const original = state.storage.put.bind(state.storage);
+        state.storage.put = () => {
+          throw new Error('SQLITE_TOOBIG: string or blob too big');
+        };
+
+        try {
+          return await (instance as GroupStore).fetch(
+            new Request('https://group/members', {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                'x-user-id': alice.user.id,
+                'x-user-name': alice.user.displayName,
+              },
+              body: JSON.stringify({ name: 'Cleo' }),
+            }),
+          );
+        } finally {
+          state.storage.put = original;
+        }
+      },
+    );
+
+    expect(response.status).toBe(500);
+    expect(response.headers.get('content-type')).toContain('application/json');
+    expect(((await response.json()) as { error: string }).error).toContain('could not be updated');
+  });
+});
+
+describe('invite links (M5, L2)', () => {
+  it('returns the code alone, never a link built from the request host', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Host header', nextYear);
+
+    const response = await SELF.fetch(`https://attacker.example.net/api/groups/${group.id}/invite`, {
+      headers: { authorization: `Bearer ${alice.token}`, 'cf-connecting-ip': uniqueIp() },
+    });
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(200);
+    expect(body.inviteCode).toBeTruthy();
+    expect(body.inviteUrl).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain('attacker.example.net');
+  });
+
+  it('returns the code alone from rotation too', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Rotate host', nextYear);
+
+    const rotated = await request(`/api/groups/${group.id}/invite/rotate`, {
+      method: 'POST',
+      token: alice.token,
+      body: {},
+    });
+
+    expect(rotated.body.inviteCode).toBeTruthy();
+    expect(rotated.body.inviteUrl).toBeUndefined();
+  });
+
+  it('rejects an expired code with an error distinct from an invalid one', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Stale invite', nextYear);
+
+    const issuedLongAgo = new Date(Date.now() - (INVITE_TTL_SECONDS + 3600) * 1000);
+    const stale = await createInviteCode(TEST_SECRET, group.id, 1, issuedLongAgo);
+
+    const expired = await request('/api/invites/accept', { method: 'POST', token: bob.token, body: { inviteCode: stale } });
+    const forged = await request('/api/invites/accept', {
+      method: 'POST',
+      token: bob.token,
+      body: { inviteCode: 'Z3JvdXAtMTIzLjEuMQ.forgedsignature' },
+    });
+
+    expect(expired.status).toBe(410);
+    expect(expired.body.error).toContain('expired');
+    expect(forged.status).toBe(400);
+    expect(forged.body.error).not.toBe(expired.body.error);
+  });
+
+  it('still accepts a freshly minted code', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Fresh invite', nextYear);
+    const inviteCode = await inviteCodeFor(alice, group.id);
+
+    const joined = await request('/api/invites/accept', { method: 'POST', token: bob.token, body: { inviteCode } });
+    expect(joined.status).toBe(201);
+  });
+
+  it('ships a client that carries the code in the fragment', async () => {
+    const shell = await (await SELF.fetch('https://example.com/app')).text();
+
+    expect(shell).toContain("'/join#invite='");
+    expect(shell).toContain('location.hash');
+    // Cleared from the address bar so it does not linger in history or referrers.
+    expect(shell).toContain('history.replaceState');
+  });
+});
+
+describe('security headers (L1)', () => {
+  it('locks the app shell down and allows the inline script and style by nonce', async () => {
+    const response = await SELF.fetch('https://example.com/app');
+    const csp = response.headers.get('content-security-policy') ?? '';
+
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(response.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(response.headers.get('x-frame-options')).toBe('DENY');
+    expect(response.headers.get('strict-transport-security')).toContain('max-age=');
+
+    for (const directive of [
+      "default-src 'none'",
+      "connect-src 'self'",
+      "img-src 'self' data:",
+      "manifest-src 'self'",
+      "base-uri 'none'",
+      "form-action 'none'",
+      "frame-ancestors 'none'",
+    ]) {
+      expect(csp, directive).toContain(directive);
+    }
+    expect(csp).not.toContain("'unsafe-inline'");
+
+    const nonce = /script-src 'nonce-([A-Za-z0-9+/_-]+)'/.exec(csp)?.[1];
+    expect(nonce).toBeTruthy();
+
+    const shell = await response.text();
+    expect(shell).toContain(`<script nonce="${nonce}">`);
+    expect(shell).toContain(`<style nonce="${nonce}">`);
+    expect(shell).not.toContain('__CSP_NONCE__');
+  });
+
+  it('mints a fresh nonce for every response', async () => {
+    const first = await SELF.fetch('https://example.com/app');
+    const second = await SELF.fetch('https://example.com/app');
+
+    expect(first.headers.get('content-security-policy')).not.toBe(second.headers.get('content-security-policy'));
+  });
+});
+
+describe('the group cap (L3)', () => {
+  it('refuses to create a group past the cap instead of orphaning one', async () => {
+    const alice = await registerUser('Alice');
+    await fillAccountToGroupCap(alice);
+
+    const response = await request('/api/groups', {
+      method: 'POST',
+      token: alice.token,
+      body: { name: 'One too many', revealYear: nextYear },
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error).toContain('at most');
+
+    const account = await request('/api/auth/me', { token: alice.token });
+    expect(account.body.groups).toHaveLength(LIMITS.groupsPerUser);
+  });
+
+  it('refuses to accept an invite past the cap, without adding a hidden membership', async () => {
+    const owner = await registerUser('Owner');
+    const joiner = await registerUser('Joiner');
+    const group = await createGroup(owner, 'Full up', nextYear);
+    const inviteCode = await inviteCodeFor(owner, group.id);
+    await fillAccountToGroupCap(joiner);
+
+    const response = await request('/api/invites/accept', {
+      method: 'POST',
+      token: joiner.token,
+      body: { inviteCode },
+    });
+
+    expect(response.status).toBe(409);
+
+    const overview = await request(`/api/groups/${group.id}`, { token: owner.token });
+    expect(overview.body.group.members).toHaveLength(1);
+  });
+});
+
+describe('read rate limiting (L4)', () => {
+  it('blocks an authenticated read flood from one account', async () => {
+    const reader = await registerUser('Reader');
+
+    let sawTooMany = false;
+    for (let attempt = 0; attempt < 200 && !sawTooMany; attempt += 1) {
+      const response = await request('/api/auth/me', { token: reader.token, ip: uniqueIp() });
+      sawTooMany = response.status === 429;
+      if (!sawTooMany) {
+        expect(response.status).toBe(200);
+      }
+    }
+
+    expect(sawTooMany).toBe(true);
+  });
+});
+
+describe('writing after the reveal (L5)', () => {
+  it('refuses new quotes once the group has opened', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Too late', nextYear);
+    await unlockGroup(group.id);
+
+    const response = await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { text: 'Written after reading everyone else', saidByMemberId: group.you.memberId },
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error).toContain('no longer collecting');
+
+    const stats = await request(`/api/groups/${group.id}/stats`, { token: alice.token });
+    expect(stats.body.totalQuotes).toBe(0);
   });
 });

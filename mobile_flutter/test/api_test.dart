@@ -127,6 +127,13 @@ void main() {
       );
     });
 
+    test('extracts the code from a fragment link', () {
+      expect(
+        readInviteCode('https://quotes.example.workers.dev/join#invite=abc.def'),
+        'abc.def',
+      );
+    });
+
     test('decodes percent-escaped codes', () {
       expect(readInviteCode('https://example.test/join?invite=a%2Bb.c'), 'a+b.c');
     });

@@ -10,12 +10,21 @@
 const encoder = new TextEncoder();
 
 /**
- * PBKDF2 rounds. Kept deliberately modest: one derivation costs roughly 5ms of
- * CPU, and Cloudflare's free plan allows 10ms per request. Raise it (100k costs
- * about 15ms) once the Worker runs on a paid plan. Stored hashes record the
- * count they were made with, so existing accounts keep working after a change.
+ * PBKDF2 rounds when `PBKDF2_ITERATIONS` is not set. OWASP asks for 600,000,
+ * which costs about 90ms of CPU and therefore cannot run on Cloudflare's free
+ * plan (10ms per request); 30,000 costs roughly 5ms and fits. A paid plan
+ * should set `PBKDF2_ITERATIONS = "600000"`.
  */
-export const PBKDF2_ITERATIONS = 30_000;
+export const DEFAULT_PBKDF2_ITERATIONS = 30_000;
+
+/** Below this a misconfigured value would silently weaken every new hash. */
+const MIN_PBKDF2_ITERATIONS = 10_000;
+
+/** Reads the configured round count, falling back to the default when unusable. */
+export const resolvePbkdf2Iterations = (raw: unknown): number => {
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= MIN_PBKDF2_ITERATIONS ? value : DEFAULT_PBKDF2_ITERATIONS;
+};
 
 export const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
 
@@ -64,16 +73,26 @@ const hmac = async (secret: string, message: string): Promise<string> => {
   return toBase64Url(signature);
 };
 
-export const hashPassword = async (password: string, saltInput?: Uint8Array<ArrayBuffer>): Promise<string> => {
+export const hashPassword = async (
+  password: string,
+  iterations: number = DEFAULT_PBKDF2_ITERATIONS,
+  saltInput?: Uint8Array<ArrayBuffer>,
+): Promise<string> => {
   const salt: Uint8Array<ArrayBuffer> = saltInput ?? crypto.getRandomValues(new Uint8Array(16));
   const key = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
-    key,
-    256,
-  );
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations, hash: 'SHA-256' }, key, 256);
 
-  return `pbkdf2$${PBKDF2_ITERATIONS}$${toBase64Url(salt)}$${toBase64Url(bits)}`;
+  return `pbkdf2$${iterations}$${toBase64Url(salt)}$${toBase64Url(bits)}`;
+};
+
+/**
+ * The round count a stored hash was made with. Lets a login notice that an
+ * account predates a raised `PBKDF2_ITERATIONS` and re-hash it in place.
+ */
+export const readHashIterations = (stored: string): number | null => {
+  const [scheme, iterationsRaw] = stored.split('$');
+  const iterations = Number(iterationsRaw);
+  return scheme === 'pbkdf2' && Number.isInteger(iterations) && iterations > 0 ? iterations : null;
 };
 
 export const verifyPassword = async (password: string, stored: string): Promise<boolean> => {
@@ -149,45 +168,65 @@ export const verifySessionToken = async (
 
 /**
  * Invite codes carry the group they belong to, so joining needs no lookup table.
- * The version lets an owner rotate a leaked link without recreating the group.
+ * The version lets an owner rotate a leaked link without recreating the group,
+ * and the expiry bounds the damage of a link that leaks out of a chat thread.
  */
-export const createInviteCode = async (secret: string, groupId: string, version: number): Promise<string> => {
-  const body = `${groupId}.${version}`;
+export const INVITE_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+export type InviteRead =
+  | { ok: true; groupId: string; version: number }
+  | { ok: false; reason: 'invalid' | 'expired' };
+
+const invalidInvite: InviteRead = { ok: false, reason: 'invalid' };
+
+export const createInviteCode = async (
+  secret: string,
+  groupId: string,
+  version: number,
+  now: Date = new Date(),
+): Promise<string> => {
+  const expiresAt = Math.floor(now.getTime() / 1000) + INVITE_TTL_SECONDS;
+  const body = `${groupId}.${version}.${expiresAt}`;
   const signature = await hmac(secret, `invite:${body}`);
   return `${toBase64Url(encoder.encode(body))}.${signature}`;
 };
 
-export const readInviteCode = async (
-  secret: string,
-  code: string,
-): Promise<{ groupId: string; version: number } | null> => {
+export const readInviteCode = async (secret: string, code: string, now: Date = new Date()): Promise<InviteRead> => {
   const [body, signature] = code.split('.');
   if (!body || !signature) {
-    return null;
+    return invalidInvite;
   }
 
   let decoded: string;
   try {
     decoded = new TextDecoder().decode(fromBase64Url(body));
   } catch {
-    return null;
+    return invalidInvite;
   }
 
   const expected = await hmac(secret, `invite:${decoded}`);
   if (!timingSafeEqual(expected, signature)) {
-    return null;
+    return invalidInvite;
   }
 
-  const separator = decoded.lastIndexOf('.');
-  if (separator <= 0) {
-    return null;
+  // Group ids may contain dots, so the two trailing fields are peeled off the
+  // right rather than splitting the payload.
+  const expirySeparator = decoded.lastIndexOf('.');
+  const versionSeparator = decoded.lastIndexOf('.', expirySeparator - 1);
+  if (versionSeparator <= 0) {
+    return invalidInvite;
   }
 
-  const groupId = decoded.slice(0, separator);
-  const version = Number(decoded.slice(separator + 1));
-  if (!groupId || !Number.isInteger(version) || version < 1) {
-    return null;
+  const groupId = decoded.slice(0, versionSeparator);
+  const version = Number(decoded.slice(versionSeparator + 1, expirySeparator));
+  const expiresAt = Number(decoded.slice(expirySeparator + 1));
+  if (!groupId || !Number.isInteger(version) || version < 1 || !Number.isInteger(expiresAt)) {
+    return invalidInvite;
   }
 
-  return { groupId, version };
+  if (expiresAt * 1000 <= now.getTime()) {
+    return { ok: false, reason: 'expired' };
+  }
+
+  return { ok: true, groupId, version };
 };

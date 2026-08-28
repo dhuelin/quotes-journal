@@ -42,9 +42,33 @@ export const LIMITS = {
   quoteText: 500,
   involvedMembers: 25,
   membersPerGroup: 100,
-  quotesPerGroup: 5000,
+  /**
+   * A whole group — members and every quote — is one `storage.put('group', …)`,
+   * and a Durable Object value tops out at around 2.2MB. Past that *every* write
+   * path fails permanently, so this cap has to bite long before the ceiling
+   * does: a typical quote serialises to about 750 bytes, which leaves this well
+   * inside `groupBytes`.
+   */
+  quotesPerGroup: 2000,
+  /**
+   * The real guarantee. A quote carrying the maximum text plus the maximum
+   * involved-member list serialises to about 2.7KB, so the count cap alone can
+   * still be walked past the ceiling on purpose. Everything below this budget
+   * leaves roughly 600KB of the ceiling spare for members and future fields.
+   */
+  groupBytes: 1_600_000,
   groupsPerUser: 50,
 } as const;
+
+/**
+ * Serialised size of a stored group, in UTF-8 bytes rather than UTF-16 units so
+ * that a group full of non-Latin quotes is measured as storage sees it.
+ */
+export const groupByteSize = (group: GroupState): number => new TextEncoder().encode(JSON.stringify(group)).length;
+
+/** Whether keeping `quote` would push the group past the storage budget. */
+export const exceedsGroupBudget = (group: GroupState, quote: Quote): boolean =>
+  groupByteSize(group) + new TextEncoder().encode(JSON.stringify(quote)).length + 1 > LIMITS.groupBytes;
 
 export const getRevealAtIso = (revealYear: number): string =>
   new Date(Date.UTC(revealYear + 1, 0, 1, 0, 0, 0)).toISOString();

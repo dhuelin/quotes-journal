@@ -4,9 +4,13 @@ import {
   buildProgress,
   buildQuiz,
   buildStats,
+  exceedsGroupBudget,
   findMemberByUserId,
   getRevealAtIso,
+  groupByteSize,
+  LIMITS,
   type GroupState,
+  type Quote,
 } from '../src/domain';
 
 const group = (): GroupState => ({
@@ -117,5 +121,64 @@ describe('member lookup', () => {
   it('finds members by the account that joined, ignoring guests', () => {
     expect(findMemberByUserId(group(), 'u2')?.name).toBe('Bob');
     expect(findMemberByUserId(group(), 'nobody')).toBeUndefined();
+  });
+});
+
+/**
+ * A group is stored as a single Durable Object value, and that value has a hard
+ * ceiling of roughly 2.2MB. Crossing it fails every later write — quotes, guest
+ * members, joins and invite rotation alike — with no way back, so the caps have
+ * to be provably on the safe side of it.
+ */
+describe('the stored-value budget', () => {
+  const DO_VALUE_CEILING_BYTES = 2_200_000;
+  const bytesOf = (value: unknown): number => new TextEncoder().encode(JSON.stringify(value)).length;
+
+  const quote = (involved: number, text: string): Quote => ({
+    id: crypto.randomUUID(),
+    text,
+    saidByMemberId: crypto.randomUUID(),
+    recordedByMemberId: crypto.randomUUID(),
+    involvedMemberIds: Array.from({ length: involved }, () => crypto.randomUUID()),
+    createdAt: new Date().toISOString(),
+  });
+
+  it('leaves the ceiling room for the members alongside a budget-full quote list', () => {
+    const members = Array.from({ length: LIMITS.membersPerGroup }, () => ({
+      id: crypto.randomUUID(),
+      name: 'n'.repeat(LIMITS.memberName),
+      userId: crypto.randomUUID(),
+      role: 'member' as const,
+      joinedAt: new Date().toISOString(),
+    }));
+
+    expect(LIMITS.groupBytes + bytesOf(members)).toBeLessThan(DO_VALUE_CEILING_BYTES);
+  });
+
+  it('keeps the quote count cap inside the byte budget for maximum-length quotes', () => {
+    const full = bytesOf(quote(0, 'x'.repeat(LIMITS.quoteText)));
+
+    expect(LIMITS.quotesPerGroup * full).toBeLessThan(LIMITS.groupBytes);
+  });
+
+  it('stops a worst-case quote stream at the budget, well short of the ceiling', () => {
+    // The count cap alone is not enough: max text plus a full involved-member
+    // list is several times an ordinary quote, so the byte budget is what
+    // actually guarantees the group stays writable.
+    const worst = quote(LIMITS.involvedMembers, '漢'.repeat(LIMITS.quoteText));
+    expect(LIMITS.quotesPerGroup * bytesOf(worst)).toBeGreaterThan(DO_VALUE_CEILING_BYTES);
+
+    const filling: GroupState = { ...group(), quotes: [] };
+    const perQuote = bytesOf(worst);
+    filling.quotes = Array.from({ length: Math.floor(LIMITS.groupBytes / perQuote) }, () =>
+      quote(LIMITS.involvedMembers, '漢'.repeat(LIMITS.quoteText)),
+    );
+
+    expect(exceedsGroupBudget(filling, worst)).toBe(true);
+    expect(groupByteSize(filling)).toBeLessThan(DO_VALUE_CEILING_BYTES);
+  });
+
+  it('allows a quote while there is room', () => {
+    expect(exceedsGroupBudget(group(), quote(0, 'still plenty of room'))).toBe(false);
   });
 });

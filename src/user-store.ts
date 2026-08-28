@@ -1,5 +1,5 @@
 import { LIMITS } from './domain';
-import { PBKDF2_ITERATIONS, verifyPassword } from './auth';
+import { hashPassword, readHashIterations, resolvePbkdf2Iterations, verifyPassword } from './auth';
 import { readJsonBody } from './validation';
 
 /**
@@ -32,9 +32,11 @@ const jsonResponse = (body: unknown, status = 200): Response =>
 
 /**
  * Verified against when the account does not exist, so that a failed login costs
- * the same whether or not the address is registered.
+ * the same whether or not the address is registered. Built at the configured
+ * round count so the timing keeps matching a real hash after a raise.
  */
-const ABSENT_ACCOUNT_HASH = `pbkdf2$${PBKDF2_ITERATIONS}$${'A'.repeat(22)}$${'B'.repeat(43)}`;
+const absentAccountHash = (iterations: number): string =>
+  `pbkdf2$${iterations}$${'A'.repeat(22)}$${'B'.repeat(43)}`;
 
 const publicUser = (user: UserRecord) => ({
   id: user.id,
@@ -46,6 +48,16 @@ export class UserStore {
   constructor(private readonly ctx: DurableObjectState, private readonly _env: unknown) {}
 
   async fetch(request: Request): Promise<Response> {
+    // An unexpected storage failure would otherwise surface as a plain-text 500
+    // that the clients cannot read an error message out of.
+    try {
+      return await this.route(request);
+    } catch {
+      return jsonResponse({ error: 'The account could not be updated, please try again later' }, 500);
+    }
+  }
+
+  private async route(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const user = await this.ctx.storage.get<UserRecord>('user');
 
@@ -93,12 +105,24 @@ export class UserStore {
         return jsonResponse({ error: 'Invalid credentials' }, 401);
       }
 
+      // The Worker owns the PBKDF2 configuration and passes it down; this object
+      // is only reachable from there.
+      const iterations = resolvePbkdf2Iterations(body.value.iterations);
+
       // Same response and same amount of work whether the account is missing or
       // the password is wrong, so this endpoint cannot be used to enumerate
       // registered addresses.
-      const matches = await verifyPassword(password, user?.passwordHash ?? ABSENT_ACCOUNT_HASH);
+      const matches = await verifyPassword(password, user?.passwordHash ?? absentAccountHash(iterations));
       if (!user || !matches) {
         return jsonResponse({ error: 'Email or password is incorrect' }, 401);
+      }
+
+      // A stored hash records the rounds it was made with, so an account created
+      // under a lower setting is upgraded here, the one moment the plaintext is
+      // available.
+      if ((readHashIterations(user.passwordHash) ?? 0) < iterations) {
+        user.passwordHash = await hashPassword(password, iterations);
+        await this.ctx.storage.put('user', user);
       }
 
       return jsonResponse({ user: publicUser(user) });

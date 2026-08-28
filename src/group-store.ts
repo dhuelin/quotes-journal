@@ -1,5 +1,6 @@
 import {
   areQuotesVisible,
+  exceedsGroupBudget,
   buildProgress,
   buildQuiz,
   buildStats,
@@ -41,6 +42,10 @@ const readCaller = (request: Request): Caller | null => {
   return { userId, displayName };
 };
 
+/** The UI identifies members by name alone, so names have to stay unambiguous. */
+const hasMemberNamed = (group: GroupState, name: string): boolean =>
+  group.members.some((member) => member.name.toLowerCase() === name.toLowerCase());
+
 const publicMember = (member: Member, viewerMemberId: string) => ({
   id: member.id,
   name: member.name,
@@ -53,6 +58,17 @@ export class GroupStore {
   constructor(private readonly ctx: DurableObjectState, private readonly _env: unknown) {}
 
   async fetch(request: Request): Promise<Response> {
+    // A group and all of its quotes live in one stored value, so a write that
+    // outgrows the Durable Object value ceiling throws. Without this the runtime
+    // answers with a plain-text 500 that no client can parse.
+    try {
+      return await this.route(request);
+    } catch {
+      return jsonResponse({ error: 'The group could not be updated, please try again later' }, 500);
+    }
+  }
+
+  private async route(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const caller = readCaller(request);
     if (!caller) {
@@ -180,14 +196,14 @@ export class GroupStore {
       return jsonResponse({ error: `A group can hold at most ${LIMITS.membersPerGroup} members` }, 409);
     }
 
-    // A guest placeholder added by the same display name is claimed rather than
-    // duplicated, so quotes recorded about someone before they signed up follow
-    // them into their account.
-    const claimable = group.members.find(
-      (member) => member.userId === null && member.name.toLowerCase() === caller.displayName.toLowerCase(),
-    );
+    // Joining never adopts an existing member row. Matching on the display name
+    // would let anyone holding the invite code register under a guest's name and
+    // inherit that guest's quotes, counts and quiz answers.
+    if (hasMemberNamed(group, caller.displayName)) {
+      return jsonResponse({ error: 'That name is already taken in this group' }, 409);
+    }
 
-    const member: Member = claimable ?? {
+    const member: Member = {
       id: crypto.randomUUID(),
       name: caller.displayName,
       userId: caller.userId,
@@ -195,13 +211,7 @@ export class GroupStore {
       joinedAt: new Date().toISOString(),
     };
 
-    if (claimable) {
-      claimable.userId = caller.userId;
-      claimable.joinedAt = new Date().toISOString();
-    } else {
-      group.members.push(member);
-    }
-
+    group.members.push(member);
     await this.ctx.storage.put('group', group);
     return jsonResponse({ group: this.overview(group, member) }, 201);
   }
@@ -221,7 +231,7 @@ export class GroupStore {
       return jsonResponse({ error: `A group can hold at most ${LIMITS.membersPerGroup} members` }, 409);
     }
 
-    if (group.members.some((member) => member.name.toLowerCase() === name.value.toLowerCase())) {
+    if (hasMemberNamed(group, name.value)) {
       return jsonResponse({ error: 'A member with that name already exists' }, 409);
     }
 
@@ -242,6 +252,12 @@ export class GroupStore {
     const body = await readJsonBody(request);
     if (!body.ok) {
       return jsonResponse({ error: body.error }, 400);
+    }
+
+    // Once the vault is open a quote could be written with full knowledge of what
+    // everyone else collected, which would make the leaderboard meaningless.
+    if (areQuotesVisible(group.revealYear)) {
+      return jsonResponse({ error: 'This group has been revealed and is no longer collecting quotes' }, 409);
     }
 
     const text = validateText(body.value.text, 'Quote', LIMITS.quoteText);
@@ -277,6 +293,12 @@ export class GroupStore {
       involvedMemberIds: involved.value,
       createdAt: new Date().toISOString(),
     };
+
+    // Checked before the push: crossing the stored-value ceiling would fail this
+    // write and every later one, including joins and invite rotation.
+    if (exceedsGroupBudget(group, quote)) {
+      return jsonResponse({ error: 'This group has run out of room for new quotes' }, 409);
+    }
 
     group.quotes.push(quote);
     await this.ctx.storage.put('group', group);

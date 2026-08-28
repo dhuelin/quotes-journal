@@ -287,7 +287,9 @@ class _MembersTab extends StatelessWidget {
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: const Text('Invite a friend'),
-        content: SelectableText('${result.body['inviteUrl']}'),
+        // Composed here from the configured base URL: the Worker returns only
+        // the code, so a link can never inherit an attacker's Host header.
+        content: SelectableText('${api.baseUrl}/join#invite=${result.body['inviteCode']}'),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(dialogContext).pop(),

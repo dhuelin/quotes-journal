@@ -14,7 +14,7 @@ const html = `<!doctype html>
     <link rel="apple-touch-icon" href="/icon.svg" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
     <title>Quotes Journal</title>
-    <style>
+    <style nonce="__CSP_NONCE__">
       :root {
         --bg: #0f1020;
         --surface: #191a30;
@@ -144,7 +144,7 @@ const html = `<!doctype html>
   </head>
   <body>
     <main id="app" aria-live="polite"></main>
-    <script>
+    <script nonce="__CSP_NONCE__">
       (function () {
         'use strict';
 
@@ -163,7 +163,7 @@ const html = `<!doctype html>
           tab: 'collect',
           reveal: null,
           notice: null,
-          pendingInvite: new URL(location.href).searchParams.get('invite'),
+          pendingInvite: readInviteFromLocation(),
         };
 
         function escapeHtml(value) {
@@ -604,7 +604,7 @@ const html = `<!doctype html>
           onClick('show-invite', async function () {
             try {
               var invite = await api('/api/groups/' + encodeURIComponent(state.group.id) + '/invite');
-              showInvite(invite.inviteUrl);
+              showInvite(invite.inviteCode);
             } catch (error) {
               notify(error.message, 'error');
               render();
@@ -617,7 +617,7 @@ const html = `<!doctype html>
                 method: 'POST',
                 body: {},
               });
-              showInvite(invite.inviteUrl);
+              showInvite(invite.inviteCode);
             } catch (error) {
               notify(error.message, 'error');
               render();
@@ -699,18 +699,42 @@ const html = `<!doctype html>
           });
         }
 
-        function showInvite(url) {
+        function showInvite(code) {
           var box = document.getElementById('invite-box');
           if (box) {
-            box.innerHTML = '<p class="mono small">' + escapeHtml(url) + '</p>';
+            box.innerHTML = '<p class="mono small">' + escapeHtml(inviteUrl(code)) + '</p>';
           }
+        }
+
+        /** Pulls the code out of a '?invite=' or '#invite=' string, if there is one. */
+        function inviteFromText(value) {
+          var trimmed = (value || '').trim();
+          var marker = trimmed.indexOf('invite=');
+          return marker === -1 ? '' : decodeURIComponent(trimmed.slice(marker + 'invite='.length));
         }
 
         /** Accepts either a raw code or a full invite URL pasted from a message. */
         function readInvite(value) {
           var trimmed = (value || '').trim();
-          var marker = trimmed.indexOf('invite=');
-          return marker === -1 ? trimmed : decodeURIComponent(trimmed.slice(marker + 'invite='.length));
+          return inviteFromText(trimmed) || trimmed;
+        }
+
+        /**
+         * Invite codes travel in the fragment, which browsers never send to the
+         * server, so they stay out of access logs, referrers and proxies. Links
+         * shared before that used '?invite=', so those are still read.
+         */
+        function readInviteFromLocation() {
+          var code = inviteFromText(location.hash) || inviteFromText(location.search);
+          if (code) {
+            history.replaceState({}, '', location.pathname);
+          }
+          return code || null;
+        }
+
+        /** Built from this origin: the server never composes a link from a header. */
+        function inviteUrl(code) {
+          return location.origin + '/join#invite=' + encodeURIComponent(code);
         }
 
         async function startSession(result) {
@@ -799,4 +823,8 @@ const html = `<!doctype html>
   </body>
 </html>`;
 
-export const appHtml = html;
+/**
+ * The inline <style> and <script> are allowed by a per-response CSP nonce, which
+ * is stamped into both tags here.
+ */
+export const renderAppHtml = (nonce: string): string => html.replaceAll('__CSP_NONCE__', nonce);
