@@ -664,22 +664,117 @@ describe('auth rate limiting per account (H2, M4)', () => {
     expect(byAccount).not.toBeNull();
     expect(byAddress).not.toBeNull();
     expect(byAccount?.status).toBe(byAddress?.status);
-    expect(byAccount?.body).toEqual(byAddress?.body);
+    // Same wording either way, so the response never says whether the address
+    // is registered. The retry hint does differ, because the two buckets have
+    // different windows — that reveals which limit fired, not who exists.
+    expect(byAccount?.body.error).toBe(byAddress?.body.error);
+    expect(byAccount?.body.retryAfterSeconds).toBeGreaterThan(0);
   });
 
-  it('puts the taken-email 409 behind the per-account bucket', async () => {
+  it('never spends the account budget on a correct sign-in', async () => {
+    // Signing in on several devices used to lock the owner out of their own
+    // account, because the bucket was consumed whether or not the attempt
+    // succeeded. Ten correct logins in a row must all pass.
+    const user = await registerUser('Repeat');
+    const email = user.user.email;
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const response = await request('/api/auth/login', {
+        method: 'POST',
+        ip: uniqueIp(),
+        body: { email, password: 'correct horse battery staple' },
+      });
+      expect(response.status, `attempt ${attempt}`).toBe(200);
+    }
+  });
+
+  it('blocks the attacking client without locking the owner out', async () => {
+    const user = await registerUser('Victim');
+    const email = user.user.email;
+    const attacker = uniqueIp();
+
+    // One attacker, guessing from one client, until their narrow bucket is dry.
+    let attackerBlocked = false;
+    for (let attempt = 0; attempt < 8 && !attackerBlocked; attempt += 1) {
+      const response = await request('/api/auth/login', {
+        method: 'POST',
+        ip: attacker,
+        body: { email, password: 'not the right password' },
+      });
+      attackerBlocked = response.status === 429;
+    }
+
+    expect(attackerBlocked).toBe(true);
+
+    // The narrow bucket is keyed on address *and* client, so the owner signing
+    // in from their own machine is untouched by the attack.
+    const owner = await request('/api/auth/login', {
+      method: 'POST',
+      ip: uniqueIp(),
+      body: { email, password: 'correct horse battery staple' },
+    });
+
+    expect(owner.status).toBe(200);
+  });
+
+  it('keeps register probes from denying login on the same address', async () => {
+    const user = await registerUser('Separate');
+    const email = user.user.email;
+
+    // Six register attempts carrying only the address — no password knowledge.
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      await request('/api/auth/register', {
+        method: 'POST',
+        ip: uniqueIp(),
+        body: { displayName: 'Probe', email, password: 'a long enough password' },
+      });
+    }
+
+    const owner = await request('/api/auth/login', {
+      method: 'POST',
+      ip: uniqueIp(),
+      body: { email, password: 'correct horse battery staple' },
+    });
+
+    expect(owner.status).toBe(200);
+  });
+
+  it('throttles repeated probing of one address, even from many client IPs', async () => {
     const email = `enumerate${Date.now()}@example.com`;
     const body = { displayName: 'Probe', email, password: 'a long enough password' };
 
     const statuses: number[] = [];
-    for (let attempt = 0; attempt < 7; attempt += 1) {
+    for (let attempt = 0; attempt < 12; attempt += 1) {
       statuses.push((await request('/api/auth/register', { method: 'POST', ip: uniqueIp(), body })).status);
     }
 
     expect(statuses[0]).toBe(201);
     expect(statuses).toContain(409);
-    // Probing the address is no longer free, however many addresses it comes from.
-    expect(statuses[statuses.length - 1]).toBe(429);
+    // A rotating IP earns a fresh narrow bucket every time, so the address-wide
+    // budget is the only thing left to bite — and it does.
+    expect(statuses).toContain(429);
+  });
+
+  it('does not stop enumeration across distinct addresses (known gap, issue #6)', async () => {
+    // Every address arrives with a full bucket, so probing many addresses once
+    // each is limited only by the per-IP budget. Asserted so the gap stays
+    // visible rather than being mistaken for something these buckets cover.
+    const stamp = Date.now();
+    const taken = `known${stamp}@example.com`;
+    await request('/api/auth/register', {
+      method: 'POST',
+      body: { displayName: 'Known', email: taken, password: 'a long enough password' },
+    });
+
+    const probe = (email: string) =>
+      request('/api/auth/register', {
+        method: 'POST',
+        ip: uniqueIp(),
+        body: { displayName: 'Probe', email, password: 'a long enough password' },
+      });
+
+    expect((await probe(taken)).status).toBe(409);
+    expect((await probe(`free${stamp}@example.com`)).status).toBe(201);
   });
 });
 

@@ -9,12 +9,14 @@ const invalid = (error: string): Invalid => ({ ok: false, error });
 /**
  * Trims, then rejects empty strings, over-long strings and control characters
  * (which would otherwise let someone smuggle newlines into a display name).
+ * `allowLineBreaks` is for quote text, where a two-line quote is a reasonable
+ * thing to record; names stay strictly single-line.
  */
 export const validateText = (
   raw: unknown,
   field: string,
   maxLength: number,
-  { minLength = 1 } = {},
+  { minLength = 1, allowLineBreaks = false } = {},
 ): Validated<string> => {
   if (typeof raw !== 'string') {
     return invalid(`${field} must be a string`);
@@ -29,8 +31,13 @@ export const validateText = (
     return invalid(`${field} must be at most ${maxLength} characters`);
   }
 
-  if (/[\u0000-\u001f\u007f]/.test(value)) {
-    return invalid(`${field} contains unsupported control characters`);
+  const forbidden = allowLineBreaks ? /[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f]/ : /[\u0000-\u001f\u007f]/;
+  if (forbidden.test(value)) {
+    return invalid(
+      allowLineBreaks
+        ? `${field} contains characters that cannot be saved`
+        : `${field} has to be on a single line`,
+    );
   }
 
   return { ok: true, value };

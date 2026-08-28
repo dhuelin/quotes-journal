@@ -20,11 +20,18 @@ const jsonResponse = (body: unknown, status = 200): Response =>
     headers: { 'content-type': 'application/json; charset=utf-8' },
   });
 
+/**
+ * `consume: false` reports whether a token is available without spending one.
+ * The auth routes peek before doing the password work and only spend a token
+ * when the attempt actually fails, so a correct sign-in never counts against
+ * the account and cannot be used to lock its owner out.
+ */
 export const nextBucketState = (
   state: BucketState,
   limit: number,
   windowMs: number,
   now: number,
+  consume = true,
 ): { state: BucketState; decision: RateLimitDecision } => {
   const elapsed = Math.max(0, now - state.updatedAt);
   const refilled = Math.min(limit, state.tokens + (elapsed / windowMs) * limit);
@@ -41,7 +48,7 @@ export const nextBucketState = (
     };
   }
 
-  const tokens = refilled - 1;
+  const tokens = consume ? refilled - 1 : refilled;
   return {
     state: { tokens, updatedAt: now },
     decision: { allowed: true, remaining: Math.floor(tokens), retryAfterSeconds: 0 },
@@ -61,8 +68,9 @@ export class RateLimiter {
     }
 
     const now = Date.now();
+    const consume = url.searchParams.get('consume') !== '0';
     const stored = (await this.ctx.storage.get<BucketState>('bucket')) ?? { tokens: limit, updatedAt: now };
-    const { state, decision } = nextBucketState(stored, limit, windowMs, now);
+    const { state, decision } = nextBucketState(stored, limit, windowMs, now, consume);
 
     await this.ctx.storage.put('bucket', state);
     return jsonResponse(decision);

@@ -118,7 +118,7 @@ export class GroupStore {
 
     if (url.pathname === '/quiz' && request.method === 'GET') {
       if (!areQuotesVisible(group.revealYear)) {
-        return lockedResponse(group, 'The quiz stays');
+        return lockedResponse(group, 'The quiz and its answers');
       }
       return jsonResponse({ questions: buildQuiz(group) });
     }
@@ -260,7 +260,7 @@ export class GroupStore {
       return jsonResponse({ error: 'This group has been revealed and is no longer collecting quotes' }, 409);
     }
 
-    const text = validateText(body.value.text, 'Quote', LIMITS.quoteText);
+    const text = validateText(body.value.text, 'Quote', LIMITS.quoteText, { allowLineBreaks: true });
     if (!text.ok) {
       return jsonResponse({ error: text.error }, 400);
     }

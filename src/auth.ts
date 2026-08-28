@@ -21,10 +21,32 @@ export const DEFAULT_PBKDF2_ITERATIONS = 30_000;
 const MIN_PBKDF2_ITERATIONS = 10_000;
 
 /** Reads the configured round count, falling back to the default when unusable. */
+/**
+ * Bounded at both ends. The floor stops a typo weakening every hash; the ceiling
+ * stops one taking every login past the Worker CPU limit, which would be a
+ * silent authentication outage with nothing pointing at the cause. Only plain
+ * decimal digits are accepted, so `1e9` and `0x100000` fall back rather than
+ * resolving to a billion rounds.
+ */
 export const resolvePbkdf2Iterations = (raw: unknown): number => {
-  const value = Number(raw);
-  return Number.isInteger(value) && value >= MIN_PBKDF2_ITERATIONS ? value : DEFAULT_PBKDF2_ITERATIONS;
+  if (typeof raw !== 'string' && typeof raw !== 'number') {
+    return DEFAULT_PBKDF2_ITERATIONS;
+  }
+
+  const text = String(raw).trim();
+  if (!/^\d+$/.test(text)) {
+    return DEFAULT_PBKDF2_ITERATIONS;
+  }
+
+  const value = Number(text);
+  if (!Number.isInteger(value) || value < MIN_PBKDF2_ITERATIONS || value > MAX_PBKDF2_ITERATIONS) {
+    return DEFAULT_PBKDF2_ITERATIONS;
+  }
+
+  return value;
 };
+
+export const MAX_PBKDF2_ITERATIONS = 1_000_000;
 
 export const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
 

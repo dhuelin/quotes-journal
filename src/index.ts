@@ -25,6 +25,7 @@ export type Env = {
   AUTH_SECRET?: string;
   RATE_LIMIT_AUTH?: string;
   RATE_LIMIT_AUTH_ACCOUNT?: string;
+  RATE_LIMIT_AUTH_ACCOUNT_WIDE?: string;
   RATE_LIMIT_WRITE?: string;
   RATE_LIMIT_READ?: string;
   /** PBKDF2 rounds; see `DEFAULT_PBKDF2_ITERATIONS` for the free-plan trade-off. */
@@ -35,11 +36,14 @@ type AppEnv = { Bindings: Env; Variables: { user: SessionUser } };
 
 const app = new Hono<AppEnv>();
 
+/** Applied to every response: a sniffed content type is a bug waiting to happen. */
+const JSON_HEADERS = {
+  'content-type': 'application/json; charset=utf-8',
+  'x-content-type-options': 'nosniff',
+} as const;
+
 const jsonError = (message: string, status: number, extra: Record<string, unknown> = {}): Response =>
-  new Response(JSON.stringify({ error: message, ...extra }), {
-    status,
-    headers: { 'content-type': 'application/json; charset=utf-8' },
-  });
+  new Response(JSON.stringify({ error: message, ...extra }), { status, headers: JSON_HEADERS });
 
 const requireSecret = (env: Env): string | null => env.AUTH_SECRET ?? null;
 
@@ -52,17 +56,31 @@ const requireSecret = (env: Env): string | null => env.AUTH_SECRET ?? null;
  */
 const clientKey = (request: Request): string => request.headers.get('cf-connecting-ip') ?? 'unknown';
 
-/** Header-independent bucket key: the normalised address being signed in to. */
-const accountKey = (email: string): string => `auth:account:${email}`;
+/**
+ * Header-independent bucket keys for the auth routes.
+ *
+ * Split three ways deliberately. `purpose` keeps a register probe from spending
+ * login's budget, so nobody can deny an account by poking at its address. The
+ * narrow bucket is keyed on the address *and* the client, so one attacker
+ * exhausts only their own; the wide one is a slower per-address backstop that
+ * still throttles an attacker spread across many addresses' worth of IPs.
+ */
+const narrowAccountKey = (purpose: string, email: string, request: Request): string =>
+  `auth:${purpose}:${email}:${clientKey(request)}`;
+
+const wideAccountKey = (purpose: string, email: string): string => `auth:${purpose}:all:${email}`;
 
 const checkRateLimit = async (
   env: Env,
   bucket: string,
   limit: number,
   windowMs: number,
+  consume = true,
 ): Promise<RateLimitDecision> => {
   const stub = env.RATE_LIMIT.get(env.RATE_LIMIT.idFromName(bucket));
-  const response = await stub.fetch(`https://limiter/consume?limit=${limit}&windowMs=${windowMs}`);
+  const response = await stub.fetch(
+    `https://limiter/consume?limit=${limit}&windowMs=${windowMs}${consume ? '' : '&consume=0'}`,
+  );
   return (await response.json()) as RateLimitDecision;
 };
 
@@ -76,23 +94,51 @@ const accountAuthLimit = (env: Env) => ({
   limit: numberFromEnv(env.RATE_LIMIT_AUTH_ACCOUNT, 5),
   windowMs: 15 * 60 * 1000,
 });
+/** The per-address backstop: higher and slower, so it bites only a distributed run. */
+const wideAccountLimit = (env: Env) => ({
+  limit: numberFromEnv(env.RATE_LIMIT_AUTH_ACCOUNT_WIDE, 20),
+  windowMs: 60 * 60 * 1000,
+});
 const writeLimit = (env: Env) => ({ limit: numberFromEnv(env.RATE_LIMIT_WRITE, 60), windowMs: 60 * 1000 });
 const readLimit = (env: Env) => ({ limit: numberFromEnv(env.RATE_LIMIT_READ, 120), windowMs: 60 * 1000 });
 
-/** Consumes the per-address auth bucket. Blocked looks the same as a blocked IP. */
-const checkAccountLimit = async (env: Env, email: string): Promise<RateLimitDecision> => {
-  const { limit, windowMs } = accountAuthLimit(env);
-  return checkRateLimit(env, accountKey(email), limit, windowMs);
+/**
+ * Looks at both per-address buckets without spending from either. Blocked looks
+ * exactly like a blocked IP.
+ */
+const peekAccountLimit = async (env: Env, purpose: string, email: string, request: Request) => {
+  const narrow = accountAuthLimit(env);
+  const wide = wideAccountLimit(env);
+
+  const [narrowDecision, wideDecision] = await Promise.all([
+    checkRateLimit(env, narrowAccountKey(purpose, email, request), narrow.limit, narrow.windowMs, false),
+    checkRateLimit(env, wideAccountKey(purpose, email), wide.limit, wide.windowMs, false),
+  ]);
+
+  return narrowDecision.allowed ? wideDecision : narrowDecision;
+};
+
+/** Spends from both per-address buckets. Only ever called after a failed attempt. */
+const spendAccountLimit = async (env: Env, purpose: string, email: string, request: Request): Promise<void> => {
+  const narrow = accountAuthLimit(env);
+  const wide = wideAccountLimit(env);
+
+  await Promise.all([
+    checkRateLimit(env, narrowAccountKey(purpose, email, request), narrow.limit, narrow.windowMs),
+    checkRateLimit(env, wideAccountKey(purpose, email), wide.limit, wide.windowMs),
+  ]);
 };
 
 const tooManyRequests = (decision: RateLimitDecision): Response =>
-  new Response(JSON.stringify({ error: 'Too many requests, please slow down' }), {
-    status: 429,
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-      'retry-after': String(decision.retryAfterSeconds),
-    },
-  });
+  new Response(
+    // The client turns retryAfterSeconds into "try again in N minutes"; a bare
+    // "slow down" leaves a locked-out user with no idea how long to wait.
+    JSON.stringify({
+      error: 'Too many attempts, please wait before trying again',
+      retryAfterSeconds: decision.retryAfterSeconds,
+    }),
+    { status: 429, headers: { ...JSON_HEADERS, 'retry-after': String(decision.retryAfterSeconds) } },
+  );
 
 const callUserStore = (env: Env, email: string, path: string, body?: unknown): Promise<Response> => {
   const stub = env.USERS.get(env.USERS.idFromName(email));
@@ -145,10 +191,7 @@ const accountHasGroupCapacity = async (env: Env, user: SessionUser, groupId?: st
 };
 
 const passThrough = async (response: Response): Promise<Response> =>
-  new Response(await response.text(), {
-    status: response.status,
-    headers: { 'content-type': 'application/json; charset=utf-8' },
-  });
+  new Response(await response.text(), { status: response.status, headers: JSON_HEADERS });
 
 const appManifest = {
   name: 'Quotes Journal',
@@ -213,14 +256,25 @@ const htmlResponse = (): Response => {
 app.get('/', () => htmlResponse());
 app.get('/app', () => htmlResponse());
 app.get('/join', () => htmlResponse());
-app.get('/manifest.webmanifest', (c) => c.json(appManifest));
+app.get('/manifest.webmanifest', (c) =>
+  c.body(JSON.stringify(appManifest), 200, {
+    'content-type': 'application/manifest+json; charset=utf-8',
+    'x-content-type-options': 'nosniff',
+  }),
+);
 app.get('/sw.js', (c) =>
   c.body(serviceWorkerScript, 200, {
     'content-type': 'application/javascript; charset=utf-8',
     'cache-control': 'no-cache',
+    'x-content-type-options': 'nosniff',
   }),
 );
-app.get('/icon.svg', (c) => c.body(appIcon, 200, { 'content-type': 'image/svg+xml; charset=utf-8' }));
+app.get('/icon.svg', (c) =>
+  c.body(appIcon, 200, {
+    'content-type': 'image/svg+xml; charset=utf-8',
+    'x-content-type-options': 'nosniff',
+  }),
+);
 
 /** Rejects requests without a valid session token. */
 const requireUser: MiddlewareHandler<AppEnv> = async (c, next) => {
@@ -291,7 +345,7 @@ app.post('/api/auth/register', async (c) => {
     return jsonError(password.error, 400);
   }
 
-  const accountDecision = await checkAccountLimit(c.env, email.value);
+  const accountDecision = await peekAccountLimit(c.env, 'register', email.value, c.req.raw);
   if (!accountDecision.allowed) {
     return tooManyRequests(accountDecision);
   }
@@ -306,9 +360,13 @@ app.post('/api/auth/register', async (c) => {
 
   // A taken address still answers 409: with no email provider wired up, a
   // neutral "check your inbox" would leave the user unable to finish signing up.
-  // The per-account bucket above is what stops that 409 being a usable
-  // enumeration oracle; the neutral response waits on email delivery (issue #6).
+  //
+  // That 409 remains an enumeration oracle. The per-address buckets do not close
+  // it — enumeration probes each address once, so every address arrives with a
+  // full bucket — and only the per-IP limit slows it down. The real fix is a
+  // neutral response with the outcome delivered by email; it waits on issue #6.
   if (!response.ok) {
+    await spendAccountLimit(c.env, 'register', email.value, c.req.raw);
     return passThrough(response);
   }
 
@@ -339,7 +397,7 @@ app.post('/api/auth/login', async (c) => {
     return jsonError('Email or password is incorrect', 401);
   }
 
-  const accountDecision = await checkAccountLimit(c.env, email.value);
+  const accountDecision = await peekAccountLimit(c.env, 'login', email.value, c.req.raw);
   if (!accountDecision.allowed) {
     return tooManyRequests(accountDecision);
   }
@@ -350,7 +408,10 @@ app.post('/api/auth/login', async (c) => {
     // successful sign-in; the Worker owns the configuration.
     iterations: resolvePbkdf2Iterations(c.env.PBKDF2_ITERATIONS),
   });
+  // Only a failed attempt costs the account budget, so signing in correctly on
+  // several devices never locks the owner out of their own account.
   if (!response.ok) {
+    await spendAccountLimit(c.env, 'login', email.value, c.req.raw);
     return jsonError('Email or password is incorrect', 401);
   }
 
@@ -559,6 +620,15 @@ app.post('/api/invites/accept', async (c) => {
   return c.json(joined, response.status === 201 ? 201 : 200);
 });
 
-app.notFound(() => jsonError('Not found', 404));
+app.notFound((c) => {
+  // A person who mistypes a path gets the app, not a raw error object; API
+  // paths keep answering JSON so clients can still parse the failure.
+  const wantsHtml = (c.req.header('accept') ?? '').includes('text/html');
+  if (wantsHtml && !c.req.path.startsWith('/api/')) {
+    return htmlResponse();
+  }
+
+  return jsonError('Not found', 404);
+});
 
 export default app;
