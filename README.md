@@ -123,7 +123,13 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 
 ## What is still open
 
-See [docs/planned-issues.md](docs/planned-issues.md): the interactive quiz
-frontend, timezone-aware reveal handling, a year-end countdown and unlock
-notifications, richer analytics, session revocation and password reset, a
-persisted mobile session, and store submission setup for the mobile app.
+Tracked in [the issue tracker](https://github.com/dhuelin/quotes-journal/issues):
+
+- [#2](https://github.com/dhuelin/quotes-journal/issues/2) the interactive Kahoot-style quiz frontend
+- [#3](https://github.com/dhuelin/quotes-journal/issues/3) timezone-aware reveal (today it unlocks at midnight UTC)
+- [#4](https://github.com/dhuelin/quotes-journal/issues/4) year-end countdown and unlock notifications
+- [#5](https://github.com/dhuelin/quotes-journal/issues/5) richer analytics beyond the leaderboard
+- [#6](https://github.com/dhuelin/quotes-journal/issues/6) session revocation and password reset
+- [#7](https://github.com/dhuelin/quotes-journal/issues/7) persist the mobile session across restarts
+- [#8](https://github.com/dhuelin/quotes-journal/issues/8) store submission setup for the mobile app
+- [#9](https://github.com/dhuelin/quotes-journal/issues/9) keep the cached group name on an account in sync
