@@ -123,6 +123,7 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 
 ## What is still open
 
-Tracked as issues on the repository: the interactive quiz frontend, a year-end
-countdown and unlock notifications, richer analytics, timezone-aware reveal
-handling, and store submission setup for the mobile app.
+See [docs/planned-issues.md](docs/planned-issues.md): the interactive quiz
+frontend, timezone-aware reveal handling, a year-end countdown and unlock
+notifications, richer analytics, session revocation and password reset, a
+persisted mobile session, and store submission setup for the mobile app.
