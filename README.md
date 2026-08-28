@@ -33,12 +33,19 @@ talks to the same API on Android and iOS.
   fragment (`/join#invite=…`), which browsers never send to a server, so they
   stay out of access logs, referrers and proxies.
 - Joining a group always creates a new member row. A display name matching an
-  existing guest is rejected rather than merged, and names are unique within a
-  group so the member list stays unambiguous.
-- Authentication is rate limited twice: per client IP, and per email address.
-  The second bucket matters because `cf-connecting-ip` is only trustworthy
-  behind the Cloudflare edge — under `wrangler dev` the client sets it. Writes
-  and authenticated reads are limited per account.
+  existing guest is never merged automatically — the owner binds a guest to an
+  account explicitly, because only a human knows whether the new arrival really
+  is that person. Names are unique within a group so the member list stays
+  unambiguous; a joiner whose name is taken picks another for that group.
+- Adding, renaming and removing members is owner-only, so a name cannot be
+  squatted to keep someone out.
+- Authentication is rate limited per client IP and per email address. The
+  second bucket matters because `cf-connecting-ip` is only trustworthy behind
+  the Cloudflare edge — under `wrangler dev` the client sets it. A token is
+  spent only when an attempt **fails**, and login and registration have separate
+  budgets, so signing in correctly on several devices never locks you out and a
+  registration probe cannot deny someone their login. Writes and authenticated
+  reads are limited per account.
 - Every body is size- and shape-checked before it reaches storage, and a group
   is refused new quotes before it can outgrow the Durable Object value ceiling.
 - The app shell is served with a strict `Content-Security-Policy`
@@ -62,6 +69,11 @@ configured one, so accounts upgrade themselves as people sign in.
 
 Rotating `AUTH_SECRET` invalidates all sessions and all outstanding invite
 links at once.
+
+One gap is known and open: registering with an address that already has an
+account answers `409`, which tells an attacker whether a given person uses the
+app. Closing it properly means a neutral response with the outcome delivered by
+email, which is tracked in issue #6.
 
 ## Tech stack
 
@@ -139,14 +151,17 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | `GET` | `/api/groups` | groups you belong to |
 | `POST` | `/api/groups` | `{ name, revealYear }`; the creator becomes owner |
 | `GET` | `/api/groups/:groupId` | members, your role, and progress while locked |
-| `POST` | `/api/groups/:groupId/members` | `{ name }`, for friends without an account |
+| `POST` | `/api/groups/:groupId/members` | `{ name }`, for friends without an account; owner only |
+| `POST` | `/api/groups/:groupId/members/claim` | `{ guestMemberId, memberId }`; owner only |
+| `POST` | `/api/groups/:groupId/members/rename` | `{ memberId, name }`; owner only |
+| `POST` | `/api/groups/:groupId/members/remove` | `{ memberId }`; owner only, refused once quoted |
 | `POST` | `/api/groups/:groupId/quotes` | `{ text, saidByMemberId, involvedMemberIds }`; `409` after the reveal |
 | `GET` | `/api/groups/:groupId/quotes` | `423` until the reveal |
 | `GET` | `/api/groups/:groupId/quiz` | `423` until the reveal |
 | `GET` | `/api/groups/:groupId/stats` | `423` until the reveal |
 | `GET` | `/api/groups/:groupId/invite` | current invite code; the client builds the link |
 | `POST` | `/api/groups/:groupId/invite/rotate` | owner only; invalidates old links |
-| `POST` | `/api/invites/accept` | `{ inviteCode }`; `410` if expired or rotated |
+| `POST` | `/api/invites/accept` | `{ inviteCode, memberName? }`; `410` if expired or rotated |
 
 ## What is still open
 
