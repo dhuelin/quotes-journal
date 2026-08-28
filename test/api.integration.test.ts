@@ -1265,7 +1265,8 @@ describe('read rate limiting (L4)', () => {
     const reader = await registerUser('Reader');
 
     let sawTooMany = false;
-    for (let attempt = 0; attempt < 200 && !sawTooMany; attempt += 1) {
+    // The pool pins RATE_LIMIT_READ low, so this settles in a few dozen calls.
+    for (let attempt = 0; attempt < 60 && !sawTooMany; attempt += 1) {
       const response = await request('/api/auth/me', { token: reader.token, ip: uniqueIp() });
       sawTooMany = response.status === 429;
       if (!sawTooMany) {
