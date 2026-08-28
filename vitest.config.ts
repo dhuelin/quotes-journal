@@ -5,6 +5,11 @@ export default defineWorkersConfig({
     poolOptions: {
       workers: {
         isolatedStorage: false,
+        miniflare: {
+          bindings: {
+            AUTH_SECRET: 'test-secret-not-used-in-production',
+          },
+        },
         wrangler: {
           configPath: './wrangler.toml',
         },
