@@ -1,0 +1,11 @@
+name = "quotes-journal"
+main = "src/index.ts"
+compatibility_date = "2025-09-06"
+
+[[durable_objects.bindings]]
+name = "GROUPS"
+class_name = "GroupStore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GroupStore"]
