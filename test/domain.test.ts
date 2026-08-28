@@ -182,3 +182,25 @@ describe('the stored-value budget', () => {
     expect(exceedsGroupBudget(group(), quote(0, 'still plenty of room'))).toBe(false);
   });
 });
+
+/**
+ * The client is served under `style-src 'nonce-…'`. A nonce authorises inline
+ * <style> blocks but never style="" attributes, which browsers drop silently —
+ * no test that stops at the HTTP layer can see it, so guard the source instead.
+ */
+describe('the inlined client under CSP', () => {
+  it('carries no inline style attributes', async () => {
+    const { renderAppHtml } = await import('../src/ui');
+
+    expect(renderAppHtml('test-nonce')).not.toContain('style="');
+  });
+
+  it('stamps the nonce onto both inline blocks and leaves no placeholder behind', async () => {
+    const { renderAppHtml } = await import('../src/ui');
+    const page = renderAppHtml('test-nonce');
+
+    expect(page).toContain('<style nonce="test-nonce">');
+    expect(page).toContain('<script nonce="test-nonce">');
+    expect(page).not.toContain('__CSP_NONCE__');
+  });
+});

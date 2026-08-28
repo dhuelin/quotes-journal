@@ -140,6 +140,10 @@ const html = `<!doctype html>
         border-left: 3px solid var(--accent); border-radius: 0 10px 10px 0;
       }
       blockquote footer { color: var(--muted); font-size: .85rem; margin-top: .4rem; }
+
+      /* Inline style attributes cannot carry the CSP nonce, so every rule lives here. */
+      .group-title { margin-top: .6rem; }
+      .vault-note { margin-top: .7rem; }
     </style>
   </head>
   <body>
@@ -385,7 +389,7 @@ const html = `<!doctype html>
           return (
             headerHtml() +
             '<button class="link" id="back-to-groups">&larr; All groups</button>' +
-            '<h1 style="margin-top:.6rem">' + escapeHtml(group.name) + '</h1>' +
+            '<h1 class="group-title">' + escapeHtml(group.name) + '</h1>' +
             '<p class="muted small">' +
             (group.locked
               ? 'Sealed until 1 January ' + (group.revealYear + 1) + ' &middot; ' + daysUntil(group.revealAt) + ' days to go'
@@ -428,7 +432,7 @@ const html = `<!doctype html>
             '<select id="quote-said-by" name="saidByMemberId" required>' + options + '</select>' +
             (involved ? '<label>Who else was there?</label><div class="checks">' + involved + '</div>' : '') +
             '<button type="submit">Save quote</button>' +
-            '<p class="small muted" style="margin-top:.7rem">Saved quotes disappear straight into the vault &mdash; nobody, including you, can read them back before the reveal.</p>' +
+            '<p class="small muted vault-note">Saved quotes disappear straight into the vault &mdash; nobody, including you, can read them back before the reveal.</p>' +
             '</form>' +
             '</div>' +
             '<div class="card locked-box">' +
