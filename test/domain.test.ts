@@ -195,6 +195,24 @@ describe('the inlined client under CSP', () => {
     expect(renderAppHtml('test-nonce')).not.toContain('style="');
   });
 
+  it('sets no maxlength, so a pasted over-long value is reported rather than trimmed', async () => {
+    const { renderAppHtml } = await import('../src/ui');
+
+    // Silent truncation hid an error the server states clearly; a counter and
+    // the server's own message replaced it.
+    expect(renderAppHtml('n')).not.toContain('maxlength=');
+    expect(renderAppHtml('n')).toContain('id="quote-count"');
+  });
+
+  it('escapes nothing into a regex literal, which a template literal would eat', async () => {
+    const { renderAppHtml } = await import('../src/ui');
+
+    // ui.ts is one big template literal: a backslash written here never reaches
+    // the browser, so a regex like /^\/groups/ silently becomes /^/groups/ and
+    // throws "invalid flags" at load. Path parsing uses split() instead.
+    expect(renderAppHtml('n')).not.toMatch(/match\(\/\^/);
+  });
+
   it('stamps the nonce onto both inline blocks and leaves no placeholder behind', async () => {
     const { renderAppHtml } = await import('../src/ui');
     const page = renderAppHtml('test-nonce');

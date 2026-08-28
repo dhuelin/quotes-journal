@@ -111,6 +111,10 @@ const html = `<!doctype html>
       .group-item { width: 100%; text-align: left; background: var(--surface-2); border: 1px solid var(--line);
         color: var(--text); margin: 0 0 .6rem; padding: .8rem; border-radius: 12px; font-weight: 500; }
 
+      /* Names and quotes are free text and may contain no spaces at all. Without
+         this a single long run widens the page and every card collapses. */
+      .group-item, blockquote, ul.list li, th, td, .pill, .notice { overflow-wrap: anywhere; }
+
       .pill { font-size: .72rem; padding: .18rem .55rem; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
       .pill.locked { color: var(--accent); border-color: var(--accent); }
       .pill.open { color: var(--ok); border-color: var(--ok); }
@@ -131,7 +135,8 @@ const html = `<!doctype html>
       .locked-box .count { font-size: 2.6rem; font-weight: 700; color: var(--accent); }
 
       table { width: 100%; border-collapse: collapse; }
-      th, td { text-align: left; padding: .5rem 0; border-bottom: 1px solid var(--line); }
+      th, td { text-align: left; padding: .5rem .5rem .5rem 0; border-bottom: 1px solid var(--line); }
+      th:last-child, td:last-child { padding-right: 0; }
       th { color: var(--muted); font-size: .8rem; font-weight: 550; }
       td.num, th.num { text-align: right; }
 
@@ -157,6 +162,7 @@ const html = `<!doctype html>
         }
 
         var TOKEN_KEY = 'quotes-journal.token';
+        var INVITE_KEY = 'quotes-journal.pending-invite';
         var app = document.getElementById('app');
 
         var state = {
@@ -215,6 +221,15 @@ const html = `<!doctype html>
             throw new Error('unauthenticated');
           }
 
+          if (response.status === 429 && payload.retryAfterSeconds) {
+            var wait = payload.retryAfterSeconds > 90
+              ? Math.ceil(payload.retryAfterSeconds / 60) + ' minutes'
+              : payload.retryAfterSeconds + ' seconds';
+            var throttled = new Error((payload.error || 'Too many attempts') + '. Try again in about ' + wait + '.');
+            throttled.status = 429;
+            throw throttled;
+          }
+
           if (!response.ok) {
             var failure = new Error(payload.error || 'Something went wrong');
             failure.payload = payload;
@@ -222,7 +237,7 @@ const html = `<!doctype html>
             throw failure;
           }
 
-          return payload;
+          return settings.withStatus ? { status: response.status, body: payload } : payload;
         }
 
         function signOut(message) {
@@ -289,7 +304,7 @@ const html = `<!doctype html>
           return (
             '<form id="register-form">' +
             '<label for="register-name">Display name</label>' +
-            '<input id="register-name" name="displayName" required maxlength="60" />' +
+            '<input id="register-name" name="displayName" required />' +
             '<p class="small muted">This is the name your friends see next to quotes.</p>' +
             '<label for="register-email">Email</label>' +
             '<input id="register-email" name="email" type="email" autocomplete="email" required />' +
@@ -330,7 +345,7 @@ const html = `<!doctype html>
             '<h2>Start a group</h2>' +
             '<form id="create-group-form">' +
             '<label for="group-name">Group name</label>' +
-            '<input id="group-name" name="name" required maxlength="80" placeholder="Sunday football crew" />' +
+            '<input id="group-name" name="name" required placeholder="Sunday football crew" />' +
             '<label for="group-year">Collect quotes for</label>' +
             '<input id="group-year" name="revealYear" type="number" required value="' + new Date().getUTCFullYear() + '" />' +
             '<p class="small muted">Everything unlocks on 1 January of the following year.</p>' +
@@ -361,9 +376,17 @@ const html = `<!doctype html>
 
         function groupView() {
           var group = state.group;
-          var tabs = ['collect', 'members'];
+          // Once the reveal has passed the server refuses new quotes, so
+          // offering the form would be a promise the app cannot keep.
+          var tabs = group.locked ? ['collect', 'members'] : ['members'];
           if (!group.locked) {
-            tabs.push('reveal');
+            tabs.unshift('reveal');
+          }
+
+          // A tab from a URL or an earlier group may not exist here — a revealed
+          // group has no collect tab — so settle on a real one before rendering.
+          if (tabs.indexOf(state.tab) === -1) {
+            state.tab = tabs[0];
           }
 
           var tabsHtml = tabs
@@ -380,7 +403,7 @@ const html = `<!doctype html>
           var body;
           if (state.tab === 'members') {
             body = membersTab();
-          } else if (state.tab === 'reveal' && !group.locked) {
+          } else if (state.tab === 'reveal') {
             body = revealTab();
           } else {
             body = collectTab();
@@ -427,7 +450,8 @@ const html = `<!doctype html>
             '<div class="card">' +
             '<form id="quote-form">' +
             '<label for="quote-text">What was said?</label>' +
-            '<textarea id="quote-text" name="text" required maxlength="500" placeholder="&#8220;I am not lost, the map is wrong.&#8221;"></textarea>' +
+            '<textarea id="quote-text" name="text" required placeholder="&#8220;I am not lost, the map is wrong.&#8221;"></textarea>' +
+            '<p class="small muted" id="quote-count">0 / 500</p>' +
             '<label for="quote-said-by">Who said it?</label>' +
             '<select id="quote-said-by" name="saidByMemberId" required>' + options + '</select>' +
             (involved ? '<label>Who else was there?</label><div class="checks">' + involved + '</div>' : '') +
@@ -472,7 +496,7 @@ const html = `<!doctype html>
             '<p class="small muted">Use this for friends who should be quotable but are not using the app.</p>' +
             '<form id="member-form">' +
             '<label for="member-name">Name</label>' +
-            '<input id="member-name" name="name" required maxlength="60" />' +
+            '<input id="member-name" name="name" required />' +
             '<button type="submit">Add member</button>' +
             '</form>' +
             '</div>'
@@ -518,7 +542,7 @@ const html = `<!doctype html>
             '<tbody>' + rows + '</tbody></table>' +
             '</div>' +
             '<div class="card">' +
-            '<h2>' + escapeHtml(state.reveal.quotes.length) + ' quotes</h2>' +
+            '<h2>' + escapeHtml(state.reveal.quotes.length) + (state.reveal.quotes.length === 1 ? ' quote' : ' quotes') + '</h2>' +
             (quotes || '<p class="muted">This group never recorded a quote.</p>') +
             '</div>'
           );
@@ -526,7 +550,57 @@ const html = `<!doctype html>
 
         /* ---------- actions ---------- */
 
-        function render() {
+        /**
+         * Re-rendering replaces the whole document, which throws away whatever
+         * the user had typed. That is right after a successful save — the form
+         * should come back empty — but wrong after a validation error, where
+         * losing a half-written quote is the worst thing the app can do. So the
+         * failure paths ask for the input back.
+         */
+        function readForms() {
+          var snapshot = {};
+          var fields = app.querySelectorAll('input, textarea, select');
+
+          for (var index = 0; index < fields.length; index += 1) {
+            var field = fields[index];
+            var key = field.id || field.name;
+            if (!key) {
+              continue;
+            }
+            if (field.type === 'checkbox' || field.type === 'radio') {
+              snapshot['@' + key + '=' + field.value] = field.checked;
+            } else {
+              snapshot[key] = field.value;
+            }
+          }
+
+          return snapshot;
+        }
+
+        function writeForms(snapshot) {
+          var fields = app.querySelectorAll('input, textarea, select');
+
+          for (var index = 0; index < fields.length; index += 1) {
+            var field = fields[index];
+            var key = field.id || field.name;
+            if (!key) {
+              continue;
+            }
+            if (field.type === 'checkbox' || field.type === 'radio') {
+              var checked = snapshot['@' + key + '=' + field.value];
+              if (checked !== undefined) {
+                field.checked = checked;
+              }
+            } else if (snapshot[key] !== undefined) {
+              field.value = snapshot[key];
+            }
+          }
+        }
+
+        function render(options) {
+          var keepInput = options && options.keepInput;
+          var snapshot = keepInput ? readForms() : null;
+
           if (!state.token) {
             app.innerHTML = authView();
           } else if (state.group) {
@@ -534,6 +608,11 @@ const html = `<!doctype html>
           } else {
             app.innerHTML = groupsView();
           }
+
+          if (snapshot) {
+            writeForms(snapshot);
+          }
+
           state.notice = null;
           bind();
         }
@@ -556,7 +635,7 @@ const html = `<!doctype html>
             } catch (error) {
               if (error && error.message !== 'unauthenticated') {
                 notify(error.message, 'error');
-                render();
+                render({ keepInput: true });
               }
             } finally {
               if (button) {
@@ -584,6 +663,7 @@ const html = `<!doctype html>
           document.querySelectorAll('[data-tab]').forEach(function (button) {
             button.addEventListener('click', function () {
               state.tab = button.getAttribute('data-tab');
+              history.replaceState({}, '', pathFor(state.group.id, state.tab));
               render();
               if (state.tab === 'reveal' && !state.reveal) {
                 loadReveal();
@@ -602,6 +682,7 @@ const html = `<!doctype html>
             state.group = null;
             state.reveal = null;
             state.tab = 'collect';
+            history.pushState({}, '', '/app');
             render();
           });
 
@@ -633,7 +714,7 @@ const html = `<!doctype html>
               method: 'POST',
               body: { email: form.email.value, password: form.password.value },
             });
-            await startSession(result);
+            await startSession(result, true);
           });
 
           onSubmit('register-form', async function (form) {
@@ -645,7 +726,7 @@ const html = `<!doctype html>
                 password: form.password.value,
               },
             });
-            await startSession(result);
+            await startSession(result, true);
           });
 
           onSubmit('create-group-form', async function (form) {
@@ -655,21 +736,29 @@ const html = `<!doctype html>
             });
             await loadGroups();
             state.group = created.group;
-            state.tab = 'collect';
+            state.tab = defaultTab(created.group);
+            history.pushState({}, '', pathFor(created.group.id, state.tab));
             notify('Group created. Share the invite link from the members tab.', 'ok');
             render();
+            if (state.tab === 'reveal') {
+              loadReveal();
+            }
           });
 
           onSubmit('join-form', async function (form) {
-            var joined = await api('/api/invites/accept', {
-              method: 'POST',
-              body: { inviteCode: readInvite(form.inviteCode.value) },
-            });
-            state.pendingInvite = null;
+            var joined = await acceptInvite(readInvite(form.inviteCode.value));
+            forgetPendingInvite();
             await loadGroups();
-            state.group = joined.group;
-            state.tab = 'collect';
-            notify('You joined ' + joined.group.name + '.', 'ok');
+            state.group = joined.body.group;
+            state.tab = defaultTab(joined.body.group);
+            history.pushState({}, '', pathFor(joined.body.group.id, state.tab));
+            // 201 means the join happened; 200 means you were already in.
+            notify(
+              joined.status === 201
+                ? 'You joined ' + joined.body.group.name + '.'
+                : 'You are already a member of ' + joined.body.group.name + '.',
+              'ok',
+            );
             render();
           });
 
@@ -682,6 +771,17 @@ const html = `<!doctype html>
             notify('Member added.', 'ok');
             render();
           });
+
+          var quoteText = document.getElementById('quote-text');
+          var quoteCount = document.getElementById('quote-count');
+          if (quoteText && quoteCount) {
+            var showCount = function () {
+              quoteCount.textContent = quoteText.value.length + ' / 500';
+              quoteCount.className = quoteText.value.length > 500 ? 'small' : 'small muted';
+            };
+            quoteText.addEventListener('input', showCount);
+            showCount();
+          }
 
           onSubmit('quote-form', async function (form) {
             var involved = Array.prototype.slice
@@ -731,9 +831,32 @@ const html = `<!doctype html>
         function readInviteFromLocation() {
           var code = inviteFromText(location.hash) || inviteFromText(location.search);
           if (code) {
+            // Stashed before the URL is cleaned, so reloading the landing page
+            // — or coming back to a tab the phone restored — does not silently
+            // drop the invite and leave the user in a group-less account.
+            try {
+              sessionStorage.setItem(INVITE_KEY, code);
+            } catch (error) {
+              /* private mode: fall back to the in-memory copy */
+            }
             history.replaceState({}, '', location.pathname);
+            return code;
           }
-          return code || null;
+
+          try {
+            return sessionStorage.getItem(INVITE_KEY);
+          } catch (error) {
+            return null;
+          }
+        }
+
+        function forgetPendingInvite() {
+          state.pendingInvite = null;
+          try {
+            sessionStorage.removeItem(INVITE_KEY);
+          } catch (error) {
+            /* nothing to clean up */
+          }
         }
 
         /** Built from this origin: the server never composes a link from a header. */
@@ -741,19 +864,28 @@ const html = `<!doctype html>
           return location.origin + '/join#invite=' + encodeURIComponent(code);
         }
 
-        async function startSession(result) {
+        async function startSession(result, justSignedIn) {
           state.token = result.token;
           state.user = result.user;
           localStorage.setItem(TOKEN_KEY, result.token);
 
           if (state.pendingInvite) {
             try {
-              await api('/api/invites/accept', { method: 'POST', body: { inviteCode: state.pendingInvite } });
-              notify('You joined the group you were invited to.', 'ok');
+              var joined = await acceptInvite(state.pendingInvite);
+              notify(
+                joined.status === 201
+                  ? 'You joined ' + joined.body.group.name + '.'
+                  : 'You are already a member of ' + joined.body.group.name + '.',
+                'ok',
+              );
             } catch (error) {
-              notify('Signed in, but the invite link could not be used: ' + error.message, 'error');
+              notify(
+                (justSignedIn ? 'Signed in, but that invite link could not be used: ' : 'That invite link could not be used: ') +
+                  error.message,
+                'error',
+              );
             }
-            state.pendingInvite = null;
+            forgetPendingInvite();
             history.replaceState({}, '', '/app');
           }
 
@@ -767,12 +899,83 @@ const html = `<!doctype html>
           state.groups = account.groups;
         }
 
-        async function openGroup(groupId, tab) {
+        /**
+         * Accepts an invite, and if the group already has someone by this name,
+         * asks for another rather than dead-ending: the display name is global
+         * but a member name is per-group.
+         */
+        async function acceptInvite(code) {
+          try {
+            return await api('/api/invites/accept', { method: 'POST', body: { inviteCode: code }, withStatus: true });
+          } catch (error) {
+            if (!error.payload || !error.payload.nameTaken) {
+              throw error;
+            }
+
+            var alternative = prompt(
+              'Someone in that group already goes by your name. What should they call you there?',
+              state.user ? state.user.displayName : '',
+            );
+
+            if (!alternative) {
+              throw error;
+            }
+
+            return api('/api/invites/accept', {
+              method: 'POST',
+              body: { inviteCode: code, memberName: alternative },
+              withStatus: true,
+            });
+          }
+        }
+
+        /**
+         * The app had no history entries at all: Back left the page entirely,
+         * which on a phone is the natural "up" gesture, and a reload dropped
+         * you to the group list. Each group and tab now has a real URL. The
+         * Worker serves the shell for any non-API path, so these survive a
+         * refresh.
+         */
+        function pathFor(groupId, tab) {
+          return groupId ? '/groups/' + encodeURIComponent(groupId) + '/' + (tab || 'collect') : '/app';
+        }
+
+        // Split rather than matched: this file is a template literal, so a
+        // backslash in a regex here is eaten before the browser ever sees it.
+        function locationTarget() {
+          var parts = location.pathname.split('/').filter(Boolean);
+          if (parts[0] !== 'groups' || !parts[1]) {
+            return null;
+          }
+          return { groupId: decodeURIComponent(parts[1]), tab: parts[2] || null };
+        }
+
+        /** Collecting is the point during the year; the reveal is the point after. */
+        function defaultTab(group) {
+          return group.locked ? 'collect' : 'reveal';
+        }
+
+        async function openGroup(groupId, tab, options) {
+          // Re-reading the group the user is already looking at — after saving a
+          // quote, say — is a refresh, not a navigation. Pushing for those would
+          // stack duplicate entries and Back would appear to do nothing.
+          var reopening = state.group && state.group.id === groupId;
+
           try {
             var result = await api('/api/groups/' + encodeURIComponent(groupId));
             state.group = result.group;
-            state.tab = tab || 'collect';
+            state.tab = tab || defaultTab(result.group);
             state.reveal = null;
+
+            if (!(options && options.fromHistory)) {
+              var path = pathFor(groupId, state.tab);
+              if (reopening) {
+                history.replaceState({}, '', path);
+              } else {
+                history.pushState({}, '', path);
+              }
+            }
+
             render();
             if (state.tab === 'reveal') {
               loadReveal();
@@ -799,6 +1002,23 @@ const html = `<!doctype html>
           }
         }
 
+        window.addEventListener('popstate', function () {
+          var target = locationTarget();
+          if (!state.token) {
+            render();
+            return;
+          }
+
+          if (target) {
+            openGroup(target.groupId, target.tab, { fromHistory: true });
+            return;
+          }
+
+          state.group = null;
+          state.reveal = null;
+          render();
+        });
+
         async function boot() {
           if (!state.token) {
             render();
@@ -808,7 +1028,7 @@ const html = `<!doctype html>
           try {
             await loadGroups();
             if (state.pendingInvite) {
-              await startSession({ token: state.token, user: state.user });
+              await startSession({ token: state.token, user: state.user }, false);
               return;
             }
           } catch (error) {
@@ -816,6 +1036,12 @@ const html = `<!doctype html>
               return;
             }
             notify(error.message, 'error');
+          }
+
+          var target = locationTarget();
+          if (target) {
+            await openGroup(target.groupId, target.tab, { fromHistory: true });
+            return;
           }
 
           render();
