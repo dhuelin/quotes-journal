@@ -21,6 +21,7 @@ A Cloudflare Worker app with web (`/`) and app-style (`/app`) interfaces to mana
 - GitHub Actions + Wrangler deployment to Cloudflare
 - Docker support for local startup
 - PWA support for Android and iOS (installable mobile experience)
+- Capacitor native projects for App Store + Google Play Store publishing
 
 ## Local development
 
@@ -35,6 +36,32 @@ npm run dev
 docker build -t quotes-journal .
 docker run --rm -p 8787:8787 quotes-journal
 ```
+
+## Mobile app (Android + iOS) and store publishing
+
+Native app projects are included in:
+
+- `/android` (Google Play Store)
+- `/ios` (Apple App Store)
+
+Set the mobile web endpoint (the deployed Worker URL) before syncing:
+
+```bash
+export MOBILE_APP_URL="https://<your-worker>.workers.dev/app"
+npm run mobile:sync
+```
+
+Then open projects:
+
+```bash
+npm run mobile:open:android
+npm run mobile:open:ios
+```
+
+From Android Studio / Xcode, create release builds and submit:
+
+- Google Play: upload `.aab` in Play Console
+- Apple App Store: upload archive via Xcode Organizer / Transporter
 
 ## Test
 
