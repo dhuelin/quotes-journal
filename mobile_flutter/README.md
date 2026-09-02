@@ -29,10 +29,16 @@ flutter test
 
 - Create an account or sign in; the session token is held in memory for the run.
 - List the groups you belong to, create a group, or join one from an invite link.
+  If the group already has someone using your display name, it asks what to call
+  you there rather than turning you away.
 - Record a quote: pick who said it and who else was there. The server attributes
   the quote to you, so who collected what cannot be faked.
-- While the year runs, only a count is visible. From 1 January the reveal tab
-  shows every quote and the per-member statistics.
+- While the year runs, only a count is visible, and the group opens on the quote
+  form. From 1 January collecting is over: the form is gone and the group opens
+  on the reveal, with every quote and the per-member statistics.
+- Owners can add a guest, bind a guest to the account of someone who has joined,
+  and rename or remove a member. Those routes are owner-only on the server, so
+  the app only offers them to owners.
 
 ## Store submission
 

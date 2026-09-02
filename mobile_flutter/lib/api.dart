@@ -18,6 +18,10 @@ class ApiResult {
     final error = body['error'];
     return error is String ? error : 'Something went wrong (HTTP $statusCode)';
   }
+
+  /// The group already has a member under the name this join asked for. The
+  /// server sets this so a client can offer another name instead of a dead end.
+  bool get isNameTaken => statusCode == 409 && body['nameTaken'] == true;
 }
 
 /// Lets tests drive the client without a socket.
@@ -85,8 +89,38 @@ class QuotesApi {
   Future<ApiResult> group({required String groupId}) =>
       _request('GET', '/api/groups/${Uri.encodeComponent(groupId)}', null);
 
+  /// Owner only: everyone else gets a 403.
   Future<ApiResult> addMember({required String groupId, required String name}) =>
       _request('POST', '/api/groups/${Uri.encodeComponent(groupId)}/members', {'name': name});
+
+  /// Owner only. Binds a guest row to someone who has already joined, folding
+  /// their own row in so quotes recorded either way stay on one member.
+  Future<ApiResult> claimGuest({
+    required String groupId,
+    required String guestMemberId,
+    required String memberId,
+  }) =>
+      _request('POST', '/api/groups/${Uri.encodeComponent(groupId)}/members/claim', {
+        'guestMemberId': guestMemberId,
+        'memberId': memberId,
+      });
+
+  /// Owner only.
+  Future<ApiResult> renameMember({
+    required String groupId,
+    required String memberId,
+    required String name,
+  }) =>
+      _request('POST', '/api/groups/${Uri.encodeComponent(groupId)}/members/rename', {
+        'memberId': memberId,
+        'name': name,
+      });
+
+  /// Owner only. Refused once the member appears in a quote.
+  Future<ApiResult> removeMember({required String groupId, required String memberId}) =>
+      _request('POST', '/api/groups/${Uri.encodeComponent(groupId)}/members/remove', {
+        'memberId': memberId,
+      });
 
   /// The Worker attributes the quote to the signed-in caller, so there is no
   /// `recordedByMemberId` to send.
@@ -114,8 +148,13 @@ class QuotesApi {
   Future<ApiResult> invite({required String groupId}) =>
       _request('GET', '/api/groups/${Uri.encodeComponent(groupId)}/invite', null);
 
-  Future<ApiResult> acceptInvite({required String inviteCode}) =>
-      _request('POST', '/api/invites/accept', {'inviteCode': inviteCode});
+  /// [memberName] names you within that one group, for when the group already
+  /// has someone using your account's display name.
+  Future<ApiResult> acceptInvite({required String inviteCode, String? memberName}) =>
+      _request('POST', '/api/invites/accept', {
+        'inviteCode': inviteCode,
+        'memberName': ?memberName,
+      });
 
   void _rememberToken(ApiResult result) {
     final value = result.body['token'];

@@ -53,16 +53,22 @@ class _QuotesJournalAppState extends State<QuotesJournalApp> {
 
 /// Shared helper: runs an API call, shows a snack bar on failure and returns
 /// the result only when it succeeded.
+/// [ignoreFailure] suppresses the snack bar for a failure the caller intends to
+/// handle itself — a name collision on join, say, where the right answer is to
+/// ask for another name rather than to show an error and stop.
 Future<ApiResult?> runCall(
   BuildContext context,
   Future<ApiResult> Function() call, {
   String? successMessage,
+  bool Function(ApiResult failure)? ignoreFailure,
 }) async {
   final messenger = ScaffoldMessenger.of(context);
   try {
     final result = await call();
     if (!result.isSuccess) {
-      messenger.showSnackBar(SnackBar(content: Text(result.errorMessage)));
+      if (ignoreFailure == null || !ignoreFailure(result)) {
+        messenger.showSnackBar(SnackBar(content: Text(result.errorMessage)));
+      }
       return null;
     }
     if (successMessage != null) {

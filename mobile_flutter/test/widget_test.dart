@@ -14,15 +14,19 @@ RequestSender backend(Map<String, ApiResult> routes, {List<String>? seen}) {
   };
 }
 
-Map<String, dynamic> groupBody({required bool locked, int totalQuotes = 0}) => {
+Map<String, dynamic> groupBody({
+  required bool locked,
+  int totalQuotes = 0,
+  String role = 'owner',
+}) => {
       'group': {
         'id': 'g1',
         'name': 'Sunday football crew',
         'revealYear': 2026,
         'locked': locked,
-        'you': {'memberId': 'm1', 'name': 'Alice', 'role': 'owner'},
+        'you': {'memberId': 'm1', 'name': 'Alice', 'role': role},
         'members': [
-          {'id': 'm1', 'name': 'Alice', 'role': 'owner', 'isGuest': false, 'isYou': true},
+          {'id': 'm1', 'name': 'Alice', 'role': role, 'isGuest': false, 'isYou': true},
           {'id': 'm2', 'name': 'Cleo', 'role': 'member', 'isGuest': true, 'isYou': false},
         ],
         'progress': {'totalQuotes': totalQuotes, 'recordedByYou': totalQuotes, 'memberCount': 2},
@@ -145,6 +149,92 @@ void main() {
     expect(find.text('I am not lost, the map is wrong'), findsOneWidget);
     expect(find.text('— Cleo, recorded by Alice'), findsOneWidget);
     expect(find.text('quoted 1 · collected 0'), findsOneWidget);
+  });
+
+  testWidgets('a revealed group offers no quote form, since the server refuses one', (tester) async {
+    final api = QuotesApi(
+      baseUrl: 'https://example.test',
+      sender: backend({
+        'GET /api/groups/g1': ok(groupBody(locked: false, totalQuotes: 4)),
+        'GET /api/groups/g1/quotes': ok(const {'quotes': []}),
+        'GET /api/groups/g1/stats': ok(const {'leaderboard': []}),
+      }),
+    );
+
+    await tester.pumpWidget(MaterialApp(home: GroupScreen(api: api, groupId: 'g1')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Add a quote'), findsNothing);
+    expect(find.byKey(const Key('quote-text-field')), findsNothing);
+    expect(find.text('The reveal'), findsOneWidget);
+  });
+
+  testWidgets('the quote field does not silently truncate, and counts instead', (tester) async {
+    final api = QuotesApi(
+      baseUrl: 'https://example.test',
+      sender: backend({'GET /api/groups/g1': ok(groupBody(locked: true))}),
+    );
+
+    await tester.pumpWidget(MaterialApp(home: GroupScreen(api: api, groupId: 'g1')));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.byKey(const Key('quote-text-field')), 'x' * 501);
+    await tester.pump();
+
+    final field = tester.widget<TextField>(find.byKey(const Key('quote-text-field')));
+    expect(field.maxLength, isNull);
+    expect(field.controller!.text.length, 501);
+    expect(find.text('501 / 500'), findsOneWidget);
+  });
+
+  testWidgets('member management is hidden from members who are not the owner', (tester) async {
+    final api = QuotesApi(
+      baseUrl: 'https://example.test',
+      sender: backend({'GET /api/groups/g1': ok(groupBody(locked: true, role: 'member'))}),
+    );
+
+    await tester.pumpWidget(MaterialApp(home: GroupScreen(api: api, groupId: 'g1')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Members'));
+    await tester.pumpAndSettle();
+
+    // Adding, claiming, renaming and removing are owner-only on the server, so
+    // a non-owner should never be offered a control that earns them a 403.
+    expect(find.byKey(const Key('add-member-tile')), findsNothing);
+    expect(find.byKey(const Key('member-menu-m2')), findsNothing);
+    expect(find.byKey(const Key('show-invite-tile')), findsOneWidget);
+  });
+
+  testWidgets('the owner can reach claim, rename and remove on a guest', (tester) async {
+    final seen = <String>[];
+    final api = QuotesApi(
+      baseUrl: 'https://example.test',
+      sender: backend(
+        {
+          'GET /api/groups/g1': ok(groupBody(locked: true)),
+          'POST /api/groups/g1/members/rename': ok(groupBody(locked: true)),
+        },
+        seen: seen,
+      ),
+    );
+
+    await tester.pumpWidget(MaterialApp(home: GroupScreen(api: api, groupId: 'g1')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Members'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('member-menu-m2')));
+    await tester.pumpAndSettle();
+    expect(find.text('This is someone who joined'), findsOneWidget);
+    expect(find.text('Remove'), findsOneWidget);
+
+    await tester.tap(find.text('Rename'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('member-rename-field')), 'Cleopatra');
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+
+    expect(seen, contains('POST /api/groups/g1/members/rename'));
   });
 
   testWidgets('saving a quote posts it and clears the field', (tester) async {

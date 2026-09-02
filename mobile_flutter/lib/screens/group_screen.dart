@@ -59,26 +59,28 @@ class _GroupScreenState extends State<GroupScreen> {
       );
     }
 
-    final tabCount = _locked ? 2 : 3;
-
+    // Once the reveal has passed the server refuses new quotes, so offering the
+    // form would be a promise the app cannot keep. Collecting is the point
+    // during the year; the reveal is the point after it.
     return DefaultTabController(
-      length: tabCount,
+      length: 2,
       child: Scaffold(
         appBar: AppBar(
           title: Text('${group['name']}'),
           bottom: TabBar(
             tabs: [
-              const Tab(text: 'Add a quote'),
+              Tab(text: _locked ? 'Add a quote' : 'The reveal'),
               const Tab(text: 'Members'),
-              if (!_locked) const Tab(text: 'The reveal'),
             ],
           ),
         ),
         body: TabBarView(
           children: [
-            _CollectTab(api: widget.api, group: group, members: _members, onSaved: _load),
+            if (_locked)
+              _CollectTab(api: widget.api, group: group, members: _members, onSaved: _load)
+            else
+              _RevealTab(api: widget.api, groupId: widget.groupId, members: _members),
             _MembersTab(api: widget.api, group: group, members: _members, onChanged: _load),
-            if (!_locked) _RevealTab(api: widget.api, groupId: widget.groupId, members: _members),
           ],
         ),
       ),
@@ -161,10 +163,13 @@ class _CollectTabState extends State<_CollectTab> {
           key: const Key('quote-text-field'),
           controller: _text,
           maxLines: 3,
-          maxLength: 500,
-          decoration: const InputDecoration(
+          // No maxLength: silently trimming a pasted quote hides a limit the
+          // server states clearly. The counter shows it instead.
+          onChanged: (_) => setState(() {}),
+          decoration: InputDecoration(
             labelText: 'What was said?',
-            border: OutlineInputBorder(),
+            border: const OutlineInputBorder(),
+            helperText: '${_text.text.characters.length} / 500',
           ),
         ),
         const SizedBox(height: 8),
@@ -277,6 +282,111 @@ class _MembersTab extends StatelessWidget {
     }
   }
 
+  /// Binds a guest row to a member who has joined, on the owner's say-so.
+  Future<void> _claim(BuildContext context, Map<String, dynamic> guest) async {
+    final joined = members
+        .where((entry) => entry['isGuest'] != true && entry['id'] != guest['id'])
+        .toList();
+
+    if (joined.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Nobody has joined yet who could be this person.')),
+      );
+      return;
+    }
+
+    final memberId = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: Text('Who is ${guest['name']}?'),
+        children: [
+          for (final entry in joined)
+            SimpleDialogOption(
+              onPressed: () => Navigator.of(dialogContext).pop('${entry['id']}'),
+              child: Text('${entry['name']}'),
+            ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
+
+    if (memberId == null || !context.mounted) {
+      return;
+    }
+
+    final result = await runCall(
+      context,
+      () => api.claimGuest(
+        groupId: '${group['id']}',
+        guestMemberId: '${guest['id']}',
+        memberId: memberId,
+      ),
+      successMessage: 'Their quotes now belong to their account.',
+    );
+
+    if (result != null) {
+      await onChanged();
+    }
+  }
+
+  Future<void> _rename(BuildContext context, Map<String, dynamic> member) async {
+    final name = await _askForName(context, 'Rename ${member['name']}', '${member['name']}');
+    if (name == null || name.isEmpty || !context.mounted) {
+      return;
+    }
+
+    final result = await runCall(
+      context,
+      () => api.renameMember(groupId: '${group['id']}', memberId: '${member['id']}', name: name),
+      successMessage: 'Renamed.',
+    );
+
+    if (result != null) {
+      await onChanged();
+    }
+  }
+
+  Future<void> _remove(BuildContext context, Map<String, dynamic> member) async {
+    final result = await runCall(
+      context,
+      () => api.removeMember(groupId: '${group['id']}', memberId: '${member['id']}'),
+      successMessage: 'Removed.',
+    );
+
+    if (result != null) {
+      await onChanged();
+    }
+  }
+
+  Future<String?> _askForName(BuildContext context, String title, String initial) {
+    final controller = TextEditingController(text: initial);
+    return showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(title),
+        content: TextField(
+          key: const Key('member-rename-field'),
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: 'Name'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(controller.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _showInvite(BuildContext context) async {
     final result = await runCall(context, () => api.invite(groupId: '${group['id']}'));
     if (result == null || !context.mounted) {
@@ -302,13 +412,38 @@ class _MembersTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Adding, claiming, renaming and removing are owner-only on the server, so
+    // showing them to anyone else would just earn a 403.
+    final isOwner = (group['you'] as Map?)?['role'] == 'owner';
+
     return ListView(
       children: [
         for (final member in members)
           ListTile(
             title: Text('${member['name']}'),
             subtitle: Text(member['isGuest'] == true ? 'not signed up' : '${member['role']}'),
-            trailing: member['isYou'] == true ? const Chip(label: Text('you')) : null,
+            trailing: member['isYou'] == true
+                ? const Chip(label: Text('you'))
+                : isOwner && member['role'] != 'owner'
+                    ? PopupMenuButton<String>(
+                        key: Key('member-menu-${member['id']}'),
+                        onSelected: (choice) {
+                          if (choice == 'claim') {
+                            _claim(context, member);
+                          } else if (choice == 'rename') {
+                            _rename(context, member);
+                          } else {
+                            _remove(context, member);
+                          }
+                        },
+                        itemBuilder: (_) => [
+                          if (member['isGuest'] == true)
+                            const PopupMenuItem(value: 'claim', child: Text('This is someone who joined')),
+                          const PopupMenuItem(value: 'rename', child: Text('Rename')),
+                          const PopupMenuItem(value: 'remove', child: Text('Remove')),
+                        ],
+                      )
+                    : null,
           ),
         const Divider(),
         ListTile(
@@ -317,12 +452,13 @@ class _MembersTab extends StatelessWidget {
           title: const Text('Show invite link'),
           onTap: () => _showInvite(context),
         ),
-        ListTile(
-          key: const Key('add-member-tile'),
-          leading: const Icon(Icons.person_add),
-          title: const Text('Add someone without an account'),
-          onTap: () => _addMember(context),
-        ),
+        if (isOwner)
+          ListTile(
+            key: const Key('add-member-tile'),
+            leading: const Icon(Icons.person_add),
+            title: const Text('Add someone without an account'),
+            onTap: () => _addMember(context),
+          ),
       ],
     );
   }

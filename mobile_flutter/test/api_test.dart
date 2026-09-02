@@ -115,6 +115,61 @@ void main() {
     });
   });
 
+  group('owner-only member routes', () {
+    late FakeBackend backend;
+    late QuotesApi api;
+
+    setUp(() {
+      backend = FakeBackend();
+      api = QuotesApi(baseUrl: 'https://example.test', sender: backend.sender);
+    });
+
+    test('claiming names both the guest row and the account folded into it', () async {
+      await api.claimGuest(groupId: 'g1', guestMemberId: 'guest', memberId: 'joined');
+
+      final call = backend.calls.single;
+      expect(call['path'], '/api/groups/g1/members/claim');
+      expect(call['body'], {'guestMemberId': 'guest', 'memberId': 'joined'});
+    });
+
+    test('rename and remove address a member by id', () async {
+      await api.renameMember(groupId: 'g1', memberId: 'm2', name: 'Cleopatra');
+      await api.removeMember(groupId: 'g1', memberId: 'm2');
+
+      expect(backend.calls[0]['path'], '/api/groups/g1/members/rename');
+      expect(backend.calls[0]['body'], {'memberId': 'm2', 'name': 'Cleopatra'});
+      expect(backend.calls[1]['path'], '/api/groups/g1/members/remove');
+      expect(backend.calls[1]['body'], {'memberId': 'm2'});
+    });
+  });
+
+  group('joining under another name', () {
+    test('omits memberName unless one was chosen', () async {
+      final backend = FakeBackend();
+      final api = QuotesApi(baseUrl: 'https://example.test', sender: backend.sender);
+
+      await api.acceptInvite(inviteCode: 'code');
+      expect((backend.calls.single['body'] as Map).containsKey('memberName'), isFalse);
+    });
+
+    test('sends the chosen per-group name when there is one', () async {
+      final backend = FakeBackend();
+      final api = QuotesApi(baseUrl: 'https://example.test', sender: backend.sender);
+
+      await api.acceptInvite(inviteCode: 'code', memberName: 'Bob B');
+      expect((backend.calls.single['body'] as Map)['memberName'], 'Bob B');
+    });
+
+    test('recognises a name collision, and only that', () {
+      expect(
+        ApiResult(statusCode: 409, body: const {'error': 'taken', 'nameTaken': true}).isNameTaken,
+        isTrue,
+      );
+      expect(ApiResult(statusCode: 409, body: const {'error': 'other'}).isNameTaken, isFalse);
+      expect(ApiResult(statusCode: 410, body: const {'nameTaken': true}).isNameTaken, isFalse);
+    });
+  });
+
   group('readInviteCode', () {
     test('accepts a bare code', () {
       expect(readInviteCode('  abc.def  '), 'abc.def');

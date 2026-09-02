@@ -77,15 +77,42 @@ class _GroupsScreenState extends State<GroupsScreen> {
       return;
     }
 
-    final result = await runCall(
+    final invite = readInviteCode(code);
+    var result = await runCall(
       context,
-      () => widget.api.acceptInvite(inviteCode: readInviteCode(code)),
+      () => widget.api.acceptInvite(inviteCode: invite),
       successMessage: 'You joined the group.',
+      // Handled below rather than shown as a dead end.
+      ignoreFailure: (failure) => failure.isNameTaken,
     );
+
+    if (result == null && mounted) {
+      result = await _joinUnderAnotherName(invite);
+    }
 
     if (result != null && mounted) {
       await _load();
     }
+  }
+
+  /// The group already has someone using this account's display name, so it
+  /// asks for a name to go by in that one group instead of refusing outright.
+  Future<ApiResult?> _joinUnderAnotherName(String invite) async {
+    final alternative = await _promptForText(
+      title: 'That name is taken',
+      label: 'What should they call you in this group?',
+      fieldKey: const Key('member-name-field'),
+    );
+
+    if (alternative == null || alternative.isEmpty || !mounted) {
+      return null;
+    }
+
+    return runCall(
+      context,
+      () => widget.api.acceptInvite(inviteCode: invite, memberName: alternative),
+      successMessage: 'You joined the group.',
+    );
   }
 
   Future<String?> _promptForText({
