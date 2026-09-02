@@ -1,0 +1,33 @@
+name = "quotes-journal"
+main = "src/index.ts"
+compatibility_date = "2025-09-06"
+
+# AUTH_SECRET is intentionally not declared here: it is a secret, set once with
+# `wrangler secret put AUTH_SECRET` (and in .dev.vars for local development).
+# Declaring it as a plain var would overwrite the secret on every deploy.
+
+# PBKDF2_ITERATIONS defaults to 30,000, which fits the free plan's 10ms of CPU.
+# On a paid plan raise it to OWASP's 600000 (about 90ms); stored hashes carry
+# their own round count, so existing accounts upgrade on their next login.
+# [vars]
+# PBKDF2_ITERATIONS = "600000"
+
+[[durable_objects.bindings]]
+name = "GROUPS"
+class_name = "GroupStore"
+
+[[durable_objects.bindings]]
+name = "USERS"
+class_name = "UserStore"
+
+[[durable_objects.bindings]]
+name = "RATE_LIMIT"
+class_name = "RateLimiter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GroupStore"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["UserStore", "RateLimiter"]

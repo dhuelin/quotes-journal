@@ -1,0 +1,32 @@
+{
+  "name": "quotes-journal",
+  "version": "1.0.0",
+  "description": "A Application, which can save your funny quotes and prepare a Quiz about the Quotes.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "start:docker": "wrangler dev --ip 0.0.0.0 --port 8787",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dhuelin/quotes-journal"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "hono": "^4.9.8"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8.71",
+    "@cloudflare/workers-types": "^5.20260828.1",
+    "@types/node": "^24.5.2",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.38.0"
+  }
+}
