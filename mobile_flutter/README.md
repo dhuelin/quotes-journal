@@ -6,16 +6,20 @@ the web app uses, so it needs a deployed (or locally running) Worker to point at
 ## Configure the backend
 
 The server address is a compile-time constant, so release builds cannot be
-pointed at the wrong host by accident:
+pointed at the wrong host by accident. It defaults to production
+(`https://quotes.huelin.dev`), so a release build needs no flag:
 
 ```bash
-flutter run --dart-define=QUOTES_JOURNAL_URL=http://10.0.2.2:8787          # Android emulator against `npm run dev`
-flutter build apk --dart-define=QUOTES_JOURNAL_URL=https://<worker>.workers.dev
-flutter build ipa --dart-define=QUOTES_JOURNAL_URL=https://<worker>.workers.dev
+flutter build apk
+flutter build ipa
 ```
 
-Without the flag it falls back to `https://quotes-journal.example.workers.dev`,
-which is a placeholder and will not resolve.
+Override it to run against a local Worker:
+
+```bash
+flutter run --dart-define=QUOTES_JOURNAL_URL=http://10.0.2.2:8787   # Android emulator against `npm run dev`
+flutter run --dart-define=QUOTES_JOURNAL_URL=http://localhost:8787  # iOS simulator
+```
 
 ## Develop
 

@@ -3,8 +3,8 @@
 Collect the funny things your friends say all year, then unlock the whole
 collection — plus a quiz and per-person statistics — on 1 January.
 
-A Cloudflare Worker serves both the web app and the HTTP API; a Flutter app
-talks to the same API on Android and iOS.
+Live at **https://quotes.huelin.dev**. A Cloudflare Worker serves both the web
+app and the HTTP API; a Flutter app talks to the same API on Android and iOS.
 
 ## How it works
 
@@ -125,18 +125,45 @@ pointed at the wrong host by accident.
 
 ## Deploy
 
-Configure repository secrets for GitHub Actions:
+Pushing to `main` deploys to **https://quotes.huelin.dev** via GitHub Actions.
+
+Configure these repository secrets:
 
 - `CLOUDFLARE_API_TOKEN`
 - `CLOUDFLARE_ACCOUNT_ID`
 
-Set the app secret once, against your Cloudflare account:
+The token needs, on the account holding the Worker:
+
+- **Workers Scripts → Edit** — uploads the script, applies the Durable Object
+  migrations, and stores secrets
+- **Account Settings → Read**
+- **User Details → Read**
+
+and, because the Worker runs on a custom domain rather than `workers.dev`:
+
+- **Zone → Workers Routes → Edit**, on the `huelin.dev` zone
+
+Set the app secret once, against the same account:
 
 ```bash
 npx wrangler secret put AUTH_SECRET
 ```
 
-Then push to `main` to trigger a deploy.
+Without it the auth endpoints answer `503`. Rotating it signs everyone out and
+invalidates every outstanding invite link.
+
+### The domain
+
+`quotes.huelin.dev` is configured as a [Custom
+Domain](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/):
+the Worker is the origin, and Cloudflare manages the DNS record and the
+certificate. `workers_dev = false` keeps the app on that one hostname — served
+from two origins it would split sessions, since tokens live in `localStorage`
+per origin.
+
+Both clients build invite links from their own origin, so nothing needs
+updating when the hostname changes. Links shared earlier keep working: an
+invite code is signed against its group, not against a host.
 
 ## API overview
 
