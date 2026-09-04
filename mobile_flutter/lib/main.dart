@@ -5,11 +5,15 @@ import 'screens/group_screen.dart';
 import 'screens/groups_screen.dart';
 import 'screens/sign_in_screen.dart';
 
-/// Where the app talks to. Override at build time:
-/// `flutter build apk --dart-define=QUOTES_JOURNAL_URL=https://…workers.dev`
+/// Where the app talks to. Production by default; override at build time to
+/// point a build at a local Worker:
+/// `flutter run --dart-define=QUOTES_JOURNAL_URL=http://10.0.2.2:8787`
+///
+/// Compile-time on purpose: a release build cannot be repointed at another host
+/// after the fact, by anyone.
 const String defaultBaseUrl = String.fromEnvironment(
   'QUOTES_JOURNAL_URL',
-  defaultValue: 'https://quotes-journal.example.workers.dev',
+  defaultValue: 'https://quotes.huelin.dev',
 );
 
 void main() {

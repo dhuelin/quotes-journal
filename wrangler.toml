@@ -2,6 +2,24 @@ name = "quotes-journal"
 main = "src/index.ts"
 compatibility_date = "2025-09-06"
 
+# One origin only. Without this the app stays reachable at the workers.dev
+# subdomain as well, which splits sessions (tokens live in localStorage, per
+# origin) and leaves a second public copy of the same data.
+#
+# Must stay above [[routes]]: after a table header TOML would read it as a key
+# inside the route rather than a top-level setting.
+workers_dev = false
+
+# The Worker is the origin, so this is a Custom Domain rather than a route:
+# Cloudflare creates the DNS record and issues the certificate itself, and every
+# path on the hostname reaches the Worker.
+#
+# Deploying this needs Zone > Workers Routes > Edit on the huelin.dev zone, on
+# top of the account-level Workers permissions.
+[[routes]]
+pattern = "quotes.huelin.dev"
+custom_domain = true
+
 # AUTH_SECRET is intentionally not declared here: it is a secret, set once with
 # `wrangler secret put AUTH_SECRET` (and in .dev.vars for local development).
 # Declaring it as a plain var would overwrite the secret on every deploy.
