@@ -1,0 +1,85 @@
+name: Mobile release
+
+# Builds signed store artefacts on a version tag, e.g. `git tag v1.0.0 && git push --tags`.
+# Nothing is uploaded to either store automatically: the artefacts are attached to
+# the workflow run for you to submit, so a tag can never publish by itself.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: Android app bundle
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile_flutter
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Restore the upload keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "ANDROID_KEYSTORE_BASE64 is not set. Add it as a repository secret:"
+            echo "  base64 -w0 quotes-journal-upload.jks"
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/upload.jks"
+
+      - name: Build the app bundle
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/upload.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: flutter build appbundle --release
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: quotes-journal-android
+          path: mobile_flutter/build/app/outputs/bundle/release/app-release.aab
+          if-no-files-found: error
+
+  ios:
+    name: iOS archive
+    # Only a macOS runner has Xcode, so this job cannot run on ubuntu.
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: mobile_flutter
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # Unsigned: signing needs an Apple distribution certificate and a
+      # provisioning profile in the runner's keychain. This proves the iOS build
+      # compiles on every tag; the submittable archive is built in Xcode until
+      # those credentials are set up. See mobile_flutter/README.md.
+      - name: Build (unsigned)
+        run: flutter build ios --release --no-codesign

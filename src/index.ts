@@ -2,7 +2,7 @@ import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { GroupStore } from './group-store';
 import { UserStore } from './user-store';
 import { RateLimiter, type RateLimitDecision } from './rate-limiter';
-import { renderAppHtml } from './ui';
+import { renderAppHtml, renderPrivacyHtml } from './ui';
 import { LIMITS } from './domain';
 import {
   createInviteCode,
@@ -224,7 +224,7 @@ const appIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" r
  * than keeping hashes in step with the markup. Everything else is denied:
  * nothing here loads a third-party origin.
  */
-const htmlResponse = (): Response => {
+const htmlResponse = (render: (nonce: string) => string = renderAppHtml): Response => {
   const nonce = crypto.randomUUID().replaceAll('-', '');
   const policy = [
     "default-src 'none'",
@@ -241,7 +241,7 @@ const htmlResponse = (): Response => {
     "frame-ancestors 'none'",
   ].join('; ');
 
-  return new Response(renderAppHtml(nonce), {
+  return new Response(render(nonce), {
     headers: {
       'content-type': 'text/html; charset=utf-8',
       'content-security-policy': policy,
@@ -256,6 +256,8 @@ const htmlResponse = (): Response => {
 app.get('/', () => htmlResponse());
 app.get('/app', () => htmlResponse());
 app.get('/join', () => htmlResponse());
+// Both app stores require a reachable privacy policy URL in the listing.
+app.get('/privacy', () => htmlResponse(renderPrivacyHtml));
 app.get('/manifest.webmanifest', (c) =>
   c.body(JSON.stringify(appManifest), 200, {
     'content-type': 'application/manifest+json; charset=utf-8',

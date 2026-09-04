@@ -1058,3 +1058,101 @@ const html = `<!doctype html>
  * is stamped into both tags here.
  */
 export const renderAppHtml = (nonce: string): string => html.replaceAll('__CSP_NONCE__', nonce);
+
+/**
+ * The privacy policy, served at /privacy. Both app stores require a reachable
+ * policy URL in the listing, and the store data-safety declarations have to
+ * match what this says — so it describes exactly what the code does and nothing
+ * aspirational.
+ *
+ * Kept in the same file and under the same CSP as the app: one inline style,
+ * carrying the nonce, no scripts at all.
+ */
+const privacyHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0f1020" />
+    <title>Privacy — Quotes Journal</title>
+    <style nonce="__CSP_NONCE__">
+      :root { --bg:#0f1020; --surface:#191a30; --line:#32345a; --text:#f2f2f7; --muted:#a2a4c4; --accent:#f8c630; color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body { margin:0; background:var(--bg); color:var(--text);
+        font:16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+      main { max-width:680px; margin:0 auto; padding:2rem 1rem 4rem; }
+      h1 { font-size:1.6rem; margin:0 0 .25rem; }
+      h2 { font-size:1.1rem; margin:2rem 0 .5rem; }
+      p, li { margin:0 0 .75rem; }
+      ul { padding-left:1.2rem; }
+      a { color:var(--accent); }
+      .muted { color:var(--muted); }
+      .card { background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:1rem 1.25rem; margin-top:1.5rem; }
+      /* A nonce authorises inline style blocks but never style attributes. */
+      .flush { margin-top:0; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Privacy</h1>
+      <p class="muted">Quotes Journal &middot; last updated 4 September 2026</p>
+
+      <p>Quotes Journal is a small app for recording things your friends said and
+      reading them back at the end of the year. This page describes every piece of
+      data it holds and what happens to it.</p>
+
+      <h2>What is collected</h2>
+      <ul>
+        <li><strong>Your email address</strong>, so you can sign in and so an
+        account can be recognised as yours.</li>
+        <li><strong>A display name</strong> you choose, shown to the other members
+        of your groups.</li>
+        <li><strong>Your password</strong>, stored only as a PBKDF2-HMAC-SHA256
+        hash with a random salt. The password itself is never written down.</li>
+        <li><strong>The groups you belong to</strong>, the names of members in
+        them, and the quotes recorded in them.</li>
+      </ul>
+
+      <h2>What is not collected</h2>
+      <ul>
+        <li>No analytics, tracking or advertising, of any kind.</li>
+        <li>No contacts, location, photos, camera or microphone access.</li>
+        <li>No third-party services. Nothing is shared with anyone.</li>
+        <li>Nothing is sold, ever.</li>
+      </ul>
+
+      <h2>Who can see your quotes</h2>
+      <p>Quotes are visible only to members of the group they were recorded in,
+      and only after that group's reveal date. Before then the app shows a count
+      and nothing else &mdash; not even to the person who wrote the quote down.
+      Someone who is not a member of a group cannot see that the group exists.</p>
+
+      <h2>Where it is stored</h2>
+      <p>On Cloudflare Workers infrastructure, reachable only through
+      <a href="https://quotes.huelin.dev">quotes.huelin.dev</a> over HTTPS. The
+      app is run by an individual, not a company.</p>
+
+      <h2>Deleting your data</h2>
+      <p>There is no self-service delete yet. Email the address below and your
+      account and its data will be removed. This is a known gap and is tracked
+      publicly in the project's issue tracker.</p>
+
+      <h2>Children</h2>
+      <p>The app is not directed at children and collects nothing beyond what is
+      listed above from anyone.</p>
+
+      <h2>Changes</h2>
+      <p>If this policy changes, the date at the top of this page changes with it.
+      The app is open source, so every revision is visible in its history.</p>
+
+      <div class="card">
+        <h2 class="flush">Contact</h2>
+        <p class="muted">For privacy questions or a deletion request, contact the
+        maintainer through the
+        <a href="https://github.com/dhuelin/quotes-journal">project repository</a>.</p>
+      </div>
+    </main>
+  </body>
+</html>`;
+
+export const renderPrivacyHtml = (nonce: string): string => privacyHtml.replaceAll('__CSP_NONCE__', nonce);

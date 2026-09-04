@@ -117,11 +117,15 @@ The Flutter client lives in [`mobile_flutter/`](mobile_flutter/README.md):
 cd mobile_flutter
 flutter pub get
 flutter test
-flutter run --dart-define=QUOTES_JOURNAL_URL=https://<your-worker>.workers.dev
+flutter run                 # talks to production; --dart-define to point elsewhere
 ```
 
-The backend address is a compile-time constant, so a release build cannot be
-pointed at the wrong host by accident.
+The backend address is a compile-time constant defaulting to production, so a
+release build cannot be pointed at the wrong host by accident.
+
+Store identifiers, signing, release builds and the submission checklist are in
+[`mobile_flutter/README.md`](mobile_flutter/README.md). Both app ids are
+`dev.huelin.quotesjournal` and are permanent once published.
 
 ## Deploy
 
@@ -189,6 +193,10 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | `GET` | `/api/groups/:groupId/invite` | current invite code; the client builds the link |
 | `POST` | `/api/groups/:groupId/invite/rotate` | owner only; invalidates old links |
 | `POST` | `/api/invites/accept` | `{ inviteCode, memberName? }`; `410` if expired or rotated |
+
+The Worker also serves the app at `/`, `/app` and `/join`, and a privacy policy
+at `/privacy` — both app stores require a reachable policy URL, and the
+store data-safety declarations must match what that page says.
 
 ## What is still open
 
