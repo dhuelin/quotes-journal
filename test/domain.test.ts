@@ -189,10 +189,23 @@ describe('the stored-value budget', () => {
  * no test that stops at the HTTP layer can see it, so guard the source instead.
  */
 describe('the inlined client under CSP', () => {
-  it('carries no inline style attributes', async () => {
-    const { renderAppHtml } = await import('../src/ui');
+  it('carries no inline style attributes on any page', async () => {
+    const { renderAppHtml, renderPrivacyHtml } = await import('../src/ui');
 
+    // Every page served under the nonce policy, not just the app: a style=""
+    // attribute cannot carry the nonce and is dropped silently by the browser.
     expect(renderAppHtml('test-nonce')).not.toContain('style="');
+    expect(renderPrivacyHtml('test-nonce')).not.toContain('style="');
+  });
+
+  it('stamps the nonce onto the privacy page too', async () => {
+    const { renderPrivacyHtml } = await import('../src/ui');
+    const page = renderPrivacyHtml('test-nonce');
+
+    expect(page).toContain('<style nonce="test-nonce">');
+    expect(page).not.toContain('__CSP_NONCE__');
+    // No scripts at all on this page, so none should be authorised.
+    expect(page).not.toContain('<script');
   });
 
   it('sets no maxlength, so a pasted over-long value is reported rather than trimmed', async () => {

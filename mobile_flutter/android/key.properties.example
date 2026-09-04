@@ -1,0 +1,16 @@
+# Copy to android/key.properties and fill in. Never commit the real file or the
+# keystore: android/.gitignore already excludes key.properties, *.jks and
+# *.keystore.
+#
+# Generate a keystore once, and keep it somewhere you will still have in five
+# years. Losing it means you can never publish an update to this app again —
+# Play matches uploads by signing key, and there is no recovery.
+#
+#   keytool -genkey -v -keystore ~/quotes-journal-upload.jks \
+#     -keyalg RSA -keysize 2048 -validity 10000 -alias upload
+#
+# storeFile is resolved relative to the android/ directory.
+storeFile=../../quotes-journal-upload.jks
+storePassword=
+keyAlias=upload
+keyPassword=
