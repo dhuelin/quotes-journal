@@ -10,7 +10,16 @@ import {
 } from '../src/auth';
 import type { UserRecord } from '../src/user-store';
 import type { GroupStore } from '../src/group-store';
-import { createGroup, registerUser, request, unlockGroup, uniqueIp, type TestUser } from './helpers';
+import {
+  createGroup,
+  fakeImage,
+  rawRequest,
+  registerUser,
+  request,
+  unlockGroup,
+  uniqueIp,
+  type TestUser,
+} from './helpers';
 
 const nextYear = new Date().getUTCFullYear();
 
@@ -22,6 +31,23 @@ const inviteCodeFor = async (owner: TestUser, groupId: string): Promise<string> 
   expect(response.status).toBe(200);
   return response.body.inviteCode as string;
 };
+
+/** Walks someone through a real invite so the membership checks are exercised. */
+const joinGroup = async (owner: TestUser, joiner: TestUser, groupId: string): Promise<void> => {
+  const inviteCode = await inviteCodeFor(owner, groupId);
+  const response = await request('/api/invites/accept', {
+    method: 'POST',
+    token: joiner.token,
+    body: { inviteCode },
+  });
+  expect(response.status).toBe(201);
+};
+
+/** The serialised size of what is actually in storage for a group. */
+const storedGroupSize = async (groupId: string): Promise<number> =>
+  runInDurableObject(env.GROUPS.get(env.GROUPS.idFromName(groupId)), async (_instance, state) =>
+    groupByteSize((await state.storage.get<GroupState>('group')) as GroupState),
+  );
 
 const accountStub = (user: TestUser) => env.USERS.get(env.USERS.idFromName(user.user.email));
 
@@ -1195,7 +1221,9 @@ describe('security headers (L1)', () => {
     for (const directive of [
       "default-src 'none'",
       "connect-src 'self'",
-      "img-src 'self' data:",
+      // blob: is the preview and the revealed picture, both created from bytes
+      // this origin already holds; no remote image source is allowed.
+      "img-src 'self' data: blob:",
       "manifest-src 'self'",
       "base-uri 'none'",
       "form-action 'none'",
@@ -1295,5 +1323,177 @@ describe('writing after the reveal (L5)', () => {
 
     const stats = await request(`/api/groups/${group.id}/stats`, { token: alice.token });
     expect(stats.body.totalQuotes).toBe(0);
+  });
+});
+
+/**
+ * A picture is context for a quote, so it is exactly as secret as the quote is:
+ * behind the same membership check and the same reveal lock, including for the
+ * person who uploaded it.
+ */
+describe('pictures attached to quotes (L6)', () => {
+  const addQuote = async (author: TestUser, groupId: string, saidByMemberId: string, text = 'Look at this') => {
+    const response = await request(`/api/groups/${groupId}/quotes`, {
+      method: 'POST',
+      token: author.token,
+      body: { text, saidByMemberId },
+    });
+    expect(response.status).toBe(201);
+    return response.body.quote.id as string;
+  };
+
+  const attach = (author: TestUser, groupId: string, quoteId: string, bytes: Uint8Array) =>
+    rawRequest(`/api/groups/${groupId}/quotes/${quoteId}/image`, {
+      method: 'POST',
+      token: author.token,
+      contentType: 'image/jpeg',
+      body: bytes,
+    });
+
+  it('keeps a picture sealed until the reveal, even from the person who uploaded it', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Sealed pictures', nextYear);
+    const quoteId = await addQuote(alice, group.id, group.you.memberId);
+
+    expect((await attach(alice, group.id, quoteId, fakeImage('jpeg'))).status).toBe(201);
+
+    const locked = await rawRequest(`/api/groups/${group.id}/quotes/${quoteId}/image`, { token: alice.token });
+    expect(locked.status).toBe(423);
+    expect((await locked.json<{ revealAt: string }>()).revealAt).toBeTruthy();
+  });
+
+  it('serves the picture after the reveal, with the type its bytes actually are', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Opened pictures', nextYear);
+    const quoteId = await addQuote(alice, group.id, group.you.memberId);
+
+    // Uploaded claiming to be a JPEG; the bytes say PNG, and the bytes win.
+    const png = fakeImage('png', 128);
+    const upload = await rawRequest(`/api/groups/${group.id}/quotes/${quoteId}/image`, {
+      method: 'POST',
+      token: alice.token,
+      contentType: 'image/jpeg',
+      body: png,
+    });
+    expect(upload.status).toBe(201);
+
+    await unlockGroup(group.id);
+
+    const image = await rawRequest(`/api/groups/${group.id}/quotes/${quoteId}/image`, { token: alice.token });
+    expect(image.status).toBe(200);
+    expect(image.headers.get('content-type')).toBe('image/png');
+    expect(image.headers.get('x-content-type-options')).toBe('nosniff');
+    // A picture is private to the group, so no shared cache may keep a copy.
+    expect(image.headers.get('cache-control')).toContain('no-store');
+    expect(new Uint8Array(await image.arrayBuffer())).toEqual(png);
+
+    const quotes = await request(`/api/groups/${group.id}/quotes`, { token: alice.token });
+    expect(quotes.body.quotes[0].image).toMatchObject({ contentType: 'image/png', bytes: 128 });
+  });
+
+  it('refuses anything that is not a picture, whatever the header says', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Not a picture', nextYear);
+    const quoteId = await addQuote(alice, group.id, group.you.memberId);
+
+    // An SVG is an image to a browser and a script host to an attacker; it has
+    // no magic number in the allow-list, so it never reaches storage.
+    const svg = new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>');
+    const response = await attach(alice, group.id, quoteId, svg);
+
+    expect(response.status).toBe(415);
+    expect((await response.json<{ error: string }>()).error).toContain('JPEG, PNG and WebP');
+  });
+
+  it('refuses a picture over the size cap', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Too big', nextYear);
+    const quoteId = await addQuote(alice, group.id, group.you.memberId);
+
+    const response = await attach(alice, group.id, quoteId, fakeImage('jpeg', LIMITS.quoteImageBytes + 1));
+
+    expect(response.status).toBe(413);
+  });
+
+  it('lets only the recorder attach or remove a picture', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Whose quote', nextYear);
+    await joinGroup(alice, bob, group.id);
+    const quoteId = await addQuote(alice, group.id, group.you.memberId);
+
+    expect((await attach(bob, group.id, quoteId, fakeImage('jpeg'))).status).toBe(403);
+
+    const removedByBob = await request(`/api/groups/${group.id}/quotes/${quoteId}/image/remove`, {
+      method: 'POST',
+      token: bob.token,
+      body: {},
+    });
+    expect(removedByBob.status).toBe(403);
+  });
+
+  it('lets the recorder replace a picture and take it away again', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Wrong photo', nextYear);
+    const quoteId = await addQuote(alice, group.id, group.you.memberId);
+
+    expect((await attach(alice, group.id, quoteId, fakeImage('jpeg', 100))).status).toBe(201);
+    const replaced = await attach(alice, group.id, quoteId, fakeImage('webp', 200));
+    expect(replaced.status).toBe(201);
+    expect((await replaced.json<{ image: { bytes: number } }>()).image.bytes).toBe(200);
+
+    const removed = await request(`/api/groups/${group.id}/quotes/${quoteId}/image/remove`, {
+      method: 'POST',
+      token: alice.token,
+      body: {},
+    });
+    expect(removed.status).toBe(200);
+
+    await unlockGroup(group.id);
+    const gone = await rawRequest(`/api/groups/${group.id}/quotes/${quoteId}/image`, { token: alice.token });
+    expect(gone.status).toBe(404);
+
+    const quotes = await request(`/api/groups/${group.id}/quotes`, { token: alice.token });
+    expect(quotes.body.quotes[0].image).toBeUndefined();
+  });
+
+  it('hides a picture from someone outside the group behind the same 404 as the group', async () => {
+    const alice = await registerUser('Alice');
+    const stranger = await registerUser('Mallory');
+    const group = await createGroup(alice, 'Private pictures', nextYear);
+    const quoteId = await addQuote(alice, group.id, group.you.memberId);
+    await attach(alice, group.id, quoteId, fakeImage('jpeg'));
+    await unlockGroup(group.id);
+
+    const response = await rawRequest(`/api/groups/${group.id}/quotes/${quoteId}/image`, { token: stranger.token });
+
+    expect(response.status).toBe(404);
+    expect((await response.json<{ error: string }>()).error).toBe('Group not found');
+  });
+
+  it('stops accepting pictures once the group has opened', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Late picture', nextYear);
+    const quoteId = await addQuote(alice, group.id, group.you.memberId);
+    await unlockGroup(group.id);
+
+    const response = await attach(alice, group.id, quoteId, fakeImage('jpeg'));
+
+    expect(response.status).toBe(409);
+    expect((await response.json<{ error: string }>()).error).toContain('no longer collecting');
+  });
+
+  it('keeps the picture bytes out of the stored group value', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Blob budget', nextYear);
+    const quoteId = await addQuote(alice, group.id, group.you.memberId);
+    const before = await storedGroupSize(group.id);
+
+    await attach(alice, group.id, quoteId, fakeImage('jpeg', 500_000));
+
+    // Only the metadata lands in the group value. Were the bytes in there, the
+    // group would be a few writes from the ceiling that breaks every later one.
+    const after = await storedGroupSize(group.id);
+    expect(after - before).toBeLessThan(200);
   });
 });

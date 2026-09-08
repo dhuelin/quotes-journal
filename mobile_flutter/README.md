@@ -44,6 +44,13 @@ flutter test
   and rename or remove a member. Those routes are owner-only on the server, so
   the app only offers them to owners.
 
+## Not here yet
+
+A quote can carry an optional picture, and this client neither uploads nor shows
+one — the web app does. A quote with a picture still reads correctly here; the
+picture is simply absent. Tracked in
+[#20](https://github.com/dhuelin/quotes-journal/issues/20).
+
 ## Identifiers
 
 Both are **permanent once published**. Neither store lets you change the id of a

@@ -14,6 +14,7 @@ import {
   type SessionUser,
 } from './auth';
 import { readJsonBody, validateEmail, validatePassword, validateRevealYear, validateText } from './validation';
+import { readImageUpload } from './images';
 
 export { GroupStore, UserStore, RateLimiter };
 
@@ -174,6 +175,34 @@ const callGroupStore = (
 };
 
 /**
+ * The same call for a body that is not JSON. Quote pictures are sent as raw
+ * bytes: base64 in a JSON envelope would inflate them by a third and would not
+ * fit the 16KB body cap that every other route relies on.
+ */
+const callGroupStoreRaw = (
+  env: Env,
+  groupId: string,
+  path: string,
+  user: SessionUser,
+  method: 'GET' | 'POST',
+  body?: BodyInit,
+  extraHeaders: Record<string, string> = {},
+): Promise<Response> => {
+  const stub = env.GROUPS.get(env.GROUPS.idFromName(groupId));
+  return stub.fetch(
+    new Request(`https://group${path}`, {
+      method,
+      headers: {
+        ...extraHeaders,
+        'x-user-id': user.id,
+        'x-user-name': user.displayName,
+      },
+      body,
+    }),
+  );
+};
+
+/**
  * A group is recorded twice — in the group object and on the account — and only
  * the account side carries the cap. Checking it before the group object is
  * written keeps an over-cap creation from leaving a group nobody can reach.
@@ -231,7 +260,11 @@ const htmlResponse = (render: (nonce: string) => string = renderAppHtml): Respon
     `script-src 'nonce-${nonce}'`,
     `style-src 'nonce-${nonce}'`,
     "connect-src 'self'",
-    "img-src 'self' data:",
+    // blob: covers both halves of the picture feature: the local preview before
+    // a quote is saved, and the revealed picture, which is fetched with the
+    // bearer token and turned into an object URL rather than being addressed by
+    // a URL that would have to carry a credential.
+    "img-src 'self' data: blob:",
     "manifest-src 'self'",
     // The app registers /sw.js; without this it would fall back to script-src
     // and the service worker would be blocked by its own nonce policy.
@@ -536,6 +569,55 @@ app.post('/api/groups/:groupId/members/claim', (c) => forwardWrite(c, '/members/
 app.post('/api/groups/:groupId/members/rename', (c) => forwardWrite(c, '/members/rename'));
 app.post('/api/groups/:groupId/members/remove', (c) => forwardWrite(c, '/members/remove'));
 app.post('/api/groups/:groupId/quotes', (c) => forwardWrite(c, '/quotes'));
+app.post('/api/groups/:groupId/quotes/:quoteId/image/remove', (c) =>
+  forwardWrite(c, `/quotes/${encodeURIComponent(c.req.param('quoteId') ?? '')}/image/remove`),
+);
+
+/**
+ * Attaches a picture to a quote. The bytes are checked here — size first, then
+ * what the file actually is, from its magic number rather than its header — so
+ * the group object only ever sees something already established to be a JPEG,
+ * PNG or WebP.
+ */
+app.post('/api/groups/:groupId/quotes/:quoteId/image', async (c) => {
+  const user = c.get('user');
+  const { limit, windowMs } = writeLimit(c.env);
+  const decision = await checkRateLimit(c.env, `write:${user.id}`, limit, windowMs);
+  if (!decision.allowed) {
+    return tooManyRequests(decision);
+  }
+
+  const upload = await readImageUpload(c.req.raw);
+  if (!upload.ok) {
+    return jsonError(upload.error, upload.status);
+  }
+
+  const path = `/quotes/${encodeURIComponent(c.req.param('quoteId'))}/image`;
+  return passThrough(
+    await callGroupStoreRaw(c.env, c.req.param('groupId'), path, user, 'POST', upload.bytes as BodyInit, {
+      'x-image-type': upload.contentType,
+    }),
+  );
+});
+
+/**
+ * Serves a picture back, behind the same membership check and the same reveal
+ * lock as the quote it belongs to. The client fetches this with its bearer
+ * token and renders the result as an object URL, so nothing here needs a
+ * credential in the URL — which would leak through history and referrers.
+ */
+app.get('/api/groups/:groupId/quotes/:quoteId/image', async (c) => {
+  const path = `/quotes/${encodeURIComponent(c.req.param('quoteId'))}/image`;
+  const response = await callGroupStoreRaw(c.env, c.req.param('groupId'), path, c.get('user'), 'GET');
+
+  // A refusal is JSON — locked, not a member, no picture — and a success is the
+  // image itself, carrying headers that must survive intact.
+  if (!response.ok) {
+    return passThrough(response);
+  }
+
+  return new Response(response.body, { status: response.status, headers: response.headers });
+});
 
 app.get('/api/groups/:groupId/invite', async (c) => {
   const secret = requireSecret(c.env);

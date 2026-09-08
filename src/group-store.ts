@@ -2,6 +2,8 @@ import {
   areQuotesVisible,
   exceedsGroupBudget,
   exceedsGroupHardCap,
+  exceedsImageBudget,
+  fitsWithinHardCap,
   buildProgress,
   buildQuiz,
   buildStats,
@@ -9,8 +11,11 @@ import {
   getRevealAtIso,
   LIMITS,
   type GroupState,
+  type ImageContentType,
   type Member,
 } from './domain';
+import { IMAGE_CONTENT_TYPES } from './domain';
+import { imageResponseHeaders } from './images';
 import { readJsonBody, validateMemberIdList, validateText } from './validation';
 
 const jsonResponse = (body: unknown, status = 200): Response =>
@@ -41,6 +46,26 @@ const readCaller = (request: Request): Caller | null => {
     return null;
   }
   return { userId, displayName };
+};
+
+/**
+ * Where a quote's picture bytes live. Deliberately its own key rather than a
+ * field on the group value: the group is read and rewritten on every single
+ * write, and carrying megabytes of image through that would be both slow and a
+ * quick route to the value ceiling.
+ */
+const imageKey = (quoteId: string): string => `image:${quoteId}`;
+
+/** Matches `/quotes/<id>/image` and `/quotes/<id>/image/remove`. */
+const readQuoteImagePath = (pathname: string): { quoteId: string; remove: boolean } | null => {
+  const parts = pathname.split('/').filter(Boolean);
+  if (parts[0] !== 'quotes' || !parts[1] || parts[2] !== 'image') {
+    return null;
+  }
+  if (parts.length > 4 || (parts.length === 4 && parts[3] !== 'remove')) {
+    return null;
+  }
+  return { quoteId: decodeURIComponent(parts[1]), remove: parts.length === 4 };
 };
 
 /** The UI identifies members by name alone, so names have to stay unambiguous. */
@@ -124,6 +149,22 @@ export class GroupStore {
       return member.role === 'owner'
         ? this.removeMember(request, group, member)
         : jsonResponse({ error: 'Only the group owner can remove a member' }, 403);
+    }
+
+    const imagePath = readQuoteImagePath(url.pathname);
+    if (imagePath) {
+      if (imagePath.remove) {
+        return request.method === 'POST'
+          ? this.removeQuoteImage(group, member, imagePath.quoteId)
+          : jsonResponse({ error: 'Not found' }, 404);
+      }
+      if (request.method === 'POST') {
+        return this.putQuoteImage(request, group, member, imagePath.quoteId);
+      }
+      if (request.method === 'GET') {
+        return this.getQuoteImage(group, imagePath.quoteId);
+      }
+      return jsonResponse({ error: 'Not found' }, 404);
     }
 
     if (url.pathname === '/quotes' && request.method === 'POST') {
@@ -485,6 +526,116 @@ export class GroupStore {
     // The quote text is deliberately not echoed back: it would show up in the
     // recorder's own client before the reveal date.
     return jsonResponse({ quote: { id: quote.id, createdAt: quote.createdAt } }, 201);
+  }
+
+  /**
+   * Attaches a picture to a quote the caller recorded.
+   *
+   * Restricted to the recorder, and only while the group is still locked, for
+   * the same reason `addQuote` is: once the vault is open, nothing about a
+   * quote should still be changing. The bytes have already been size-checked
+   * and sniffed by the Worker; re-checked here because a Durable Object is the
+   * last place anything is trusted before it is stored.
+   */
+  private async putQuoteImage(
+    request: Request,
+    group: GroupState,
+    author: Member,
+    quoteId: string,
+  ): Promise<Response> {
+    if (areQuotesVisible(group.revealYear)) {
+      return jsonResponse({ error: 'This group has been revealed and is no longer collecting quotes' }, 409);
+    }
+
+    const quote = group.quotes.find((entry) => entry.id === quoteId);
+    if (!quote) {
+      return jsonResponse({ error: 'That quote is not part of this group' }, 404);
+    }
+
+    if (quote.recordedByMemberId !== author.id) {
+      return jsonResponse({ error: 'Only the person who recorded a quote can add a picture to it' }, 403);
+    }
+
+    const declaredType = request.headers.get('x-image-type') ?? '';
+    if (!(IMAGE_CONTENT_TYPES as readonly string[]).includes(declaredType)) {
+      return jsonResponse({ error: 'Only JPEG, PNG and WebP pictures can be attached' }, 415);
+    }
+
+    const bytes = new Uint8Array(await request.arrayBuffer());
+    if (bytes.byteLength === 0 || bytes.byteLength > LIMITS.quoteImageBytes) {
+      return jsonResponse({ error: 'That picture is too large' }, 413);
+    }
+
+    if (exceedsImageBudget(group, quoteId, bytes.byteLength)) {
+      return jsonResponse({ error: 'This group has run out of room for pictures' }, 409);
+    }
+
+    const image = {
+      contentType: declaredType as ImageContentType,
+      bytes: bytes.byteLength,
+      addedAt: new Date().toISOString(),
+    };
+
+    // The picture itself is stored separately, but its metadata grows the group
+    // value, and that value has a ceiling every later write depends on.
+    if (!quote.image && !fitsWithinHardCap(group, JSON.stringify(image).length + 16)) {
+      return jsonResponse({ error: 'This group has run out of room' }, 409);
+    }
+
+    quote.image = image;
+    await this.ctx.storage.put(imageKey(quoteId), bytes);
+    await this.ctx.storage.put('group', group);
+
+    // No preview comes back: the recorder should not be able to read their own
+    // quote — picture included — before the reveal.
+    return jsonResponse({ image: { bytes: image.bytes, contentType: image.contentType } }, 201);
+  }
+
+  /** The recorder's undo, for the moment the wrong photo goes up. */
+  private async removeQuoteImage(group: GroupState, author: Member, quoteId: string): Promise<Response> {
+    if (areQuotesVisible(group.revealYear)) {
+      return jsonResponse({ error: 'This group has been revealed and is no longer collecting quotes' }, 409);
+    }
+
+    const quote = group.quotes.find((entry) => entry.id === quoteId);
+    if (!quote) {
+      return jsonResponse({ error: 'That quote is not part of this group' }, 404);
+    }
+
+    if (quote.recordedByMemberId !== author.id) {
+      return jsonResponse({ error: 'Only the person who recorded a quote can change its picture' }, 403);
+    }
+
+    if (!quote.image) {
+      return jsonResponse({ error: 'That quote has no picture' }, 404);
+    }
+
+    delete quote.image;
+    await this.ctx.storage.delete(imageKey(quoteId));
+    await this.ctx.storage.put('group', group);
+    return jsonResponse({ removed: true });
+  }
+
+  /**
+   * A picture is exactly as secret as the quote it belongs to, so it is behind
+   * the same lock — including for the person who uploaded it.
+   */
+  private async getQuoteImage(group: GroupState, quoteId: string): Promise<Response> {
+    if (!areQuotesVisible(group.revealYear)) {
+      return lockedResponse(group, 'Pictures');
+    }
+
+    const quote = group.quotes.find((entry) => entry.id === quoteId);
+    if (!quote?.image) {
+      return jsonResponse({ error: 'That quote has no picture' }, 404);
+    }
+
+    const bytes = await this.ctx.storage.get<Uint8Array>(imageKey(quoteId));
+    if (!bytes) {
+      return jsonResponse({ error: 'That quote has no picture' }, 404);
+    }
+
+    return new Response(bytes.slice().buffer as ArrayBuffer, { headers: imageResponseHeaders(quote.image.contentType) });
   }
 
   private overview(group: GroupState, viewer: Member) {

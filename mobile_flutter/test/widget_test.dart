@@ -54,6 +54,27 @@ void main() {
     expect(find.byKey(const Key('display-name-field')), findsOneWidget);
   });
 
+  testWidgets('creating an account refuses two passwords that do not match', (tester) async {
+    final seen = <String>[];
+    final api = QuotesApi(baseUrl: 'https://example.test', sender: backend(const {}, seen: seen));
+
+    await tester.pumpWidget(QuotesJournalApp(api: api));
+    await tester.tap(find.text('Create account'));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.byKey(const Key('display-name-field')), 'Alice');
+    await tester.enterText(find.byKey(const Key('email-field')), 'alice@example.com');
+    await tester.enterText(find.byKey(const Key('password-field')), 'a long enough password');
+    await tester.enterText(find.byKey(const Key('password-confirm-field')), 'a long enough passwrod');
+    await tester.tap(find.byKey(const Key('submit-button')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Those two passwords do not match'), findsOneWidget);
+    // There is no password reset yet, so the typo has to be caught before the
+    // account exists — not after it has been created with the wrong password.
+    expect(seen, isEmpty);
+  });
+
   testWidgets('signing in moves on to the group list', (tester) async {
     final api = QuotesApi(
       baseUrl: 'https://example.test',
