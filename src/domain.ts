@@ -1,5 +1,10 @@
 export type MemberRole = 'owner' | 'member';
 
+/** The three formats every current browser can both produce and display. */
+export const IMAGE_CONTENT_TYPES = ['image/jpeg', 'image/png', 'image/webp'] as const;
+
+export type ImageContentType = (typeof IMAGE_CONTENT_TYPES)[number];
+
 export type Member = {
   id: string;
   name: string;
@@ -9,6 +14,20 @@ export type Member = {
   joinedAt: string;
 };
 
+/**
+ * A picture attached to a quote for context. Only the metadata lives on the
+ * quote — the bytes are a separate key in the same Durable Object, so a group
+ * full of photos does not push the stored group value towards its ceiling.
+ *
+ * `contentType` is what the bytes actually are, decided by sniffing the magic
+ * number rather than by trusting the upload's header.
+ */
+export type QuoteImage = {
+  contentType: ImageContentType;
+  bytes: number;
+  addedAt: string;
+};
+
 export type Quote = {
   id: string;
   text: string;
@@ -16,6 +35,8 @@ export type Quote = {
   recordedByMemberId: string;
   involvedMemberIds: string[];
   createdAt: string;
+  /** Optional: a photo giving the quote its context. */
+  image?: QuoteImage;
 };
 
 export type GroupState = {
@@ -65,6 +86,19 @@ export const LIMITS = {
    */
   groupBytesHardCap: 1_900_000,
   groupsPerUser: 50,
+  /**
+   * One quote picture. The client re-encodes to about 1280px of JPEG before
+   * uploading, which lands well under this; the cap is what stops a client that
+   * does not.
+   */
+  quoteImageBytes: 1_000_000,
+  /**
+   * All pictures in a group together. Image bytes live in their own keys rather
+   * than in the group value, so they are nowhere near the ~2.2MB value ceiling —
+   * but a Durable Object's whole database is finite too, and unbounded uploads
+   * are the one way a single group could fill it.
+   */
+  groupImageBytes: 200_000_000,
 } as const;
 
 /**
@@ -88,6 +122,28 @@ export const exceedsGroupBudget = (group: GroupState, quote: Quote): boolean =>
  */
 export const exceedsGroupHardCap = (group: GroupState, member: Member): boolean =>
   sizeWith(group, member) > LIMITS.groupBytesHardCap;
+
+/** Total bytes of every picture kept in a group. */
+export const groupImageByteSize = (group: GroupState): number =>
+  group.quotes.reduce((total, quote) => total + (quote.image?.bytes ?? 0), 0);
+
+/**
+ * Whether storing `bytes` against `quoteId` would push the group past its image
+ * budget. A quote that already has a picture is having it replaced, so the one
+ * being displaced does not count towards the total.
+ */
+export const exceedsImageBudget = (group: GroupState, quoteId: string, bytes: number): boolean => {
+  const replaced = group.quotes.find((quote) => quote.id === quoteId)?.image?.bytes ?? 0;
+  return groupImageByteSize(group) - replaced + bytes > LIMITS.groupImageBytes;
+};
+
+/**
+ * Whether `extraBytes` more of stored group value still fits under the hard cap.
+ * Attaching a picture adds a little metadata to an existing quote, which is a
+ * growth of the stored value even though the picture itself is stored elsewhere.
+ */
+export const fitsWithinHardCap = (group: GroupState, extraBytes: number): boolean =>
+  groupByteSize(group) + extraBytes <= LIMITS.groupBytesHardCap;
 
 export const getRevealAtIso = (revealYear: number): string =>
   new Date(Date.UTC(revealYear + 1, 0, 1, 0, 0, 0)).toISOString();

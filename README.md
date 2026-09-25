@@ -12,9 +12,10 @@ app and the HTTP API; a Flutter app talks to the same API on Android and iOS.
   is either a linked account or a guest added by name, so friends who never sign
   up can still be quoted.
 - **Collecting.** Anyone in the group records a quote: the text, who said it and
-  who else was there. The server attributes the quote to whoever is signed in,
-  so who collected what cannot be faked.
-- **The lock.** Quotes, the quiz and the statistics all return `423 Locked`
+  who else was there, and optionally a picture for the context the words alone
+  do not carry. The server attributes the quote to whoever is signed in, so who
+  collected what cannot be faked.
+- **The lock.** Quotes, their pictures, the quiz and the statistics all return `423 Locked`
   until midnight UTC on 1 January of the following year. During the year the app
   shows only a count, so nothing is spoiled — not even for the person who wrote
   the quote down.
@@ -48,6 +49,12 @@ app and the HTTP API; a Flutter app talks to the same API on Android and iOS.
   reads are limited per account.
 - Every body is size- and shape-checked before it reaches storage, and a group
   is refused new quotes before it can outgrow the Durable Object value ceiling.
+- An uploaded picture is identified by its magic number, not by the
+  `content-type` it arrives with, so an SVG — an image to a browser and a script
+  host to an attacker — never reaches storage or gets served back from this
+  origin. Pictures are served with `nosniff` and their own
+  `default-src 'none'; sandbox` policy, and are read with a bearer token rather
+  than through a URL that would have to carry a credential.
 - The app shell is served with a strict `Content-Security-Policy`
   (`default-src 'none'`, a per-response nonce for the one inline script and
   style), plus `nosniff`, `no-referrer`, `frame-ancestors 'none'` and HSTS.
@@ -74,6 +81,22 @@ One gap is known and open: registering with an address that already has an
 account answers `409`, which tells an attacker whether a given person uses the
 app. Closing it properly means a neutral response with the outcome delivered by
 email, which is tracked in issue #6.
+
+### Pictures on a quote
+
+A picture is optional and behaves like part of the quote: only group members can
+read it, and only after the reveal — including the person who uploaded it.
+
+The browser shrinks the chosen photo to 1280px on its longest edge and re-encodes
+it as JPEG before uploading. That keeps it inside the 1MB cap, and re-encoding
+through a canvas drops the EXIF block a camera writes, so the GPS coordinates of
+where a photo was taken never leave the device.
+
+The bytes are stored under their own key in the group's Durable Object, not in
+the group value. That value is read and rewritten on every write and has a hard
+~2.2MB ceiling ([#10](https://github.com/dhuelin/quotes-journal/issues/10)) —
+only the picture's size and type live there. R2 would be the natural home if
+this grows, and is not used today because R2 is not enabled on the account.
 
 ## Tech stack
 
@@ -117,11 +140,15 @@ The Flutter client lives in [`mobile_flutter/`](mobile_flutter/README.md):
 cd mobile_flutter
 flutter pub get
 flutter test
-flutter run --dart-define=QUOTES_JOURNAL_URL=https://<your-worker>.workers.dev
+flutter run                 # talks to production; --dart-define to point elsewhere
 ```
 
-The backend address is a compile-time constant, so a release build cannot be
-pointed at the wrong host by accident.
+The backend address is a compile-time constant defaulting to production, so a
+release build cannot be pointed at the wrong host by accident.
+
+Store identifiers, signing, release builds and the submission checklist are in
+[`mobile_flutter/README.md`](mobile_flutter/README.md). Both app ids are
+`dev.huelin.quotesjournal` and are permanent once published.
 
 ## Deploy
 
@@ -184,11 +211,18 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | `POST` | `/api/groups/:groupId/members/remove` | `{ memberId }`; owner only, refused once quoted |
 | `POST` | `/api/groups/:groupId/quotes` | `{ text, saidByMemberId, involvedMemberIds }`; `409` after the reveal |
 | `GET` | `/api/groups/:groupId/quotes` | `423` until the reveal |
+| `POST` | `/api/groups/:groupId/quotes/:quoteId/image` | raw JPEG/PNG/WebP bytes; recorder only, `409` after the reveal |
+| `GET` | `/api/groups/:groupId/quotes/:quoteId/image` | the picture itself; `423` until the reveal |
+| `POST` | `/api/groups/:groupId/quotes/:quoteId/image/remove` | recorder only |
 | `GET` | `/api/groups/:groupId/quiz` | `423` until the reveal |
 | `GET` | `/api/groups/:groupId/stats` | `423` until the reveal |
 | `GET` | `/api/groups/:groupId/invite` | current invite code; the client builds the link |
 | `POST` | `/api/groups/:groupId/invite/rotate` | owner only; invalidates old links |
 | `POST` | `/api/invites/accept` | `{ inviteCode, memberName? }`; `410` if expired or rotated |
+
+The Worker also serves the app at `/`, `/app` and `/join`, and a privacy policy
+at `/privacy` — both app stores require a reachable policy URL, and the
+store data-safety declarations must match what that page says.
 
 ## What is still open
 
@@ -202,3 +236,7 @@ Tracked in [the issue tracker](https://github.com/dhuelin/quotes-journal/issues)
 - [#7](https://github.com/dhuelin/quotes-journal/issues/7) persist the mobile session across restarts
 - [#8](https://github.com/dhuelin/quotes-journal/issues/8) store submission setup for the mobile app
 - [#9](https://github.com/dhuelin/quotes-journal/issues/9) keep the cached group name on an account in sync
+- [#13](https://github.com/dhuelin/quotes-journal/issues/13) the service worker registers but caches nothing
+- [#15](https://github.com/dhuelin/quotes-journal/issues/15) a configurable reveal date, not just the year
+- [#17](https://github.com/dhuelin/quotes-journal/issues/17) settings pages for accounts and groups
+- [#19](https://github.com/dhuelin/quotes-journal/issues/19) publishing to the app stores (low priority)

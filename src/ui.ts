@@ -146,6 +146,20 @@ const html = `<!doctype html>
       }
       blockquote footer { color: var(--muted); font-size: .85rem; margin-top: .4rem; }
 
+      input[type="file"] { padding: .5rem; background: var(--surface-2); color: var(--muted); font-size: .85rem; }
+      input[type="file"]::file-selector-button {
+        font: inherit; font-weight: 600; margin-right: .6rem; padding: .35rem .7rem; cursor: pointer;
+        border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text);
+      }
+
+      .photo-preview { margin-top: .6rem; }
+      .photo-preview img { max-height: 12rem; border-radius: 10px; border: 1px solid var(--line); display: block; }
+      .photo-preview button { width: auto; margin: .5rem 0 0; padding: .35rem .8rem; font-size: .85rem; }
+
+      /* Reserves nothing until the picture arrives, so a quote without one — or
+         one whose picture fails to load — reads exactly as it did before. */
+      .quote-photo img { max-width: 100%; border-radius: 10px; margin-top: .7rem; display: block; }
+
       /* Inline style attributes cannot carry the CSP nonce, so every rule lives here. */
       .group-title { margin-top: .6rem; }
       .vault-note { margin-top: .7rem; }
@@ -174,7 +188,19 @@ const html = `<!doctype html>
           reveal: null,
           notice: null,
           pendingInvite: readInviteFromLocation(),
+          /** The shrunk, re-encoded photo waiting to go up with the next quote. */
+          pendingImage: null,
         };
+
+        /**
+         * Phone photos are several megabytes and the server refuses anything over
+         * a megabyte, so a chosen picture is shrunk and re-encoded in the browser
+         * before it is sent. Passing it through a canvas also drops the EXIF
+         * block, which means the coordinates of where the photo was taken never
+         * leave the device.
+         */
+        var MAX_IMAGE_EDGE = 1280;
+        var MAX_IMAGE_BYTES = 1000000;
 
         function escapeHtml(value) {
           return String(value === null || value === undefined ? '' : value)
@@ -245,6 +271,7 @@ const html = `<!doctype html>
           state.user = null;
           state.groups = [];
           state.group = null;
+          state.pendingImage = null;
           localStorage.removeItem(TOKEN_KEY);
           notify(message || null, 'error');
           render();
@@ -311,6 +338,9 @@ const html = `<!doctype html>
             '<label for="register-password">Password</label>' +
             '<input id="register-password" name="password" type="password" autocomplete="new-password" minlength="10" required />' +
             '<p class="small muted">At least 10 characters.</p>' +
+            '<label for="register-confirm">Repeat password</label>' +
+            '<input id="register-confirm" name="passwordConfirm" type="password" autocomplete="new-password" required />' +
+            '<p class="small muted" id="confirm-hint">There is no password reset yet, so a typo here would lock you out of the account.</p>' +
             '<button type="submit">Create account</button>' +
             '</form>'
           );
@@ -455,6 +485,10 @@ const html = `<!doctype html>
             '<label for="quote-said-by">Who said it?</label>' +
             '<select id="quote-said-by" name="saidByMemberId" required>' + options + '</select>' +
             (involved ? '<label>Who else was there?</label><div class="checks">' + involved + '</div>' : '') +
+            '<label for="quote-photo">Add a picture (optional)</label>' +
+            '<input id="quote-photo" name="photo" type="file" accept="image/jpeg,image/png,image/webp" />' +
+            '<p class="small muted" id="photo-status">For the context a quote alone does not carry. Shrunk on this device before it is sent.</p>' +
+            '<div class="photo-preview" id="photo-preview"></div>' +
             '<button type="submit">Save quote</button>' +
             '<p class="small muted vault-note">Saved quotes disappear straight into the vault &mdash; nobody, including you, can read them back before the reveal.</p>' +
             '</form>' +
@@ -517,6 +551,7 @@ const html = `<!doctype html>
               return (
                 '<blockquote>' +
                 escapeHtml(quote.text) +
+                (quote.image ? '<div class="quote-photo" data-photo="' + escapeHtml(quote.id) + '"></div>' : '') +
                 '<footer>&mdash; ' + escapeHtml(memberName(quote.saidByMemberId)) +
                 ', recorded by ' + escapeHtml(memberName(quote.recordedByMemberId)) +
                 (involved.length ? ' &middot; with ' + escapeHtml(involved.join(', ')) : '') +
@@ -564,7 +599,10 @@ const html = `<!doctype html>
           for (var index = 0; index < fields.length; index += 1) {
             var field = fields[index];
             var key = field.id || field.name;
-            if (!key) {
+            // A file input's value is read-only for security reasons: it cannot
+            // be snapshotted and writing it back would throw. The chosen picture
+            // is held in state.pendingImage across re-renders instead.
+            if (!key || field.type === 'file') {
               continue;
             }
             if (field.type === 'checkbox' || field.type === 'radio') {
@@ -583,7 +621,7 @@ const html = `<!doctype html>
           for (var index = 0; index < fields.length; index += 1) {
             var field = fields[index];
             var key = field.id || field.name;
-            if (!key) {
+            if (!key || field.type === 'file') {
               continue;
             }
             if (field.type === 'checkbox' || field.type === 'radio') {
@@ -681,6 +719,7 @@ const html = `<!doctype html>
           onClick('back-to-groups', function () {
             state.group = null;
             state.reveal = null;
+            state.pendingImage = null;
             state.tab = 'collect';
             history.pushState({}, '', '/app');
             render();
@@ -717,7 +756,32 @@ const html = `<!doctype html>
             await startSession(result, true);
           });
 
+          var confirmField = document.getElementById('register-confirm');
+          var confirmHint = document.getElementById('confirm-hint');
+          if (confirmField && confirmHint) {
+            // Live, so the mismatch is caught while the second field is still in
+            // focus rather than after the form has been thrown back.
+            confirmField.addEventListener('input', function () {
+              var password = document.getElementById('register-password');
+              var typed = confirmField.value.length > 0;
+              var matches = !password || confirmField.value === password.value;
+              confirmHint.textContent = !typed
+                ? 'There is no password reset yet, so a typo here would lock you out of the account.'
+                : matches
+                  ? 'The passwords match.'
+                  : 'The passwords do not match yet.';
+              confirmHint.className = typed && !matches ? 'small' : 'small muted';
+            });
+          }
+
           onSubmit('register-form', async function (form) {
+            // Checked here and never sent: the confirmation exists to catch a
+            // typo in the browser, and the server has no use for a second copy
+            // of the password.
+            if (form.password.value !== form.passwordConfirm.value) {
+              throw new Error('Those two passwords do not match');
+            }
+
             var result = await api('/api/auth/register', {
               method: 'POST',
               body: {
@@ -783,12 +847,40 @@ const html = `<!doctype html>
             showCount();
           }
 
+          var photoField = document.getElementById('quote-photo');
+          if (photoField) {
+            renderPendingImage();
+            photoField.addEventListener('change', async function () {
+              var file = photoField.files && photoField.files[0];
+              if (!file) {
+                state.pendingImage = null;
+                renderPendingImage();
+                return;
+              }
+
+              setPhotoStatus('Preparing the picture\u2026', false);
+              try {
+                state.pendingImage = await prepareImage(file);
+                setPhotoStatus('Ready. It is sealed with the quote until the reveal.', false);
+              } catch (error) {
+                state.pendingImage = null;
+                photoField.value = '';
+                setPhotoStatus(error.message || 'That picture could not be read', true);
+              }
+              renderPendingImage();
+            });
+          }
+
+          if (state.tab === 'reveal' && state.reveal) {
+            loadQuotePhotos();
+          }
+
           onSubmit('quote-form', async function (form) {
             var involved = Array.prototype.slice
               .call(form.querySelectorAll('input[name="involved"]:checked'))
               .map(function (input) { return input.value; });
 
-            await api('/api/groups/' + encodeURIComponent(state.group.id) + '/quotes', {
+            var saved = await api('/api/groups/' + encodeURIComponent(state.group.id) + '/quotes', {
               method: 'POST',
               body: {
                 text: form.text.value,
@@ -797,9 +889,165 @@ const html = `<!doctype html>
               },
             });
 
+            // The picture goes up second, against the quote that now exists. If
+            // it fails the quote still stands — losing the words because a photo
+            // would not upload would be much worse than saying so and moving on.
+            var pending = state.pendingImage;
+            var imageError = null;
+            if (pending) {
+              try {
+                await uploadImage(state.group.id, saved.quote.id, pending);
+              } catch (error) {
+                imageError = error.message;
+              }
+              state.pendingImage = null;
+            }
+
             await openGroup(state.group.id, 'collect');
-            notify('Saved. It is sealed until the reveal.', 'ok');
+            notify(
+              imageError
+                ? 'Quote saved, but the picture could not be attached: ' + imageError
+                : 'Saved. It is sealed until the reveal.',
+              imageError ? 'error' : 'ok',
+            );
             render();
+          });
+        }
+
+        function blobFromCanvas(canvas, quality) {
+          return new Promise(function (resolve) {
+            canvas.toBlob(function (blob) { resolve(blob); }, 'image/jpeg', quality);
+          });
+        }
+
+        /**
+         * Shrinks a chosen photo to something the server will accept, dropping
+         * the quality a step at a time until it fits rather than refusing a
+         * picture that is merely detailed.
+         */
+        async function prepareImage(file) {
+          var bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+          var longestEdge = Math.max(bitmap.width, bitmap.height);
+          var scale = Math.min(1, MAX_IMAGE_EDGE / longestEdge);
+          var canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+          canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+          canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+          bitmap.close();
+
+          var quality = 0.82;
+          var blob = await blobFromCanvas(canvas, quality);
+          while (blob && blob.size > MAX_IMAGE_BYTES && quality > 0.4) {
+            quality -= 0.15;
+            blob = await blobFromCanvas(canvas, quality);
+          }
+
+          if (!blob || blob.size > MAX_IMAGE_BYTES) {
+            throw new Error('That picture is too large, even after shrinking it');
+          }
+
+          return blob;
+        }
+
+        /** Draws whatever picture is queued for the next quote, or nothing. */
+        function renderPendingImage() {
+          var holder = document.getElementById('photo-preview');
+          if (!holder) {
+            return;
+          }
+
+          holder.textContent = '';
+          if (!state.pendingImage) {
+            return;
+          }
+
+          var image = document.createElement('img');
+          var url = URL.createObjectURL(state.pendingImage);
+          image.src = url;
+          image.alt = 'The picture you chose for this quote';
+          image.addEventListener('load', function () { URL.revokeObjectURL(url); });
+
+          var remove = document.createElement('button');
+          remove.type = 'button';
+          remove.className = 'secondary';
+          remove.textContent = 'Remove picture';
+          remove.addEventListener('click', function () {
+            state.pendingImage = null;
+            var field = document.getElementById('quote-photo');
+            if (field) {
+              field.value = '';
+            }
+            setPhotoStatus('For the context a quote alone does not carry. Shrunk on this device before it is sent.', false);
+            renderPendingImage();
+          });
+
+          holder.appendChild(image);
+          holder.appendChild(remove);
+        }
+
+        function setPhotoStatus(message, isError) {
+          var status = document.getElementById('photo-status');
+          if (status) {
+            status.textContent = message;
+            status.className = isError ? 'small' : 'small muted';
+          }
+        }
+
+        /**
+         * Sends the picture as raw bytes rather than through api(): base64 inside
+         * a JSON envelope would be a third larger and would not fit the body cap
+         * every other route relies on.
+         */
+        async function uploadImage(groupId, quoteId, blob) {
+          var response = await fetch(
+            '/api/groups/' + encodeURIComponent(groupId) + '/quotes/' + encodeURIComponent(quoteId) + '/image',
+            {
+              method: 'POST',
+              headers: { authorization: 'Bearer ' + state.token, 'content-type': blob.type || 'image/jpeg' },
+              body: blob,
+            },
+          );
+
+          if (!response.ok) {
+            var payload = {};
+            try {
+              payload = await response.json();
+            } catch (error) {
+              payload = {};
+            }
+            throw new Error(payload.error || 'The picture could not be saved');
+          }
+        }
+
+        /**
+         * Pictures are fetched with the bearer token and rendered as object URLs.
+         * An <img src> cannot carry an Authorization header, and the alternative
+         * — a signed URL — would put a credential somewhere history, referrers
+         * and shared screenshots can reach it.
+         */
+        function loadQuotePhotos() {
+          document.querySelectorAll('[data-photo]').forEach(function (holder) {
+            var quoteId = holder.getAttribute('data-photo');
+            var path =
+              '/api/groups/' + encodeURIComponent(state.group.id) + '/quotes/' + encodeURIComponent(quoteId) + '/image';
+
+            fetch(path, { headers: { authorization: 'Bearer ' + state.token } })
+              .then(function (response) { return response.ok ? response.blob() : null; })
+              .then(function (blob) {
+                if (!blob) {
+                  return;
+                }
+                var image = document.createElement('img');
+                var url = URL.createObjectURL(blob);
+                image.src = url;
+                image.alt = 'Picture attached to this quote';
+                image.addEventListener('load', function () { URL.revokeObjectURL(url); });
+                holder.appendChild(image);
+              })
+              // The quote itself reads perfectly well without its picture, so a
+              // failure here stays quiet rather than throwing a banner over the
+              // whole reveal.
+              .catch(function () {});
           });
         }
 
@@ -963,6 +1211,10 @@ const html = `<!doctype html>
 
           try {
             var result = await api('/api/groups/' + encodeURIComponent(groupId));
+            if (!reopening) {
+              // A picture chosen for one group's form has no meaning in another.
+              state.pendingImage = null;
+            }
             state.group = result.group;
             state.tab = tab || defaultTab(result.group);
             state.reveal = null;
@@ -1058,3 +1310,108 @@ const html = `<!doctype html>
  * is stamped into both tags here.
  */
 export const renderAppHtml = (nonce: string): string => html.replaceAll('__CSP_NONCE__', nonce);
+
+/**
+ * The privacy policy, served at /privacy. Both app stores require a reachable
+ * policy URL in the listing, and the store data-safety declarations have to
+ * match what this says — so it describes exactly what the code does and nothing
+ * aspirational.
+ *
+ * Kept in the same file and under the same CSP as the app: one inline style,
+ * carrying the nonce, no scripts at all.
+ */
+const privacyHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0f1020" />
+    <title>Privacy — Quotes Journal</title>
+    <style nonce="__CSP_NONCE__">
+      :root { --bg:#0f1020; --surface:#191a30; --line:#32345a; --text:#f2f2f7; --muted:#a2a4c4; --accent:#f8c630; color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body { margin:0; background:var(--bg); color:var(--text);
+        font:16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+      main { max-width:680px; margin:0 auto; padding:2rem 1rem 4rem; }
+      h1 { font-size:1.6rem; margin:0 0 .25rem; }
+      h2 { font-size:1.1rem; margin:2rem 0 .5rem; }
+      p, li { margin:0 0 .75rem; }
+      ul { padding-left:1.2rem; }
+      a { color:var(--accent); }
+      .muted { color:var(--muted); }
+      .card { background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:1rem 1.25rem; margin-top:1.5rem; }
+      /* A nonce authorises inline style blocks but never style attributes. */
+      .flush { margin-top:0; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Privacy</h1>
+      <p class="muted">Quotes Journal &middot; last updated 8 September 2026</p>
+
+      <p>Quotes Journal is a small app for recording things your friends said and
+      reading them back at the end of the year. This page describes every piece of
+      data it holds and what happens to it.</p>
+
+      <h2>What is collected</h2>
+      <ul>
+        <li><strong>Your email address</strong>, so you can sign in and so an
+        account can be recognised as yours.</li>
+        <li><strong>A display name</strong> you choose, shown to the other members
+        of your groups.</li>
+        <li><strong>Your password</strong>, stored only as a PBKDF2-HMAC-SHA256
+        hash with a random salt. The password itself is never written down.</li>
+        <li><strong>The groups you belong to</strong>, the names of members in
+        them, and the quotes recorded in them.</li>
+        <li><strong>Pictures you choose to attach to a quote</strong>, which are
+        optional. A picture is re-encoded in your browser before it is uploaded,
+        which removes the EXIF metadata a camera writes into a photo file &mdash;
+        including the GPS coordinates of where it was taken. Only the resized
+        image reaches the server.</li>
+      </ul>
+
+      <h2>What is not collected</h2>
+      <ul>
+        <li>No analytics, tracking or advertising, of any kind.</li>
+        <li>No contacts, location, microphone or camera access. Attaching a
+        picture to a quote uses your device's own file picker, one photo at a
+        time, on your explicit choice &mdash; the app never reads your library.</li>
+        <li>No third-party services. Nothing is shared with anyone.</li>
+        <li>Nothing is sold, ever.</li>
+      </ul>
+
+      <h2>Who can see your quotes</h2>
+      <p>Quotes and their pictures are visible only to members of the group they were recorded in,
+      and only after that group's reveal date. Before then the app shows a count
+      and nothing else &mdash; not even to the person who wrote the quote down.
+      Someone who is not a member of a group cannot see that the group exists.</p>
+
+      <h2>Where it is stored</h2>
+      <p>On Cloudflare Workers infrastructure, reachable only through
+      <a href="https://quotes.huelin.dev">quotes.huelin.dev</a> over HTTPS. The
+      app is run by an individual, not a company.</p>
+
+      <h2>Deleting your data</h2>
+      <p>There is no self-service delete yet. Email the address below and your
+      account and its data will be removed. This is a known gap and is tracked
+      publicly in the project's issue tracker.</p>
+
+      <h2>Children</h2>
+      <p>The app is not directed at children and collects nothing beyond what is
+      listed above from anyone.</p>
+
+      <h2>Changes</h2>
+      <p>If this policy changes, the date at the top of this page changes with it.
+      The app is open source, so every revision is visible in its history.</p>
+
+      <div class="card">
+        <h2 class="flush">Contact</h2>
+        <p class="muted">For privacy questions or a deletion request, contact the
+        maintainer through the
+        <a href="https://github.com/dhuelin/quotes-journal">project repository</a>.</p>
+      </div>
+    </main>
+  </body>
+</html>`;
+
+export const renderPrivacyHtml = (nonce: string): string => privacyHtml.replaceAll('__CSP_NONCE__', nonce);

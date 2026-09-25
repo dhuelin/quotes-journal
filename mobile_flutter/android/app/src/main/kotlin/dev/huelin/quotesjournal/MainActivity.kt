@@ -1,4 +1,4 @@
-package com.example.mobile_flutter
+package dev.huelin.quotesjournal
 
 import io.flutter.embedding.android.FlutterActivity
 

@@ -89,3 +89,43 @@ export const unlockGroup = async (groupId: string): Promise<void> => {
     await state.storage.put('group', group);
   });
 };
+
+/**
+ * A request whose body is raw bytes rather than JSON — quote pictures are
+ * uploaded that way. Returns the response itself, because a success is an image
+ * and a failure is JSON.
+ */
+export const rawRequest = async (
+  path: string,
+  // Uint8Array is a perfectly good request body at runtime; the workers
+  // typings just do not list it in BodyInit.
+  options: { method?: string; body?: BodyInit | Uint8Array; token?: string; ip?: string; contentType?: string } = {},
+): Promise<Response> => {
+  const headers: Record<string, string> = {};
+  if (options.contentType) {
+    headers['content-type'] = options.contentType;
+  }
+  if (options.token) {
+    headers.authorization = `Bearer ${options.token}`;
+  }
+  headers['cf-connecting-ip'] = options.ip ?? uniqueIp();
+
+  return SELF.fetch(`https://example.com${path}`, {
+    method: options.method ?? 'GET',
+    headers,
+    body: options.body as BodyInit | undefined,
+  });
+};
+
+/** Bytes that a sniffer accepts as the given format, without a real encoder. */
+export const fakeImage = (format: 'jpeg' | 'png' | 'webp', size = 64): Uint8Array => {
+  const bytes = new Uint8Array(size);
+  const magic = {
+    jpeg: [0xff, 0xd8, 0xff, 0xe0],
+    png: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+    webp: [0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50],
+  }[format];
+
+  bytes.set(magic, 0);
+  return bytes;
+};

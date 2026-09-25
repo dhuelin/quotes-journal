@@ -39,6 +39,10 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
 
+  # Generates the platform launcher icons from assets/app_icon.png.
+  # Re-run after changing the source: dart run flutter_launcher_icons
+  flutter_launcher_icons: ^0.14.4
+
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
   # activated in the `analysis_options.yaml` file located at the root of your
@@ -51,11 +55,19 @@ dev_dependencies:
 
 # The following section is specific to Flutter packages.
 flutter:
-
-  # The following line ensures that the Material Icons font is
-  # included with your application, so that you can use the icons in
-  # the material Icons class.
   uses-material-design: true
+
+flutter_launcher_icons:
+  image_path: "assets/app_icon.png"
+  # Android adaptive icons crop into the outer edge of the canvas, so the
+  # foreground layer carries the same mark drawn smaller, on the app's own
+  # background colour rather than a transparent one.
+  android: "ic_launcher"
+  adaptive_icon_background: "#0f1020"
+  adaptive_icon_foreground: "assets/app_icon_foreground.png"
+  ios: true
+  # The App Store rejects an icon with an alpha channel.
+  remove_alpha_ios: true
 
   # To add assets to your application, add an assets section, like this:
   # assets:

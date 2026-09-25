@@ -18,20 +18,34 @@ class _SignInScreenState extends State<SignInScreen> {
   final _displayName = TextEditingController();
   final _email = TextEditingController();
   final _password = TextEditingController();
+  final _passwordConfirm = TextEditingController();
 
   bool _registering = false;
   bool _busy = false;
+  String? _confirmError;
 
   @override
   void dispose() {
     _displayName.dispose();
     _email.dispose();
     _password.dispose();
+    _passwordConfirm.dispose();
     super.dispose();
   }
 
   Future<void> _submit() async {
-    setState(() => _busy = true);
+    // There is no password reset yet, so a typo when creating an account locks
+    // someone out of it for good. Checked here and never sent: the second copy
+    // exists to catch the typo, not for the server to compare.
+    if (_registering && _password.text != _passwordConfirm.text) {
+      setState(() => _confirmError = 'Those two passwords do not match');
+      return;
+    }
+
+    setState(() {
+      _confirmError = null;
+      _busy = true;
+    });
 
     final result = await runCall(context, () {
       if (_registering) {
@@ -111,6 +125,19 @@ class _SignInScreenState extends State<SignInScreen> {
                   helperText: 'At least 10 characters',
                 ),
               ),
+              if (_registering) ...[
+                const SizedBox(height: 12),
+                TextField(
+                  key: const Key('password-confirm-field'),
+                  controller: _passwordConfirm,
+                  obscureText: true,
+                  decoration: InputDecoration(
+                    labelText: 'Repeat password',
+                    helperText: 'There is no password reset yet',
+                    errorText: _confirmError,
+                  ),
+                ),
+              ],
               const SizedBox(height: 24),
               FilledButton(
                 key: const Key('submit-button'),

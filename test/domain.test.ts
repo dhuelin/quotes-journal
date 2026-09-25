@@ -5,9 +5,11 @@ import {
   buildQuiz,
   buildStats,
   exceedsGroupBudget,
+  exceedsImageBudget,
   findMemberByUserId,
   getRevealAtIso,
   groupByteSize,
+  groupImageByteSize,
   LIMITS,
   type GroupState,
   type Quote,
@@ -189,10 +191,23 @@ describe('the stored-value budget', () => {
  * no test that stops at the HTTP layer can see it, so guard the source instead.
  */
 describe('the inlined client under CSP', () => {
-  it('carries no inline style attributes', async () => {
-    const { renderAppHtml } = await import('../src/ui');
+  it('carries no inline style attributes on any page', async () => {
+    const { renderAppHtml, renderPrivacyHtml } = await import('../src/ui');
 
+    // Every page served under the nonce policy, not just the app: a style=""
+    // attribute cannot carry the nonce and is dropped silently by the browser.
     expect(renderAppHtml('test-nonce')).not.toContain('style="');
+    expect(renderPrivacyHtml('test-nonce')).not.toContain('style="');
+  });
+
+  it('stamps the nonce onto the privacy page too', async () => {
+    const { renderPrivacyHtml } = await import('../src/ui');
+    const page = renderPrivacyHtml('test-nonce');
+
+    expect(page).toContain('<style nonce="test-nonce">');
+    expect(page).not.toContain('__CSP_NONCE__');
+    // No scripts at all on this page, so none should be authorised.
+    expect(page).not.toContain('<script');
   });
 
   it('sets no maxlength, so a pasted over-long value is reported rather than trimmed', async () => {
@@ -213,6 +228,32 @@ describe('the inlined client under CSP', () => {
     expect(renderAppHtml('n')).not.toMatch(/match\(\/\^/);
   });
 
+  it('asks for the password twice at registration and never sends the second copy', async () => {
+    const { renderAppHtml } = await import('../src/ui');
+    const page = renderAppHtml('n');
+
+    // There is no password reset yet (#6), so a typo at registration locks
+    // someone out of an account they cannot recover.
+    expect(page).toContain('id="register-confirm"');
+    expect(page).toContain('Repeat password');
+    expect(page).toContain('form.password.value !== form.passwordConfirm.value');
+    // The confirmation is a browser-side typo check; the API takes one password.
+    expect(page).not.toContain('passwordConfirm:');
+  });
+
+  it('offers a picture field that is prepared on the device before upload', async () => {
+    const { renderAppHtml } = await import('../src/ui');
+    const page = renderAppHtml('n');
+
+    expect(page).toContain('id="quote-photo"');
+    expect(page).toContain('accept="image/jpeg,image/png,image/webp"');
+    // Re-encoding through a canvas is what strips the EXIF block, GPS included.
+    expect(page).toContain('createImageBitmap');
+    // A picture is fetched with the bearer token, never through a URL that
+    // would have to carry a credential.
+    expect(page).toContain("authorization: 'Bearer ' + state.token");
+  });
+
   it('stamps the nonce onto both inline blocks and leaves no placeholder behind', async () => {
     const { renderAppHtml } = await import('../src/ui');
     const page = renderAppHtml('test-nonce');
@@ -220,5 +261,54 @@ describe('the inlined client under CSP', () => {
     expect(page).toContain('<style nonce="test-nonce">');
     expect(page).toContain('<script nonce="test-nonce">');
     expect(page).not.toContain('__CSP_NONCE__');
+  });
+});
+
+/**
+ * Picture bytes live in their own Durable Object keys, so they cannot push the
+ * stored group value towards its ceiling. What they can do is fill the object's
+ * database, which is what this budget is for.
+ */
+describe('the picture budget', () => {
+  const withImages = (count: number, bytes: number): GroupState => {
+    const state = group();
+    state.quotes = Array.from({ length: count }, (_unused, index) => ({
+      id: `q${index}`,
+      text: 'x',
+      saidByMemberId: 'm1',
+      recordedByMemberId: 'm1',
+      involvedMemberIds: [],
+      createdAt: '2026-01-01T00:00:00.000Z',
+      image: { contentType: 'image/jpeg' as const, bytes, addedAt: '2026-01-01T00:00:00.000Z' },
+    }));
+    return state;
+  };
+
+  it('adds up only the quotes that carry a picture', () => {
+    expect(groupImageByteSize(group())).toBe(0);
+    expect(groupImageByteSize(withImages(3, 1000))).toBe(3000);
+  });
+
+  it('stops an upload that would cross the budget', () => {
+    const full = withImages(Math.floor(LIMITS.groupImageBytes / LIMITS.quoteImageBytes), LIMITS.quoteImageBytes);
+
+    expect(exceedsImageBudget(full, 'unseen-quote', LIMITS.quoteImageBytes)).toBe(true);
+  });
+
+  it('does not count the picture being replaced against the one replacing it', () => {
+    const full = withImages(Math.floor(LIMITS.groupImageBytes / LIMITS.quoteImageBytes), LIMITS.quoteImageBytes);
+
+    // Swapping the wrong photo for the right one must not be refused just
+    // because the group happens to be at its budget.
+    expect(exceedsImageBudget(full, 'q0', LIMITS.quoteImageBytes)).toBe(false);
+  });
+
+  it('leaves the whole picture budget outside the stored group value', () => {
+    // Metadata only: three numbers and a short string per quote, nowhere near
+    // the value ceiling even with every quote carrying a picture.
+    const many = withImages(LIMITS.quotesPerGroup, LIMITS.quoteImageBytes);
+
+    expect(groupByteSize(many)).toBeLessThan(LIMITS.groupBytes);
+    expect(groupImageByteSize(many)).toBeGreaterThan(LIMITS.groupBytes);
   });
 });
