@@ -8,15 +8,23 @@ import {
   buildQuiz,
   buildStats,
   findMemberByUserId,
-  getRevealAtIso,
+  canMoveReveal,
+  revealInstant,
   LIMITS,
+  QUIZ,
+  quizAsks,
+  quizQuestion,
+  quoteLinesOf,
+  scoreAnswer,
+  shuffled,
   type GroupState,
+  type QuizRun,
   type ImageContentType,
   type Member,
 } from './domain';
 import { IMAGE_CONTENT_TYPES } from './domain';
 import { imageResponseHeaders } from './images';
-import { readJsonBody, validateMemberIdList, validateText } from './validation';
+import { readJsonBody, validateMemberIdList, validateQuoteLines, validateText } from './validation';
 
 const jsonResponse = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), {
@@ -28,7 +36,7 @@ const lockedResponse = (group: GroupState, subject: string): Response =>
   jsonResponse(
     {
       error: `${subject} stay locked until the year is over`,
-      revealAt: getRevealAtIso(group.revealYear),
+      revealAt: revealInstant(group),
     },
     423,
   );
@@ -55,6 +63,19 @@ const readCaller = (request: Request): Caller | null => {
  * quick route to the value ceiling.
  */
 const imageKey = (quoteId: string): string => `image:${quoteId}`;
+
+/**
+ * One player's round. Its own key, like the pictures: the group value is read
+ * and rewritten on every write, and a round that changes on every answer has no
+ * business in there.
+ */
+const quizKey = (memberId: string): string => `quiz:${memberId}`;
+
+/**
+ * A member's best finished round, kept apart from the round in progress so that
+ * starting another one can never cost someone a score they already earned.
+ */
+const quizBestKey = (memberId: string): string => `best:${memberId}`;
 
 /** Matches `/quotes/<id>/image` and `/quotes/<id>/image/remove`. */
 const readQuoteImagePath = (pathname: string): { quoteId: string; remove: boolean } | null => {
@@ -172,24 +193,58 @@ export class GroupStore {
     }
 
     if (url.pathname === '/quotes' && request.method === 'GET') {
-      if (!areQuotesVisible(group.revealYear)) {
+      if (!areQuotesVisible(group)) {
         return lockedResponse(group, 'Quotes');
       }
       return jsonResponse({ quotes: group.quotes, members: group.members.map((entry) => publicMember(entry, member.id)) });
     }
 
     if (url.pathname === '/quiz' && request.method === 'GET') {
-      if (!areQuotesVisible(group.revealYear)) {
+      if (!areQuotesVisible(group)) {
         return lockedResponse(group, 'The quiz and its answers');
       }
       return jsonResponse({ questions: buildQuiz(group) });
     }
 
+    if (url.pathname === '/quiz/start' && request.method === 'POST') {
+      return this.startQuiz(group, member);
+    }
+
+    if (url.pathname === '/quiz/answer' && request.method === 'POST') {
+      return this.answerQuiz(request, group, member);
+    }
+
+    if (url.pathname === '/quiz/scores' && request.method === 'GET') {
+      return this.quizScores(group);
+    }
+
     if (url.pathname === '/stats' && request.method === 'GET') {
-      if (!areQuotesVisible(group.revealYear)) {
+      if (!areQuotesVisible(group)) {
         return lockedResponse(group, 'Statistics');
       }
       return jsonResponse(buildStats(group));
+    }
+
+    if (url.pathname === '/leave' && request.method === 'POST') {
+      return this.leave(group, member);
+    }
+
+    if (url.pathname === '/rename' && request.method === 'POST') {
+      return member.role === 'owner'
+        ? this.renameGroup(request, group, member)
+        : jsonResponse({ error: 'Only the group owner can rename the group' }, 403);
+    }
+
+    if (url.pathname === '/members/transfer' && request.method === 'POST') {
+      return member.role === 'owner'
+        ? this.transferOwnership(request, group, member)
+        : jsonResponse({ error: 'Only the group owner can hand the group over' }, 403);
+    }
+
+    if (url.pathname === '/reveal' && request.method === 'POST') {
+      return member.role === 'owner'
+        ? this.moveReveal(request, group, member)
+        : jsonResponse({ error: 'Only the group owner can change the reveal date' }, 403);
     }
 
     if (url.pathname === '/invite/rotate' && request.method === 'POST') {
@@ -211,8 +266,14 @@ export class GroupStore {
       return jsonResponse({ error: body.error }, 400);
     }
 
-    const { id, name, revealYear } = body.value;
+    const { id, name, revealYear, revealAt } = body.value;
     if (typeof id !== 'string' || typeof name !== 'string' || typeof revealYear !== 'number') {
+      return jsonResponse({ error: 'Invalid payload' }, 400);
+    }
+
+    // Validated by the Worker; absent means the group keeps the old default of
+    // midnight UTC on 1 January, derived from the year.
+    if (revealAt !== undefined && typeof revealAt !== 'string') {
       return jsonResponse({ error: 'Invalid payload' }, 400);
     }
 
@@ -228,6 +289,7 @@ export class GroupStore {
       id,
       name,
       revealYear,
+      ...(revealAt === undefined ? {} : { revealAt }),
       createdAt: new Date().toISOString(),
       ownerUserId: caller.userId,
       inviteVersion: 1,
@@ -383,6 +445,10 @@ export class GroupStore {
     guest.userId = joined.userId;
     guest.joinedAt = joined.joinedAt;
     group.members = group.members.filter((entry) => entry.id !== joined.id);
+    // The folded-in row is gone, so any quiz round stored against it is
+    // unreachable — and would otherwise sit in storage for good.
+    await this.ctx.storage.delete(quizKey(joined.id));
+    await this.ctx.storage.delete(quizBestKey(joined.id));
 
     for (const quote of group.quotes) {
       if (quote.saidByMemberId === joined.id) {
@@ -476,13 +542,28 @@ export class GroupStore {
 
     // Once the vault is open a quote could be written with full knowledge of what
     // everyone else collected, which would make the leaderboard meaningless.
-    if (areQuotesVisible(group.revealYear)) {
+    if (areQuotesVisible(group)) {
       return jsonResponse({ error: 'This group has been revealed and is no longer collecting quotes' }, 409);
     }
 
-    const text = validateText(body.value.text, 'Quote', LIMITS.quoteText, { allowLineBreaks: true });
-    if (!text.ok) {
-      return jsonResponse({ error: text.error }, 400);
+    // Either shape is accepted: a single remark as it always was, or an
+    // exchange. A one-line exchange is just a remark, so it is stored as one.
+    let lines: { saidByMemberId: string; text: string }[];
+    if (body.value.lines !== undefined) {
+      const parsed = validateQuoteLines(body.value.lines);
+      if (!parsed.ok) {
+        return jsonResponse({ error: parsed.error }, 400);
+      }
+      lines = parsed.value;
+    } else {
+      const text = validateText(body.value.text, 'Quote', LIMITS.quoteText, { allowLineBreaks: true });
+      if (!text.ok) {
+        return jsonResponse({ error: text.error }, 400);
+      }
+      if (typeof body.value.saidByMemberId !== 'string') {
+        return jsonResponse({ error: 'The quoted member is not part of this group' }, 400);
+      }
+      lines = [{ saidByMemberId: body.value.saidByMemberId, text: text.value }];
     }
 
     const involved = validateMemberIdList(body.value.involvedMemberIds, 'Involved members');
@@ -495,7 +576,7 @@ export class GroupStore {
     }
 
     const memberIds = new Set(group.members.map((member) => member.id));
-    if (typeof body.value.saidByMemberId !== 'string' || !memberIds.has(body.value.saidByMemberId)) {
+    if (lines.some((line) => !memberIds.has(line.saidByMemberId))) {
       return jsonResponse({ error: 'The quoted member is not part of this group' }, 400);
     }
 
@@ -505,8 +586,12 @@ export class GroupStore {
 
     const quote = {
       id: crypto.randomUUID(),
-      text: text.value,
-      saidByMemberId: body.value.saidByMemberId,
+      // Mirrors of the opening line, so a reader that predates conversations —
+      // the Flutter client, say — still shows something correct rather than
+      // nothing at all.
+      text: lines[0].text,
+      saidByMemberId: lines[0].saidByMemberId,
+      ...(lines.length > 1 ? { lines } : {}),
       // Always the caller: attribution of who collected a quote is not
       // client-controlled, otherwise the stats could be gamed.
       recordedByMemberId: author.id,
@@ -543,7 +628,7 @@ export class GroupStore {
     author: Member,
     quoteId: string,
   ): Promise<Response> {
-    if (areQuotesVisible(group.revealYear)) {
+    if (areQuotesVisible(group)) {
       return jsonResponse({ error: 'This group has been revealed and is no longer collecting quotes' }, 409);
     }
 
@@ -593,7 +678,7 @@ export class GroupStore {
 
   /** The recorder's undo, for the moment the wrong photo goes up. */
   private async removeQuoteImage(group: GroupState, author: Member, quoteId: string): Promise<Response> {
-    if (areQuotesVisible(group.revealYear)) {
+    if (areQuotesVisible(group)) {
       return jsonResponse({ error: 'This group has been revealed and is no longer collecting quotes' }, 409);
     }
 
@@ -621,7 +706,7 @@ export class GroupStore {
    * the same lock — including for the person who uploaded it.
    */
   private async getQuoteImage(group: GroupState, quoteId: string): Promise<Response> {
-    if (!areQuotesVisible(group.revealYear)) {
+    if (!areQuotesVisible(group)) {
       return lockedResponse(group, 'Pictures');
     }
 
@@ -638,14 +723,275 @@ export class GroupStore {
     return new Response(bytes.slice().buffer as ArrayBuffer, { headers: imageResponseHeaders(quote.image.contentType) });
   }
 
+  /**
+   * Begins a round for the caller, replacing any round they had going. Restarts
+   * are allowed on purpose — this is a party game, not an exam — and the group
+   * leaderboard keeps a member's best round rather than their latest, so
+   * restarting can never cost someone a score they already earned.
+   */
+  private async startQuiz(group: GroupState, player: Member): Promise<Response> {
+    if (!areQuotesVisible(group)) {
+      return lockedResponse(group, 'The quiz and its answers');
+    }
+
+    if (group.members.length < QUIZ.minMembersToPlay) {
+      return jsonResponse(
+        {
+          error: `A quiz needs at least ${QUIZ.minMembersToPlay} people in the group — with fewer, every question is a coin flip`,
+          needsMembers: QUIZ.minMembersToPlay,
+        },
+        409,
+      );
+    }
+
+    if (group.quotes.length === 0) {
+      return jsonResponse({ error: 'This group never recorded a quote, so there is nothing to ask about' }, 409);
+    }
+
+    const run: QuizRun = {
+      order: shuffled(quizAsks(group)).slice(0, QUIZ.maxQuestions),
+      index: 0,
+      askedAt: new Date().toISOString(),
+      score: 0,
+      correct: 0,
+      finishedAt: null,
+    };
+
+    await this.ctx.storage.put(quizKey(player.id), run);
+    return jsonResponse({ question: quizQuestion(group, run), score: 0 }, 201);
+  }
+
+  /**
+   * Scores one answer and serves the next question.
+   *
+   * The elapsed time comes from when the server served the question, never from
+   * the client: a browser asked to report its own response time can report zero.
+   * The answer is checked against the question the run is actually on, so a
+   * replayed or skipped-ahead request cannot bank points twice.
+   */
+  private async answerQuiz(request: Request, group: GroupState, player: Member): Promise<Response> {
+    if (!areQuotesVisible(group)) {
+      return lockedResponse(group, 'The quiz and its answers');
+    }
+
+    const body = await readJsonBody(request);
+    if (!body.ok) {
+      return jsonResponse({ error: body.error }, 400);
+    }
+
+    const run = await this.ctx.storage.get<QuizRun>(quizKey(player.id));
+    if (!run || run.finishedAt) {
+      return jsonResponse({ error: 'That round is over, start a new one' }, 409);
+    }
+
+    const ask = run.order[run.index];
+    const current = ask ? group.quotes.find((quote) => quote.id === ask.quoteId) : undefined;
+    if (!current || !ask) {
+      return jsonResponse({ error: 'That round is over, start a new one' }, 409);
+    }
+
+    // Answering a question the run has already moved past would otherwise be a
+    // way to bank the same points twice.
+    if (body.value.quoteId !== current.id) {
+      return jsonResponse({ error: 'That is not the question you are on' }, 409);
+    }
+
+    const lines = quoteLinesOf(current);
+    const askedLine = lines[Math.min(ask.line, lines.length - 1)];
+
+    // null is a question that ran out of time, which is a real answer worth nothing.
+    const guess = body.value.memberId;
+    if (guess !== null && guess !== undefined && typeof guess !== 'string') {
+      return jsonResponse({ error: 'Invalid answer' }, 400);
+    }
+
+    const correct = typeof guess === 'string' && guess === askedLine.saidByMemberId;
+    const elapsedMs = Date.now() - new Date(run.askedAt).getTime();
+    const points = scoreAnswer(correct, elapsedMs);
+
+    run.score += points;
+    run.correct += correct ? 1 : 0;
+    run.index += 1;
+    run.askedAt = new Date().toISOString();
+
+    const finished = run.index >= run.order.length;
+    if (finished) {
+      run.finishedAt = new Date().toISOString();
+    }
+
+    await this.ctx.storage.put(quizKey(player.id), run);
+
+    if (finished) {
+      const best = await this.ctx.storage.get<QuizRun>(quizBestKey(player.id));
+      if (!best || run.score > best.score) {
+        await this.ctx.storage.put(quizBestKey(player.id), run);
+      }
+    }
+
+    return jsonResponse({
+      correct,
+      // Only now, with the answer already banked, is it safe to say.
+      answerMemberId: askedLine.saidByMemberId,
+      points,
+      score: run.score,
+      finished,
+      question: finished ? null : quizQuestion(group, run),
+      summary: finished ? { score: run.score, correct: run.correct, total: run.order.length } : null,
+    });
+  }
+
+  /**
+   * Every member's best round. A quiz played alone is a score with nothing to
+   * compare it to; this is what makes it a game the group plays.
+   */
+  private async quizScores(group: GroupState): Promise<Response> {
+    if (!areQuotesVisible(group)) {
+      return lockedResponse(group, 'Quiz scores');
+    }
+
+    const runs = await this.ctx.storage.list<QuizRun>({ prefix: 'best:' });
+    const leaderboard = group.members
+      .map((member) => {
+        const run = runs.get(quizBestKey(member.id));
+        return run?.finishedAt
+          ? {
+              memberId: member.id,
+              name: member.name,
+              score: run.score,
+              correct: run.correct,
+              total: run.order.length,
+              finishedAt: run.finishedAt,
+            }
+          : null;
+      })
+      .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+      .sort((left, right) => right.score - left.score);
+
+    return jsonResponse({ leaderboard });
+  }
+
+  /**
+   * Postpones the reveal. Later only, and only while the group is still sealed —
+   * the reasoning is in `canMoveReveal`, and it is enforced here rather than in
+   * the UI because a rule that only the UI knows is not a rule.
+   */
+  private async moveReveal(request: Request, group: GroupState, owner: Member): Promise<Response> {
+    const body = await readJsonBody(request);
+    if (!body.ok) {
+      return jsonResponse({ error: body.error }, 400);
+    }
+
+    if (typeof body.value.revealAt !== 'string') {
+      return jsonResponse({ error: 'Invalid payload' }, 400);
+    }
+
+    const allowed = canMoveReveal(group, body.value.revealAt);
+    if (!allowed.ok) {
+      return jsonResponse({ error: allowed.error }, 409);
+    }
+
+    group.revealAt = body.value.revealAt;
+    group.revealMovedAt = new Date().toISOString();
+    await this.ctx.storage.put('group', group);
+    return jsonResponse({ group: this.overview(group, owner) });
+  }
+
+  /**
+   * Leaves the group, keeping the member row as a tombstone.
+   *
+   * Deleting the row is not an option: quotes point at it, and the group's
+   * history should not develop holes because somebody left. So the row stays
+   * with its name and every quote it appears in, and only the link to the
+   * account is cut — which is what membership is checked against, so access
+   * ends immediately. The effect is the same as a guest the owner added by
+   * name, which is a shape this group already understands.
+   *
+   * The owner cannot leave while they are the owner: a group with nobody able
+   * to manage members or rotate the invite is a group nobody can repair. They
+   * hand it over first.
+   */
+  private async leave(group: GroupState, member: Member): Promise<Response> {
+    if (member.role === 'owner') {
+      return jsonResponse(
+        {
+          error: 'Hand the group over to someone else before you leave it',
+          needsTransfer: true,
+        },
+        409,
+      );
+    }
+
+    member.userId = null;
+    member.leftAt = new Date().toISOString();
+    await this.ctx.storage.put('group', group);
+    // Their round is keyed on a row they can no longer reach.
+    await this.ctx.storage.delete(quizKey(member.id));
+    await this.ctx.storage.delete(quizBestKey(member.id));
+
+    return jsonResponse({ left: true });
+  }
+
+  /** Owner-only. The account list caches this name; see `/groups/touch`. */
+  private async renameGroup(request: Request, group: GroupState, owner: Member): Promise<Response> {
+    const body = await readJsonBody(request);
+    if (!body.ok) {
+      return jsonResponse({ error: body.error }, 400);
+    }
+
+    const name = validateText(body.value.name, 'Group name', LIMITS.groupName);
+    if (!name.ok) {
+      return jsonResponse({ error: name.error }, 400);
+    }
+
+    group.name = name.value;
+    await this.ctx.storage.put('group', group);
+    return jsonResponse({ group: this.overview(group, owner) });
+  }
+
+  /**
+   * Hands the group to another member who has an account. The outgoing owner
+   * stays as an ordinary member rather than being removed — they are in the
+   * quotes, and this is a handover, not an exit.
+   */
+  private async transferOwnership(request: Request, group: GroupState, owner: Member): Promise<Response> {
+    const body = await readJsonBody(request);
+    if (!body.ok) {
+      return jsonResponse({ error: body.error }, 400);
+    }
+
+    const target = group.members.find((entry) => entry.id === body.value.memberId);
+    if (!target) {
+      return jsonResponse({ error: 'That member is not part of this group' }, 404);
+    }
+
+    if (target.id === owner.id) {
+      return jsonResponse({ error: 'You already own this group' }, 409);
+    }
+
+    // A guest has no account to sign in with, so handing them the group would
+    // leave it ownerless in practice.
+    if (target.userId === null) {
+      return jsonResponse({ error: 'Only someone who has joined with an account can take the group over' }, 409);
+    }
+
+    target.role = 'owner';
+    owner.role = 'member';
+    group.ownerUserId = target.userId;
+    await this.ctx.storage.put('group', group);
+    return jsonResponse({ group: this.overview(group, owner) });
+  }
+
   private overview(group: GroupState, viewer: Member) {
-    const locked = !areQuotesVisible(group.revealYear);
+    const locked = !areQuotesVisible(group);
 
     return {
       id: group.id,
       name: group.name,
       revealYear: group.revealYear,
-      revealAt: getRevealAtIso(group.revealYear),
+      revealAt: revealInstant(group),
+      // Shown to every member, not just the owner: a date that can move is only
+      // honest if everyone can see that it did.
+      revealMovedAt: group.revealMovedAt ?? null,
       locked,
       createdAt: group.createdAt,
       inviteVersion: group.inviteVersion,

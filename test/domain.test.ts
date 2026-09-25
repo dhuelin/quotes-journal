@@ -2,7 +2,13 @@ import { describe, expect, it } from 'vitest';
 import {
   areQuotesVisible,
   buildProgress,
+  canMoveReveal,
+  quoteLinesOf,
+  quoteSpeakers,
+  revealInstant,
   buildQuiz,
+  QUIZ,
+  scoreAnswer,
   buildStats,
   exceedsGroupBudget,
   exceedsImageBudget,
@@ -56,16 +62,80 @@ const group = (): GroupState => ({
 });
 
 describe('reveal timing', () => {
-  it('locks quotes until the first moment of the following year', () => {
-    expect(areQuotesVisible(2026, new Date('2026-12-31T23:59:59.999Z'))).toBe(false);
-    expect(areQuotesVisible(2026, new Date('2027-01-01T00:00:00.000Z'))).toBe(true);
+  it('locks quotes until the first moment of the following year by default', () => {
+    expect(areQuotesVisible({ revealYear: 2026 }, new Date('2026-12-31T23:59:59.999Z'))).toBe(false);
+    expect(areQuotesVisible({ revealYear: 2026 }, new Date('2027-01-01T00:00:00.000Z'))).toBe(true);
     expect(getRevealAtIso(2026)).toBe('2027-01-01T00:00:00.000Z');
   });
 
   it('handles leap years and far-future years', () => {
     expect(getRevealAtIso(2023)).toBe('2024-01-01T00:00:00.000Z');
     expect(getRevealAtIso(2999)).toBe('3000-01-01T00:00:00.000Z');
-    expect(areQuotesVisible(2024, new Date('2024-12-31T12:00:00.000Z'))).toBe(false);
+    expect(areQuotesVisible({ revealYear: 2024 }, new Date('2024-12-31T12:00:00.000Z'))).toBe(false);
+  });
+
+  it('opens on a chosen instant instead, to the millisecond', () => {
+    // The Christmas-party case: a group that wants to read its quotes on the
+    // 29th rather than waiting for midnight on 1 January.
+    const party = { revealYear: 2026, revealAt: '2026-12-29T19:00:00.000Z' };
+
+    expect(areQuotesVisible(party, new Date('2026-12-29T18:59:59.999Z'))).toBe(false);
+    expect(areQuotesVisible(party, new Date('2026-12-29T19:00:00.000Z'))).toBe(true);
+    // And the default no longer applies, in either direction.
+    expect(areQuotesVisible(party, new Date('2026-12-30T00:00:00.000Z'))).toBe(true);
+  });
+
+  it('leaves a group stored before the date was configurable exactly where it was', () => {
+    // The migration story: there is none, because a group with no instant keeps
+    // deriving the one it has always had. Nothing shifts mid-collection.
+    const legacy = { revealYear: 2026 };
+
+    expect(revealInstant(legacy)).toBe('2027-01-01T00:00:00.000Z');
+    expect(revealInstant({ revealYear: 2026, revealAt: '2026-12-29T19:00:00.000Z' })).toBe(
+      '2026-12-29T19:00:00.000Z',
+    );
+  });
+});
+
+/**
+ * The rule the product rests on. Everyone who recorded a quote did so on the
+ * promise that nobody reads it before a stated moment; pulling that moment
+ * forward breaks a promise they cannot take back.
+ */
+describe('moving the reveal', () => {
+  const sealed = { revealYear: 2026, revealAt: '2026-12-29T19:00:00.000Z' };
+  const during = new Date('2026-06-01T00:00:00.000Z');
+
+  it('allows a later date', () => {
+    expect(canMoveReveal(sealed, '2026-12-31T19:00:00.000Z', during).ok).toBe(true);
+  });
+
+  it('refuses an earlier one, and refuses standing still', () => {
+    const earlier = canMoveReveal(sealed, '2026-12-01T19:00:00.000Z', during);
+    expect(earlier.ok).toBe(false);
+    expect(earlier.ok === false && earlier.error).toContain('only be moved later');
+
+    // The same instant is not a move, and allowing it would only ever be a way
+    // to reset the "moved" marker.
+    expect(canMoveReveal(sealed, sealed.revealAt, during).ok).toBe(false);
+  });
+
+  it('refuses any change once the group has opened', () => {
+    // Re-sealing would re-open collecting to people who have now read
+    // everything everyone else wrote.
+    const after = new Date('2027-01-05T00:00:00.000Z');
+
+    expect(canMoveReveal(sealed, '2027-06-01T00:00:00.000Z', after).ok).toBe(false);
+    expect(canMoveReveal(sealed, '2027-06-01T00:00:00.000Z', after)).toMatchObject({
+      error: expect.stringContaining('already opened'),
+    });
+  });
+
+  it('measures a legacy group against the instant it derives', () => {
+    const legacy = { revealYear: 2026 };
+
+    expect(canMoveReveal(legacy, '2027-03-01T00:00:00.000Z', during).ok).toBe(true);
+    expect(canMoveReveal(legacy, '2026-12-29T00:00:00.000Z', during).ok).toBe(false);
   });
 });
 
@@ -74,15 +144,48 @@ describe('quiz', () => {
     const quiz = buildQuiz(group());
 
     expect(quiz).toHaveLength(3);
-    expect(quiz[0].answerMemberId).toBe('m1');
     expect(quiz[0].options.map((option) => option.id)).toEqual(['m1', 'm2', 'm3']);
-    expect(quiz[2].answerMemberId).toBe('m3');
+  });
+
+  it('never ships the answer to the client', () => {
+    // The point of scoring on the server. With the answer in the payload, a
+    // score is worth exactly as much as the honesty of whoever opened devtools.
+    expect(JSON.stringify(buildQuiz(group()))).not.toContain('answerMemberId');
+    expect(JSON.stringify(buildQuiz(group()))).not.toContain('saidByMemberId');
   });
 
   it('returns nothing for a group without quotes', () => {
     const empty = group();
     empty.quotes = [];
     expect(buildQuiz(empty)).toEqual([]);
+  });
+});
+
+describe('quiz scoring', () => {
+  it('pays everything for an instant answer and half at the buzzer', () => {
+    expect(scoreAnswer(true, 0)).toBe(QUIZ.maxPoints);
+    expect(scoreAnswer(true, QUIZ.answerWindowMs)).toBe(QUIZ.maxPoints / 2);
+    expect(scoreAnswer(true, QUIZ.answerWindowMs / 2)).toBe(750);
+  });
+
+  it('pays nothing for a wrong answer, however fast', () => {
+    expect(scoreAnswer(false, 0)).toBe(0);
+    expect(scoreAnswer(false, QUIZ.answerWindowMs)).toBe(0);
+  });
+
+  it('never pays more than full or less than half for a correct answer', () => {
+    // A clock that runs backwards, or a question left open for an hour, are
+    // both arithmetic the score has to survive.
+    expect(scoreAnswer(true, -5_000)).toBe(QUIZ.maxPoints);
+    expect(scoreAnswer(true, 60 * 60 * 1000)).toBe(QUIZ.maxPoints / 2);
+  });
+
+  it('rewards speed without letting it decide the game alone', () => {
+    // The slowest correct answer is still worth half the fastest, so two right
+    // answers at the buzzer are never worth less than one instant one: knowing
+    // the group cannot be beaten by a fast thumb alone.
+    expect(scoreAnswer(true, QUIZ.answerWindowMs) * 2).toBeGreaterThanOrEqual(scoreAnswer(true, 0));
+    expect(scoreAnswer(true, QUIZ.answerWindowMs)).toBeGreaterThan(scoreAnswer(false, 0));
   });
 });
 
@@ -186,28 +289,26 @@ describe('the stored-value budget', () => {
 });
 
 /**
- * The client is served under `style-src 'nonce-…'`. A nonce authorises inline
- * <style> blocks but never style="" attributes, which browsers drop silently —
- * no test that stops at the HTTP layer can see it, so guard the source instead.
+ * The client is served under `style-src 'sha256-…'`. A hash names an inline
+ * <style> block; a style="" attribute cannot be named at all and browsers drop
+ * it silently — no test that stops at the HTTP layer can see that, so guard the
+ * source instead.
  */
 describe('the inlined client under CSP', () => {
   it('carries no inline style attributes on any page', async () => {
     const { renderAppHtml, renderPrivacyHtml } = await import('../src/ui');
 
-    // Every page served under the nonce policy, not just the app: a style=""
-    // attribute cannot carry the nonce and is dropped silently by the browser.
-    expect(renderAppHtml('test-nonce')).not.toContain('style="');
-    expect(renderPrivacyHtml('test-nonce')).not.toContain('style="');
+    // Every page under the policy, not just the app: a style="" attribute is
+    // outside what a hash or a nonce can authorise, either way.
+    expect(renderAppHtml()).not.toContain('style="');
+    expect(renderPrivacyHtml()).not.toContain('style="');
   });
 
-  it('stamps the nonce onto the privacy page too', async () => {
+  it('carries no script at all on the privacy page', async () => {
     const { renderPrivacyHtml } = await import('../src/ui');
-    const page = renderPrivacyHtml('test-nonce');
 
-    expect(page).toContain('<style nonce="test-nonce">');
-    expect(page).not.toContain('__CSP_NONCE__');
-    // No scripts at all on this page, so none should be authorised.
-    expect(page).not.toContain('<script');
+    // Nothing to execute means nothing for the policy to authorise.
+    expect(renderPrivacyHtml()).not.toContain('<script');
   });
 
   it('sets no maxlength, so a pasted over-long value is reported rather than trimmed', async () => {
@@ -215,8 +316,32 @@ describe('the inlined client under CSP', () => {
 
     // Silent truncation hid an error the server states clearly; a counter and
     // the server's own message replaced it.
-    expect(renderAppHtml('n')).not.toContain('maxlength=');
-    expect(renderAppHtml('n')).toContain('id="quote-count"');
+    expect(renderAppHtml()).not.toContain('maxlength=');
+    // One counter per line of a quote, since the limit is per line.
+    expect(renderAppHtml()).toContain("id=\"quote-count-'");
+  });
+
+  it('emits a script the browser can actually parse', async () => {
+    const { appInline } = await import('../src/ui');
+
+    // The strongest guard available at this layer, and the one that earns its
+    // keep: this file is a template literal, so a backtick ends it early and a
+    // backslash is eaten before the browser ever sees it — turning an escaped
+    // apostrophe into an unterminated string. Both have happened. Neither is
+    // visible in the HTML, and both ship a client that does not run at all.
+    expect(() => new Function(appInline.script)).not.toThrow();
+  });
+
+  it('carries no backtick or interpolation into the inlined blocks', async () => {
+    const { appInline, privacyInline } = await import('../src/ui');
+
+    // The client lives inside a template literal, so a backtick written in it —
+    // in a comment as easily as in code — ends the string early, and a `${`
+    // silently interpolates. Either one ships a client that does not run.
+    for (const block of [appInline.styles, appInline.script, privacyInline.styles]) {
+      expect(block).not.toContain('`');
+      expect(block).not.toContain('${');
+    }
   });
 
   it('escapes nothing into a regex literal, which a template literal would eat', async () => {
@@ -225,12 +350,12 @@ describe('the inlined client under CSP', () => {
     // ui.ts is one big template literal: a backslash written here never reaches
     // the browser, so a regex like /^\/groups/ silently becomes /^/groups/ and
     // throws "invalid flags" at load. Path parsing uses split() instead.
-    expect(renderAppHtml('n')).not.toMatch(/match\(\/\^/);
+    expect(renderAppHtml()).not.toMatch(/match\(\/\^/);
   });
 
   it('asks for the password twice at registration and never sends the second copy', async () => {
     const { renderAppHtml } = await import('../src/ui');
-    const page = renderAppHtml('n');
+    const page = renderAppHtml();
 
     // There is no password reset yet (#6), so a typo at registration locks
     // someone out of an account they cannot recover.
@@ -243,7 +368,7 @@ describe('the inlined client under CSP', () => {
 
   it('offers a picture field that is prepared on the device before upload', async () => {
     const { renderAppHtml } = await import('../src/ui');
-    const page = renderAppHtml('n');
+    const page = renderAppHtml();
 
     expect(page).toContain('id="quote-photo"');
     expect(page).toContain('accept="image/jpeg,image/png,image/webp"');
@@ -254,13 +379,34 @@ describe('the inlined client under CSP', () => {
     expect(page).toContain("authorization: 'Bearer ' + state.token");
   });
 
-  it('stamps the nonce onto both inline blocks and leaves no placeholder behind', async () => {
-    const { renderAppHtml } = await import('../src/ui');
-    const page = renderAppHtml('test-nonce');
+  it('hashes exactly the bytes it serves between the tags', async () => {
+    const { appInline, privacyInline, renderAppHtml, renderPrivacyHtml } = await import('../src/ui');
+    const { policies } = await import('../src/csp');
+    const page = renderAppHtml();
 
-    expect(page).toContain('<style nonce="test-nonce">');
-    expect(page).toContain('<script nonce="test-nonce">');
+    // The whole scheme rests on this: what the policy names and what the browser
+    // runs have to be the same bytes. They are interpolated, so they are — and
+    // this is the test that notices if anyone reintroduces a wrapper or a trim.
+    expect(page).toContain(`<style>${appInline.styles}</style>`);
+    expect(page).toContain(`<script>${appInline.script}</script>`);
+    expect(renderPrivacyHtml()).toContain(`<style>${privacyInline.styles}</style>`);
     expect(page).not.toContain('__CSP_NONCE__');
+
+    const policy = await policies();
+    expect(policy.app).toMatch(/script-src 'sha256-[A-Za-z0-9+/=]{44}'/);
+    expect(policy.app).toMatch(/style-src 'sha256-[A-Za-z0-9+/=]{44}'/);
+    // The privacy page has no script, so it authorises none.
+    expect(policy.privacy).not.toContain('script-src');
+  });
+
+  it('fingerprints the client so a deployed change reaches an installed app', async () => {
+    const { policies } = await import('../src/csp');
+
+    // The service worker names its cache with this. If it did not change when
+    // the client changes, a browser would keep serving a shell cached months
+    // ago and never install the new worker that would have replaced it.
+    const { version } = await policies();
+    expect(version).toMatch(/^[A-Za-z0-9]{16}$/);
   });
 });
 
@@ -310,5 +456,60 @@ describe('the picture budget', () => {
 
     expect(groupByteSize(many)).toBeLessThan(LIMITS.groupBytes);
     expect(groupImageByteSize(many)).toBeGreaterThan(LIMITS.groupBytes);
+  });
+});
+
+/**
+ * A quote with more than one speaker. The single-speaker quote is the one-line
+ * case, so nothing already recorded changes shape.
+ */
+describe('conversations', () => {
+  const exchange = (): Quote => ({
+    id: 'q9',
+    // Mirrors of the opening line, kept so a reader that predates conversations
+    // still shows something correct.
+    text: 'I am not lost.',
+    saidByMemberId: 'm1',
+    recordedByMemberId: 'm2',
+    involvedMemberIds: [],
+    createdAt: '2026-05-01T00:00:00.000Z',
+    lines: [
+      { saidByMemberId: 'm1', text: 'I am not lost.' },
+      { saidByMemberId: 'm2', text: 'You have been driving in circles for twenty minutes.' },
+      { saidByMemberId: 'm1', text: 'Scenically.' },
+    ],
+  });
+
+  it('reads a single remark as a one-line exchange', () => {
+    const [line, ...rest] = quoteLinesOf(group().quotes[0]);
+
+    expect(rest).toHaveLength(0);
+    expect(line).toEqual({ saidByMemberId: 'm1', text: 'Hello' });
+  });
+
+  it('counts a speaker once however many lines they have', () => {
+    // Otherwise the leaderboard would reward rambling rather than being quotable.
+    expect(quoteSpeakers(exchange())).toEqual(['m1', 'm2']);
+  });
+
+  it('credits every speaker in an exchange, and the recorder only once', () => {
+    const withExchange = group();
+    withExchange.quotes = [exchange()];
+
+    const stats = buildStats(withExchange);
+
+    expect(stats.saidBy).toEqual({ m1: 1, m2: 1, m3: 0 });
+    expect(stats.persistedBy).toEqual({ m1: 0, m2: 1, m3: 0 });
+    // One quote, two people in it: the totals across members can exceed the
+    // quote count, which is the honest reading of "quotes you are in".
+    expect(stats.totalQuotes).toBe(1);
+  });
+
+  it('keeps the opening line as the fallback view of the quote', () => {
+    const quote = exchange();
+
+    // A client that knows nothing about `lines` shows this, correctly attributed.
+    expect(quote.text).toBe(quote.lines![0].text);
+    expect(quote.saidByMemberId).toBe(quote.lines![0].saidByMemberId);
   });
 });

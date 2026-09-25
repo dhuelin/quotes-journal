@@ -13,15 +13,19 @@ app and the HTTP API; a Flutter app talks to the same API on Android and iOS.
   up can still be quoted.
 - **Collecting.** Anyone in the group records a quote: the text, who said it and
   who else was there, and optionally a picture for the context the words alone
-  do not carry. The server attributes the quote to whoever is signed in, so who
-  collected what cannot be faked.
-- **The lock.** Quotes, their pictures, the quiz and the statistics all return `423 Locked`
-  until midnight UTC on 1 January of the following year. During the year the app
-  shows only a count, so nothing is spoiled — not even for the person who wrote
-  the quote down.
+  do not carry. A quote can be an exchange — several lines, each with its own
+  speaker — so a back-and-forth stays one thing. The server attributes the quote
+  to whoever is signed in, so who collected what cannot be faked.
+- **The lock.** Quotes, their pictures, the quiz and the statistics all return
+  `423 Locked` until the group's reveal date — midnight on 1 January by default,
+  or any instant the creator picks. During the year the app shows only a count,
+  so nothing is spoiled — not even for the person who wrote the quote down.
 - **The reveal.** From 1 January the group can read every quote, see the
   statistics (how many quotes each person said, and how many each person
-  collected) and pull a Kahoot-style quiz payload.
+  collected) and play the quiz.
+- **The quiz.** A Kahoot-style round: one quote at a time, every member as an
+  answer, twenty seconds a question. A faster right answer is worth more, and
+  the group sees everyone's best round.
 
 ## Security model
 
@@ -56,8 +60,11 @@ app and the HTTP API; a Flutter app talks to the same API on Android and iOS.
   `default-src 'none'; sandbox` policy, and are read with a bearer token rather
   than through a URL that would have to carry a credential.
 - The app shell is served with a strict `Content-Security-Policy`
-  (`default-src 'none'`, a per-response nonce for the one inline script and
-  style), plus `nosniff`, `no-referrer`, `frame-ancestors 'none'` and HSTS.
+  (`default-src 'none'`, plus a SHA-256 hash naming the one inline script and
+  the one inline style), and `nosniff`, `no-referrer`, `frame-ancestors 'none'`
+  and HSTS. Hashes rather than a per-response nonce: a nonce authorises whatever
+  inline block carries it, while a hash authorises exactly that text — and a
+  hash is stable, which is what lets the shell be cached and opened offline.
 
 ### PBKDF2 cost
 
@@ -97,6 +104,116 @@ the group value. That value is read and rewritten on every write and has a hard
 ~2.2MB ceiling ([#10](https://github.com/dhuelin/quotes-journal/issues/10)) —
 only the picture's size and type live there. R2 would be the natural home if
 this grows, and is not used today because R2 is not enabled on the account.
+
+### Settings, and leaving a group
+
+An account can change its display name. That name is what you are called on new
+groups and on the account itself; it does **not** rename you inside groups you
+are already in, because names have to stay unique within a group and a silent
+bulk rename could collide with somebody else's. Renaming inside a group is the
+owner's existing control. Changing the name issues a fresh session token, since
+the old one carries the old name and is what names the creator of a group.
+
+**Leaving keeps the member row as a tombstone.** Deleting it is not an option —
+quotes point at it, and a group's history should not develop holes because
+someone left. The row keeps its name and every quote it appears in; only the
+link to the account is cut, which is what membership is checked against, so
+access ends at once. The effect is a guest added by name, a shape the group
+already understands.
+
+The **owner cannot leave** while they own the group: one with nobody able to
+manage members or rotate the invite is one nobody can repair. They hand it over
+first, to a member with an account — a guest has no way to sign in — and stay on
+as an ordinary member, because a handover is not an exit.
+
+A group rename updates the owner's cached list immediately. Every other member's
+heals the next time they open the group ([#9](https://github.com/dhuelin/quotes-journal/issues/9)):
+the group object stores account ids, not addresses, and the account objects are
+keyed by address, so it cannot push. Putting every member's email inside the
+group value to make a push possible is a poor trade for a cached label.
+
+### Conversations
+
+A quote is either a single remark or an exchange of up to ten lines, each with
+its own speaker. The 500-character limit is per line — a long exchange is
+several ordinary remarks — and the byte budget is what actually keeps a quote
+from outgrowing storage.
+
+A quote's `text` and `saidByMemberId` always hold the opening line, mirrored,
+even when `lines` carries the whole exchange. The duplication is deliberate: a
+reader that predates conversations, the Flutter client included, shows the
+opening line attributed to the right person rather than nothing at all.
+
+**In the quiz**, an exchange has no single answer, so a question asks about one
+line and shows the rest with their speakers named. That keeps the quiz to one
+question type, and a conversation makes better material than a lone remark
+precisely because the context is the joke. Each line is its own question, so a
+three-line exchange is three.
+
+**In the statistics**, every speaker in an exchange is credited once, however
+many lines they have — otherwise the leaderboard would reward rambling. The
+totals across members can therefore exceed the quote count, which is the honest
+reading of "quotes you are in".
+
+### The reveal date, and whether it can move
+
+A group opens at an instant its creator picks. The default is midnight on
+1 January of the following year, which is what every group did before, and a
+group stored with only a year keeps deriving exactly that — so nothing shifts
+under a group mid-collection and there is no migration.
+
+The date is picked in the browser's own zone and stored as an absolute instant,
+so what someone picks is what their group gets.
+
+**The owner can push the date back, never pull it forward.** That is the rule
+the product rests on: everyone who recorded a quote did so on the promise that
+nobody reads it before a stated moment, and pulling that moment forward breaks a
+promise they cannot take back. Delaying disappoints people; it does not betray
+them. Every member sees the current date and a marker when it has moved.
+
+Changes are refused entirely once the group has opened — re-sealing a group that
+has been read would reopen collecting to people who now know what everyone else
+wrote.
+
+### Scoring the quiz
+
+The quiz is scored on the server, and the payload no longer carries
+`answerMemberId`. The reason is simple: with the answer in the payload, a score
+is worth exactly as much as the honesty of whoever opened devtools — and this
+app already asks people to care about a leaderboard.
+
+The clock is the server's too. A browser asked to report its own response time
+can report zero, so the server stamps when it served a question and works out
+the elapsed time itself. Network latency counts against the player, which is the
+same bargain Kahoot makes.
+
+An answer is checked against the question the round is actually on, so a replayed
+request cannot bank the same points twice, and a member's **best** round is kept
+rather than their latest — restarting is free in a party game and must never
+cost someone a score they already earned.
+
+A group needs three members to play. With two, every question is a coin flip
+between you and one other person: not a quiz made easy, a quiz that does not
+work.
+
+### Offline and the installed app
+
+The service worker precaches the app shell, the icon and the manifest, and
+serves the shell for any in-app path — so an installed app opens with no
+connection, deep links included, instead of showing the browser's error page.
+Quotes still need the server, and the app says so rather than claiming a group
+is empty.
+
+Nothing under `/api` is ever cached. Quotes, pictures and the account are read
+with a bearer token, and a copy in Cache Storage would outlive signing out —
+readable by whoever picks up the device next, and for a group still under its
+reveal lock, readable early. The saving would be a round trip; the cost would be
+the only guarantee this app makes.
+
+The cache is named after a fingerprint of the client itself, so deploying a
+change alters the text of `/sw.js`. That is the only thing that makes a browser
+install a new worker and drop the old cache — a version baked in by hand is how
+an offline app ends up serving a build from months ago.
 
 ## Tech stack
 
@@ -202,21 +319,29 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | `POST` | `/api/auth/register` | `{ displayName, email, password }` → `{ token, user }` |
 | `POST` | `/api/auth/login` | `{ email, password }` → `{ token, user }` |
 | `GET` | `/api/auth/me` | the account and the groups it belongs to |
+| `POST` | `/api/account/display-name` | `{ displayName }` → a fresh `{ token, user }` |
 | `GET` | `/api/groups` | groups you belong to |
-| `POST` | `/api/groups` | `{ name, revealYear }`; the creator becomes owner |
+| `POST` | `/api/groups` | `{ name, revealYear, revealAt? }`; the creator becomes owner |
 | `GET` | `/api/groups/:groupId` | members, your role, and progress while locked |
 | `POST` | `/api/groups/:groupId/members` | `{ name }`, for friends without an account; owner only |
 | `POST` | `/api/groups/:groupId/members/claim` | `{ guestMemberId, memberId }`; owner only |
 | `POST` | `/api/groups/:groupId/members/rename` | `{ memberId, name }`; owner only |
 | `POST` | `/api/groups/:groupId/members/remove` | `{ memberId }`; owner only, refused once quoted |
-| `POST` | `/api/groups/:groupId/quotes` | `{ text, saidByMemberId, involvedMemberIds }`; `409` after the reveal |
+| `POST` | `/api/groups/:groupId/quotes` | `{ text, saidByMemberId }` or `{ lines: [{ text, saidByMemberId }] }`, plus `involvedMemberIds`; `409` after the reveal |
 | `GET` | `/api/groups/:groupId/quotes` | `423` until the reveal |
 | `POST` | `/api/groups/:groupId/quotes/:quoteId/image` | raw JPEG/PNG/WebP bytes; recorder only, `409` after the reveal |
 | `GET` | `/api/groups/:groupId/quotes/:quoteId/image` | the picture itself; `423` until the reveal |
 | `POST` | `/api/groups/:groupId/quotes/:quoteId/image/remove` | recorder only |
-| `GET` | `/api/groups/:groupId/quiz` | `423` until the reveal |
+| `GET` | `/api/groups/:groupId/quiz` | the questions, never the answers; `423` until the reveal |
+| `POST` | `/api/groups/:groupId/quiz/start` | begins a round; `409` under three members |
+| `POST` | `/api/groups/:groupId/quiz/answer` | `{ quoteId, memberId }`; scores it and serves the next question |
+| `GET` | `/api/groups/:groupId/quiz/scores` | every member's best round |
 | `GET` | `/api/groups/:groupId/stats` | `423` until the reveal |
 | `GET` | `/api/groups/:groupId/invite` | current invite code; the client builds the link |
+| `POST` | `/api/groups/:groupId/rename` | `{ name }`; owner only |
+| `POST` | `/api/groups/:groupId/leave` | keeps your member row; owners must hand over first |
+| `POST` | `/api/groups/:groupId/members/transfer` | `{ memberId }`; owner only, account holders only |
+| `POST` | `/api/groups/:groupId/reveal` | `{ revealAt }`; owner only, later only, refused once open |
 | `POST` | `/api/groups/:groupId/invite/rotate` | owner only; invalidates old links |
 | `POST` | `/api/invites/accept` | `{ inviteCode, memberName? }`; `410` if expired or rotated |
 
@@ -228,15 +353,11 @@ store data-safety declarations must match what that page says.
 
 Tracked in [the issue tracker](https://github.com/dhuelin/quotes-journal/issues):
 
-- [#2](https://github.com/dhuelin/quotes-journal/issues/2) the interactive Kahoot-style quiz frontend
 - [#3](https://github.com/dhuelin/quotes-journal/issues/3) timezone-aware reveal (today it unlocks at midnight UTC)
 - [#4](https://github.com/dhuelin/quotes-journal/issues/4) year-end countdown and unlock notifications
 - [#5](https://github.com/dhuelin/quotes-journal/issues/5) richer analytics beyond the leaderboard
 - [#6](https://github.com/dhuelin/quotes-journal/issues/6) session revocation and password reset
 - [#7](https://github.com/dhuelin/quotes-journal/issues/7) persist the mobile session across restarts
 - [#8](https://github.com/dhuelin/quotes-journal/issues/8) store submission setup for the mobile app
-- [#9](https://github.com/dhuelin/quotes-journal/issues/9) keep the cached group name on an account in sync
-- [#13](https://github.com/dhuelin/quotes-journal/issues/13) the service worker registers but caches nothing
-- [#15](https://github.com/dhuelin/quotes-journal/issues/15) a configurable reveal date, not just the year
-- [#17](https://github.com/dhuelin/quotes-journal/issues/17) settings pages for accounts and groups
 - [#19](https://github.com/dhuelin/quotes-journal/issues/19) publishing to the app stores (low priority)
+- [#20](https://github.com/dhuelin/quotes-journal/issues/20) the Flutter client shows no quote pictures
