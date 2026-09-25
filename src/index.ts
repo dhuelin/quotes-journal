@@ -606,6 +606,14 @@ app.get('/api/groups/:groupId/quiz', async (c) =>
   passThrough(await callGroupStore(c.env, c.req.param('groupId'), '/quiz', c.get('user'))),
 );
 
+/** Every member's best finished round, which is what makes the quiz a contest. */
+app.get('/api/groups/:groupId/quiz/scores', async (c) =>
+  passThrough(await callGroupStore(c.env, c.req.param('groupId'), '/quiz/scores', c.get('user'))),
+);
+
+app.post('/api/groups/:groupId/quiz/start', (c) => forwardWrite(c, '/quiz/start'));
+app.post('/api/groups/:groupId/quiz/answer', (c) => forwardWrite(c, '/quiz/answer'));
+
 app.get('/api/groups/:groupId/stats', async (c) =>
   passThrough(await callGroupStore(c.env, c.req.param('groupId'), '/stats', c.get('user'))),
 );

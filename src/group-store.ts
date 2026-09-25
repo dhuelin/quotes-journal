@@ -10,7 +10,12 @@ import {
   findMemberByUserId,
   getRevealAtIso,
   LIMITS,
+  QUIZ,
+  quizQuestion,
+  scoreAnswer,
+  shuffled,
   type GroupState,
+  type QuizRun,
   type ImageContentType,
   type Member,
 } from './domain';
@@ -55,6 +60,19 @@ const readCaller = (request: Request): Caller | null => {
  * quick route to the value ceiling.
  */
 const imageKey = (quoteId: string): string => `image:${quoteId}`;
+
+/**
+ * One player's round. Its own key, like the pictures: the group value is read
+ * and rewritten on every write, and a round that changes on every answer has no
+ * business in there.
+ */
+const quizKey = (memberId: string): string => `quiz:${memberId}`;
+
+/**
+ * A member's best finished round, kept apart from the round in progress so that
+ * starting another one can never cost someone a score they already earned.
+ */
+const quizBestKey = (memberId: string): string => `best:${memberId}`;
 
 /** Matches `/quotes/<id>/image` and `/quotes/<id>/image/remove`. */
 const readQuoteImagePath = (pathname: string): { quoteId: string; remove: boolean } | null => {
@@ -183,6 +201,18 @@ export class GroupStore {
         return lockedResponse(group, 'The quiz and its answers');
       }
       return jsonResponse({ questions: buildQuiz(group) });
+    }
+
+    if (url.pathname === '/quiz/start' && request.method === 'POST') {
+      return this.startQuiz(group, member);
+    }
+
+    if (url.pathname === '/quiz/answer' && request.method === 'POST') {
+      return this.answerQuiz(request, group, member);
+    }
+
+    if (url.pathname === '/quiz/scores' && request.method === 'GET') {
+      return this.quizScores(group);
     }
 
     if (url.pathname === '/stats' && request.method === 'GET') {
@@ -383,6 +413,10 @@ export class GroupStore {
     guest.userId = joined.userId;
     guest.joinedAt = joined.joinedAt;
     group.members = group.members.filter((entry) => entry.id !== joined.id);
+    // The folded-in row is gone, so any quiz round stored against it is
+    // unreachable — and would otherwise sit in storage for good.
+    await this.ctx.storage.delete(quizKey(joined.id));
+    await this.ctx.storage.delete(quizBestKey(joined.id));
 
     for (const quote of group.quotes) {
       if (quote.saidByMemberId === joined.id) {
@@ -636,6 +670,149 @@ export class GroupStore {
     }
 
     return new Response(bytes.slice().buffer as ArrayBuffer, { headers: imageResponseHeaders(quote.image.contentType) });
+  }
+
+  /**
+   * Begins a round for the caller, replacing any round they had going. Restarts
+   * are allowed on purpose — this is a party game, not an exam — and the group
+   * leaderboard keeps a member's best round rather than their latest, so
+   * restarting can never cost someone a score they already earned.
+   */
+  private async startQuiz(group: GroupState, player: Member): Promise<Response> {
+    if (!areQuotesVisible(group.revealYear)) {
+      return lockedResponse(group, 'The quiz and its answers');
+    }
+
+    if (group.members.length < QUIZ.minMembersToPlay) {
+      return jsonResponse(
+        {
+          error: `A quiz needs at least ${QUIZ.minMembersToPlay} people in the group — with fewer, every question is a coin flip`,
+          needsMembers: QUIZ.minMembersToPlay,
+        },
+        409,
+      );
+    }
+
+    if (group.quotes.length === 0) {
+      return jsonResponse({ error: 'This group never recorded a quote, so there is nothing to ask about' }, 409);
+    }
+
+    const run: QuizRun = {
+      order: shuffled(group.quotes.map((quote) => quote.id)).slice(0, QUIZ.maxQuestions),
+      index: 0,
+      askedAt: new Date().toISOString(),
+      score: 0,
+      correct: 0,
+      finishedAt: null,
+    };
+
+    await this.ctx.storage.put(quizKey(player.id), run);
+    return jsonResponse({ question: quizQuestion(group, run), score: 0 }, 201);
+  }
+
+  /**
+   * Scores one answer and serves the next question.
+   *
+   * The elapsed time comes from when the server served the question, never from
+   * the client: a browser asked to report its own response time can report zero.
+   * The answer is checked against the question the run is actually on, so a
+   * replayed or skipped-ahead request cannot bank points twice.
+   */
+  private async answerQuiz(request: Request, group: GroupState, player: Member): Promise<Response> {
+    if (!areQuotesVisible(group.revealYear)) {
+      return lockedResponse(group, 'The quiz and its answers');
+    }
+
+    const body = await readJsonBody(request);
+    if (!body.ok) {
+      return jsonResponse({ error: body.error }, 400);
+    }
+
+    const run = await this.ctx.storage.get<QuizRun>(quizKey(player.id));
+    if (!run || run.finishedAt) {
+      return jsonResponse({ error: 'That round is over, start a new one' }, 409);
+    }
+
+    const current = group.quotes.find((quote) => quote.id === run.order[run.index]);
+    if (!current) {
+      return jsonResponse({ error: 'That round is over, start a new one' }, 409);
+    }
+
+    // Answering a question the run has already moved past would otherwise be a
+    // way to bank the same points twice.
+    if (body.value.quoteId !== current.id) {
+      return jsonResponse({ error: 'That is not the question you are on' }, 409);
+    }
+
+    // null is a question that ran out of time, which is a real answer worth nothing.
+    const guess = body.value.memberId;
+    if (guess !== null && guess !== undefined && typeof guess !== 'string') {
+      return jsonResponse({ error: 'Invalid answer' }, 400);
+    }
+
+    const correct = typeof guess === 'string' && guess === current.saidByMemberId;
+    const elapsedMs = Date.now() - new Date(run.askedAt).getTime();
+    const points = scoreAnswer(correct, elapsedMs);
+
+    run.score += points;
+    run.correct += correct ? 1 : 0;
+    run.index += 1;
+    run.askedAt = new Date().toISOString();
+
+    const finished = run.index >= run.order.length;
+    if (finished) {
+      run.finishedAt = new Date().toISOString();
+    }
+
+    await this.ctx.storage.put(quizKey(player.id), run);
+
+    if (finished) {
+      const best = await this.ctx.storage.get<QuizRun>(quizBestKey(player.id));
+      if (!best || run.score > best.score) {
+        await this.ctx.storage.put(quizBestKey(player.id), run);
+      }
+    }
+
+    return jsonResponse({
+      correct,
+      // Only now, with the answer already banked, is it safe to say.
+      answerMemberId: current.saidByMemberId,
+      points,
+      score: run.score,
+      finished,
+      question: finished ? null : quizQuestion(group, run),
+      summary: finished ? { score: run.score, correct: run.correct, total: run.order.length } : null,
+    });
+  }
+
+  /**
+   * Every member's best round. A quiz played alone is a score with nothing to
+   * compare it to; this is what makes it a game the group plays.
+   */
+  private async quizScores(group: GroupState): Promise<Response> {
+    if (!areQuotesVisible(group.revealYear)) {
+      return lockedResponse(group, 'Quiz scores');
+    }
+
+    const runs = await this.ctx.storage.list<QuizRun>({ prefix: 'best:' });
+    const leaderboard = group.members
+      .map((member) => {
+        const run = runs.get(quizBestKey(member.id));
+        return run?.finishedAt
+          ? {
+              memberId: member.id,
+              name: member.name,
+              score: run.score,
+              correct: run.correct,
+              total: run.order.length,
+              finishedAt: run.finishedAt,
+            }
+          : null;
+      })
+      .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+      .sort((left, right) => right.score - left.score);
+
+    return jsonResponse({ leaderboard });
   }
 
   private overview(group: GroupState, viewer: Member) {

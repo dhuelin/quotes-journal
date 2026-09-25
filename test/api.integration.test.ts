@@ -508,8 +508,15 @@ describe('the year-end lock', () => {
     const quiz = await request(`/api/groups/${group.id}/quiz`, { token: alice.token });
     expect(quiz.status).toBe(200);
     expect(quiz.body.questions).toHaveLength(1);
-    expect(quiz.body.questions[0].answerMemberId).toBe(cleo.id);
     expect(quiz.body.questions[0].options).toHaveLength(2);
+    // The reveal opens the questions, not the answers: those stay on the server
+    // so that a quiz score means something. Rounds are played through
+    // /quiz/start and /quiz/answer.
+    // Cleo's id is in there — she is an answer option, as every member is.
+    // What must not be there is anything saying which option is right.
+    expect(quiz.body.questions[0].answerMemberId).toBeUndefined();
+    expect(JSON.stringify(quiz.body)).not.toContain('answerMemberId');
+    expect(JSON.stringify(quiz.body)).not.toContain('saidByMemberId');
 
     const stats = await request(`/api/groups/${group.id}/stats`, { token: alice.token });
     expect(stats.status).toBe(200);
@@ -1466,5 +1473,203 @@ describe('pictures attached to quotes (L6)', () => {
     // group would be a few writes from the ceiling that breaks every later one.
     const after = await storedGroupSize(group.id);
     expect(after - before).toBeLessThan(200);
+  });
+});
+
+/**
+ * The quiz is scored on the server, and these are the reasons that was worth
+ * doing. Every test here is a way the score could otherwise have been faked.
+ */
+describe('the quiz round (L8)', () => {
+  const playableGroup = async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Quiz night', nextYear);
+
+    // Three members, because with two every question is a coin flip.
+    for (const name of ['Bob', 'Cleo']) {
+      const added = await request(`/api/groups/${group.id}/members`, {
+        method: 'POST',
+        token: alice.token,
+        body: { name },
+      });
+      expect(added.status).toBe(201);
+    }
+
+    const fresh = await request(`/api/groups/${group.id}`, { token: alice.token });
+    const members = fresh.body.group.members as { id: string; name: string }[];
+
+    for (const member of members) {
+      const saved = await request(`/api/groups/${group.id}/quotes`, {
+        method: 'POST',
+        token: alice.token,
+        body: { text: `Something ${member.name} said`, saidByMemberId: member.id },
+      });
+      expect(saved.status).toBe(201);
+    }
+
+    await unlockGroup(group.id);
+    return { alice, group, members };
+  };
+
+  const start = (player: TestUser, groupId: string) =>
+    request(`/api/groups/${groupId}/quiz/start`, { method: 'POST', token: player.token, body: {} });
+
+  const answer = (player: TestUser, groupId: string, quoteId: string, memberId: string | null) =>
+    request(`/api/groups/${groupId}/quiz/answer`, {
+      method: 'POST',
+      token: player.token,
+      body: { quoteId, memberId },
+    });
+
+  it('never sends the answer with the question', async () => {
+    const { alice, group } = await playableGroup();
+
+    const started = await start(alice, group.id);
+    expect(started.status).toBe(201);
+    expect(JSON.stringify(started.body.question)).not.toContain('answerMemberId');
+    expect(JSON.stringify(started.body.question)).not.toContain('saidByMemberId');
+
+    // The read-only question list is the same: questions, never answers.
+    const listed = await request(`/api/groups/${group.id}/quiz`, { token: alice.token });
+    expect(JSON.stringify(listed.body)).not.toContain('answerMemberId');
+  });
+
+  it('scores a correct answer and reveals the answer only afterwards', async () => {
+    const { alice, group, members } = await playableGroup();
+    const started = await start(alice, group.id);
+    const question = started.body.question;
+
+    // The quote text names who said it, which is how the test knows the answer
+    // without the server ever having told the client.
+    const expected = members.find((member) => question.text.includes(member.name))!;
+    const response = await answer(alice, group.id, question.quoteId, expected.id);
+
+    expect(response.status).toBe(200);
+    expect(response.body.correct).toBe(true);
+    expect(response.body.answerMemberId).toBe(expected.id);
+    expect(response.body.points).toBeGreaterThan(0);
+    expect(response.body.score).toBe(response.body.points);
+  });
+
+  it('scores nothing for a wrong answer and nothing for no answer at all', async () => {
+    const { alice, group, members } = await playableGroup();
+
+    const started = await start(alice, group.id);
+    const wrong = members.find((member) => !started.body.question.text.includes(member.name))!;
+    const missed = await answer(alice, group.id, started.body.question.quoteId, wrong.id);
+    expect(missed.body.correct).toBe(false);
+    expect(missed.body.points).toBe(0);
+
+    // A question left to expire is a real answer, worth nothing.
+    const expired = await answer(alice, group.id, missed.body.question.quoteId, null);
+    expect(expired.status).toBe(200);
+    expect(expired.body.correct).toBe(false);
+    expect(expired.body.points).toBe(0);
+  });
+
+  it('refuses an answer to a question the round has already moved past', async () => {
+    const { alice, group, members } = await playableGroup();
+    const started = await start(alice, group.id);
+    const first = started.body.question;
+    const right = members.find((member) => first.text.includes(member.name))!;
+
+    const scored = await answer(alice, group.id, first.quoteId, right.id);
+    expect(scored.body.correct).toBe(true);
+
+    // Replaying the same question would otherwise bank the same points again.
+    const replay = await answer(alice, group.id, first.quoteId, right.id);
+    expect(replay.status).toBe(409);
+    expect(replay.body.error).toContain('not the question you are on');
+  });
+
+  it('finishes after every question and reports the round', async () => {
+    const { alice, group, members } = await playableGroup();
+    let current = (await start(alice, group.id)).body.question;
+    let rounds = 0;
+    let last: any = null;
+
+    while (current) {
+      const right = members.find((member) => current.text.includes(member.name))!;
+      last = await answer(alice, group.id, current.quoteId, right.id);
+      current = last.body.question;
+      rounds += 1;
+    }
+
+    expect(rounds).toBe(3);
+    expect(last.body.finished).toBe(true);
+    expect(last.body.summary).toMatchObject({ correct: 3, total: 3 });
+    expect(last.body.summary.score).toBeGreaterThan(0);
+
+    const over = await answer(alice, group.id, 'anything', null);
+    expect(over.status).toBe(409);
+  });
+
+  it('keeps a member’s best round, so starting another can never cost them one', async () => {
+    const { alice, group, members } = await playableGroup();
+
+    const playAll = async (correctly: boolean) => {
+      let current = (await start(alice, group.id)).body.question;
+      let final: any = null;
+      while (current) {
+        const pick = correctly
+          ? members.find((member) => current.text.includes(member.name))!.id
+          : null;
+        final = await answer(alice, group.id, current.quoteId, pick);
+        current = final.body.question;
+      }
+      return final.body.summary.score as number;
+    };
+
+    const good = await playAll(true);
+    const bad = await playAll(false);
+    expect(good).toBeGreaterThan(0);
+    expect(bad).toBe(0);
+
+    // Restarting is free in a party game; it must not overwrite a good round.
+    const scores = await request(`/api/groups/${group.id}/quiz/scores`, { token: alice.token });
+    expect(scores.body.leaderboard[0]).toMatchObject({ name: 'Alice', score: good });
+  });
+
+  it('refuses to start where every question would be a coin flip', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Just us', nextYear);
+    await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { text: 'Alone in here', saidByMemberId: group.you.memberId },
+    });
+    await unlockGroup(group.id);
+
+    const response = await start(alice, group.id);
+
+    expect(response.status).toBe(409);
+    expect(response.body.needsMembers).toBe(3);
+  });
+
+  it('stays locked with everything else until the reveal', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Still sealed', nextYear);
+
+    for (const path of ['/quiz/start', '/quiz/answer']) {
+      const response = await request(`/api/groups/${group.id}${path}`, {
+        method: 'POST',
+        token: alice.token,
+        body: {},
+      });
+      expect(response.status, path).toBe(423);
+    }
+
+    const scores = await request(`/api/groups/${group.id}/quiz/scores`, { token: alice.token });
+    expect(scores.status).toBe(423);
+  });
+
+  it('hides the round from someone outside the group', async () => {
+    const { group } = await playableGroup();
+    const stranger = await registerUser('Mallory');
+
+    const response = await start(stranger, group.id);
+
+    expect(response.status).toBe(404);
+    expect(response.body.error).toBe('Group not found');
   });
 });

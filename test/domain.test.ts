@@ -3,6 +3,8 @@ import {
   areQuotesVisible,
   buildProgress,
   buildQuiz,
+  QUIZ,
+  scoreAnswer,
   buildStats,
   exceedsGroupBudget,
   exceedsImageBudget,
@@ -74,15 +76,48 @@ describe('quiz', () => {
     const quiz = buildQuiz(group());
 
     expect(quiz).toHaveLength(3);
-    expect(quiz[0].answerMemberId).toBe('m1');
     expect(quiz[0].options.map((option) => option.id)).toEqual(['m1', 'm2', 'm3']);
-    expect(quiz[2].answerMemberId).toBe('m3');
+  });
+
+  it('never ships the answer to the client', () => {
+    // The point of scoring on the server. With the answer in the payload, a
+    // score is worth exactly as much as the honesty of whoever opened devtools.
+    expect(JSON.stringify(buildQuiz(group()))).not.toContain('answerMemberId');
+    expect(JSON.stringify(buildQuiz(group()))).not.toContain('saidByMemberId');
   });
 
   it('returns nothing for a group without quotes', () => {
     const empty = group();
     empty.quotes = [];
     expect(buildQuiz(empty)).toEqual([]);
+  });
+});
+
+describe('quiz scoring', () => {
+  it('pays everything for an instant answer and half at the buzzer', () => {
+    expect(scoreAnswer(true, 0)).toBe(QUIZ.maxPoints);
+    expect(scoreAnswer(true, QUIZ.answerWindowMs)).toBe(QUIZ.maxPoints / 2);
+    expect(scoreAnswer(true, QUIZ.answerWindowMs / 2)).toBe(750);
+  });
+
+  it('pays nothing for a wrong answer, however fast', () => {
+    expect(scoreAnswer(false, 0)).toBe(0);
+    expect(scoreAnswer(false, QUIZ.answerWindowMs)).toBe(0);
+  });
+
+  it('never pays more than full or less than half for a correct answer', () => {
+    // A clock that runs backwards, or a question left open for an hour, are
+    // both arithmetic the score has to survive.
+    expect(scoreAnswer(true, -5_000)).toBe(QUIZ.maxPoints);
+    expect(scoreAnswer(true, 60 * 60 * 1000)).toBe(QUIZ.maxPoints / 2);
+  });
+
+  it('rewards speed without letting it decide the game alone', () => {
+    // The slowest correct answer is still worth half the fastest, so two right
+    // answers at the buzzer are never worth less than one instant one: knowing
+    // the group cannot be beaten by a fast thumb alone.
+    expect(scoreAnswer(true, QUIZ.answerWindowMs) * 2).toBeGreaterThanOrEqual(scoreAnswer(true, 0));
+    expect(scoreAnswer(true, QUIZ.answerWindowMs)).toBeGreaterThan(scoreAnswer(false, 0));
   });
 });
 
@@ -215,6 +250,18 @@ describe('the inlined client under CSP', () => {
     // the server's own message replaced it.
     expect(renderAppHtml()).not.toContain('maxlength=');
     expect(renderAppHtml()).toContain('id="quote-count"');
+  });
+
+  it('carries no backtick or interpolation into the inlined blocks', async () => {
+    const { appInline, privacyInline } = await import('../src/ui');
+
+    // The client lives inside a template literal, so a backtick written in it —
+    // in a comment as easily as in code — ends the string early, and a `${`
+    // silently interpolates. Either one ships a client that does not run.
+    for (const block of [appInline.styles, appInline.script, privacyInline.styles]) {
+      expect(block).not.toContain('`');
+      expect(block).not.toContain('${');
+    }
   });
 
   it('escapes nothing into a regex literal, which a template literal would eat', async () => {

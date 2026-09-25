@@ -102,6 +102,65 @@ export const LIMITS = {
 } as const;
 
 /**
+ * The quiz is scored on the server, and these are the numbers it scores with.
+ *
+ * Scoring on the server rather than in the browser is the whole design: the
+ * payload used to ship `answerMemberId`, which put every answer one devtools
+ * panel away, and a client that reports its own response time can report zero.
+ * The server stamps when it served a question and works the elapsed time out
+ * itself, so network latency counts against the player — the same bargain
+ * Kahoot makes.
+ */
+export const QUIZ = {
+  /** How long a question stays worth points. */
+  answerWindowMs: 20_000,
+  maxPoints: 1000,
+  /**
+   * With two members every question is a coin flip between you and one other
+   * person — not a quiz that has been made easy, a quiz that does not work.
+   */
+  minMembersToPlay: 3,
+  /** A round long enough to be a game and short enough to finish in one sitting. */
+  maxQuestions: 20,
+} as const;
+
+/** One player's progress through one round. Kept out of the group value. */
+export type QuizRun = {
+  /** Quote ids, shuffled when the round starts, so two players differ. */
+  order: string[];
+  index: number;
+  /** When the current question was served. The clock the score is read from. */
+  askedAt: string;
+  score: number;
+  correct: number;
+  finishedAt: string | null;
+};
+
+/**
+ * Kahoot's curve: a correct answer is worth everything answered instantly and
+ * half of it answered at the buzzer, so speed matters without deciding the game
+ * on its own. A wrong answer and a question left to expire both score nothing.
+ */
+export const scoreAnswer = (correct: boolean, elapsedMs: number): number => {
+  if (!correct) {
+    return 0;
+  }
+
+  const clamped = Math.min(Math.max(elapsedMs, 0), QUIZ.answerWindowMs);
+  return Math.round(QUIZ.maxPoints * (1 - clamped / QUIZ.answerWindowMs / 2));
+};
+
+/** Fisher-Yates. The order of a quiz is not a security decision. */
+export const shuffled = <T>(items: T[]): T[] => {
+  const copy = [...items];
+  for (let index = copy.length - 1; index > 0; index -= 1) {
+    const swap = Math.floor(Math.random() * (index + 1));
+    [copy[index], copy[swap]] = [copy[swap], copy[index]];
+  }
+  return copy;
+};
+
+/**
  * Serialised size of a stored group, in UTF-8 bytes rather than UTF-16 units so
  * that a group full of non-Latin quotes is measured as storage sees it.
  */
@@ -151,15 +210,37 @@ export const getRevealAtIso = (revealYear: number): string =>
 export const areQuotesVisible = (revealYear: number, now: Date = new Date()): boolean =>
   now >= new Date(getRevealAtIso(revealYear));
 
+/**
+ * The question set as the client is allowed to see it: no `answerMemberId`.
+ * Answers stay on the server, which is what makes a score mean anything.
+ */
 export const buildQuiz = (group: GroupState) => {
   const options = group.members.map((member) => ({ id: member.id, name: member.name }));
 
   return group.quotes.map((quote) => ({
     quoteId: quote.id,
     quote: quote.text,
-    answerMemberId: quote.saidByMemberId,
+    hasImage: quote.image !== undefined,
     options,
   }));
+};
+
+/** One question, shaped for the round in progress. Never carries the answer. */
+export const quizQuestion = (group: GroupState, run: QuizRun) => {
+  const quote = group.quotes.find((entry) => entry.id === run.order[run.index]);
+  if (!quote) {
+    return null;
+  }
+
+  return {
+    quoteId: quote.id,
+    text: quote.text,
+    hasImage: quote.image !== undefined,
+    options: shuffled(group.members.map((member) => ({ id: member.id, name: member.name }))),
+    number: run.index + 1,
+    total: run.order.length,
+    answerWindowMs: QUIZ.answerWindowMs,
+  };
 };
 
 export const buildStats = (group: GroupState) => {

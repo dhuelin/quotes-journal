@@ -21,7 +21,10 @@ app and the HTTP API; a Flutter app talks to the same API on Android and iOS.
   the quote down.
 - **The reveal.** From 1 January the group can read every quote, see the
   statistics (how many quotes each person said, and how many each person
-  collected) and pull a Kahoot-style quiz payload.
+  collected) and play the quiz.
+- **The quiz.** A Kahoot-style round: one quote at a time, every member as an
+  answer, twenty seconds a question. A faster right answer is worth more, and
+  the group sees everyone's best round.
 
 ## Security model
 
@@ -100,6 +103,27 @@ the group value. That value is read and rewritten on every write and has a hard
 ~2.2MB ceiling ([#10](https://github.com/dhuelin/quotes-journal/issues/10)) —
 only the picture's size and type live there. R2 would be the natural home if
 this grows, and is not used today because R2 is not enabled on the account.
+
+### Scoring the quiz
+
+The quiz is scored on the server, and the payload no longer carries
+`answerMemberId`. The reason is simple: with the answer in the payload, a score
+is worth exactly as much as the honesty of whoever opened devtools — and this
+app already asks people to care about a leaderboard.
+
+The clock is the server's too. A browser asked to report its own response time
+can report zero, so the server stamps when it served a question and works out
+the elapsed time itself. Network latency counts against the player, which is the
+same bargain Kahoot makes.
+
+An answer is checked against the question the round is actually on, so a replayed
+request cannot bank the same points twice, and a member's **best** round is kept
+rather than their latest — restarting is free in a party game and must never
+cost someone a score they already earned.
+
+A group needs three members to play. With two, every question is a coin flip
+between you and one other person: not a quiz made easy, a quiz that does not
+work.
 
 ### Offline and the installed app
 
@@ -236,7 +260,10 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | `POST` | `/api/groups/:groupId/quotes/:quoteId/image` | raw JPEG/PNG/WebP bytes; recorder only, `409` after the reveal |
 | `GET` | `/api/groups/:groupId/quotes/:quoteId/image` | the picture itself; `423` until the reveal |
 | `POST` | `/api/groups/:groupId/quotes/:quoteId/image/remove` | recorder only |
-| `GET` | `/api/groups/:groupId/quiz` | `423` until the reveal |
+| `GET` | `/api/groups/:groupId/quiz` | the questions, never the answers; `423` until the reveal |
+| `POST` | `/api/groups/:groupId/quiz/start` | begins a round; `409` under three members |
+| `POST` | `/api/groups/:groupId/quiz/answer` | `{ quoteId, memberId }`; scores it and serves the next question |
+| `GET` | `/api/groups/:groupId/quiz/scores` | every member's best round |
 | `GET` | `/api/groups/:groupId/stats` | `423` until the reveal |
 | `GET` | `/api/groups/:groupId/invite` | current invite code; the client builds the link |
 | `POST` | `/api/groups/:groupId/invite/rotate` | owner only; invalidates old links |
@@ -250,7 +277,6 @@ store data-safety declarations must match what that page says.
 
 Tracked in [the issue tracker](https://github.com/dhuelin/quotes-journal/issues):
 
-- [#2](https://github.com/dhuelin/quotes-journal/issues/2) the interactive Kahoot-style quiz frontend
 - [#3](https://github.com/dhuelin/quotes-journal/issues/3) timezone-aware reveal (today it unlocks at midnight UTC)
 - [#4](https://github.com/dhuelin/quotes-journal/issues/4) year-end countdown and unlock notifications
 - [#5](https://github.com/dhuelin/quotes-journal/issues/5) richer analytics beyond the leaderboard

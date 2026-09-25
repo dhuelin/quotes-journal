@@ -160,6 +160,39 @@ const appStyles = `
          one whose picture fails to load — reads exactly as it did before. */
       .quote-photo img { max-width: 100%; border-radius: 10px; margin-top: .7rem; display: block; }
 
+      .quiz-shell { text-align: center; }
+      .quiz-count { color: var(--muted); font-size: .85rem; letter-spacing: .04em; text-transform: uppercase; }
+      .quiz-quote { font-size: 1.3rem; font-weight: 650; line-height: 1.35; margin: .9rem 0; }
+      .quiz-photo img { max-width: 100%; max-height: 13rem; border-radius: 10px; margin: 0 auto .5rem; display: block; }
+
+      .quiz-answers { display: grid; gap: .5rem; margin-top: 1.1rem; }
+      .quiz-answers button {
+        margin: 0; text-align: left; font-weight: 550;
+        background: var(--surface-2); color: var(--text); border: 1px solid var(--line);
+      }
+      .quiz-answers button.right { background: var(--ok); color: #06281c; border-color: var(--ok); }
+      .quiz-answers button.wrong { background: var(--danger); color: #3a0d0d; border-color: var(--danger); }
+      /* The reveal colours have to stay readable, and every option becomes a
+         disabled button the moment an answer is in. */
+      .quiz-answers button:disabled { opacity: 1; cursor: default; }
+
+      /* Driven by a keyframe rather than a width set from script: a style
+         attribute is outside what the policy can authorise, and a CSS animation
+         needs no attribute at all. Re-rendering replaces the node, which is
+         what restarts the countdown for the next question. */
+      .quiz-timer { height: .45rem; border-radius: 999px; background: var(--surface-2); overflow: hidden; margin-top: 1rem; }
+      .quiz-timer i { display: block; height: 100%; background: var(--accent); transform-origin: left;
+        animation: quiz-countdown 20s linear forwards; }
+      @keyframes quiz-countdown { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+      @media (prefers-reduced-motion: reduce) { .quiz-timer i { animation: none; transform: scaleX(1); } }
+
+      .quiz-clock { font-variant-numeric: tabular-nums; }
+      .quiz-verdict { font-weight: 700; margin-top: 1rem; }
+      .quiz-verdict.right { color: var(--ok); }
+      .quiz-verdict.wrong { color: var(--danger); }
+      .quiz-score { font-size: 2.4rem; font-weight: 700; color: var(--accent); line-height: 1.1; }
+      tr.quiz-you td { color: var(--accent); }
+
       /* Inline style attributes cannot be hashed or nonced, so every rule lives here. */
       .group-title { margin-top: .6rem; }
       .vault-note { margin-top: .7rem; }
@@ -190,6 +223,10 @@ const appScript = `
           pendingInvite: readInviteFromLocation(),
           /** The shrunk, re-encoded photo waiting to go up with the next quote. */
           pendingImage: null,
+          /** The round in progress, if the quiz tab is being played. */
+          quiz: null,
+          /** Everyone's best round, loaded when the quiz tab is opened. */
+          quizScores: null,
         };
 
         /**
@@ -285,6 +322,8 @@ const appScript = `
           state.groupsLoaded = false;
           state.group = null;
           state.pendingImage = null;
+          state.quiz = null;
+          state.quizScores = null;
           localStorage.removeItem(TOKEN_KEY);
           notify(message || null, 'error');
           render();
@@ -426,10 +465,7 @@ const appScript = `
           var group = state.group;
           // Once the reveal has passed the server refuses new quotes, so
           // offering the form would be a promise the app cannot keep.
-          var tabs = group.locked ? ['collect', 'members'] : ['members'];
-          if (!group.locked) {
-            tabs.unshift('reveal');
-          }
+          var tabs = group.locked ? ['collect', 'members'] : ['reveal', 'quiz', 'members'];
 
           // A tab from a URL or an earlier group may not exist here — a revealed
           // group has no collect tab — so settle on a real one before rendering.
@@ -439,7 +475,7 @@ const appScript = `
 
           var tabsHtml = tabs
             .map(function (tab) {
-              var labels = { collect: 'Add a quote', members: 'Members', reveal: 'The reveal' };
+              var labels = { collect: 'Add a quote', members: 'Members', reveal: 'The reveal', quiz: 'Quiz' };
               return (
                 '<button role="tab" data-tab="' + tab + '" aria-selected="' + (state.tab === tab) + '">' +
                 labels[tab] +
@@ -453,6 +489,8 @@ const appScript = `
             body = membersTab();
           } else if (state.tab === 'reveal') {
             body = revealTab();
+          } else if (state.tab === 'quiz') {
+            body = quizTab();
           } else {
             body = collectTab();
           }
@@ -601,6 +639,127 @@ const appScript = `
           );
         }
 
+        /* ---------- the quiz ---------- */
+
+        function quizTab() {
+          var quiz = state.quiz;
+          if (!quiz) {
+            return quizIntro();
+          }
+          if (quiz.phase === 'over') {
+            return quizSummary();
+          }
+          return quizRound();
+        }
+
+        function quizIntro() {
+          var group = state.group;
+          var enough = group.members.length >= 3;
+
+          return (
+            '<div class="card quiz-shell">' +
+            '<h2>Who said what?</h2>' +
+            '<p class="muted">' + escapeHtml(group.progress.totalQuotes) +
+            (group.progress.totalQuotes === 1 ? ' quote' : ' quotes') +
+            ', in a random order. A faster right answer is worth more, and a wrong one is worth nothing.</p>' +
+            (enough
+              ? '<button id="quiz-start">Start the quiz</button>'
+              : '<p class="muted small">A quiz needs at least three people in the group &mdash; with two, every question is a coin flip between you and one other person.</p>') +
+            '</div>' +
+            quizScoreboard()
+          );
+        }
+
+        function quizRound() {
+          var quiz = state.quiz;
+          var question = quiz.question;
+          var verdict = quiz.verdict;
+
+          var answers = question.options
+            .map(function (option) {
+              var mark = '';
+              if (verdict) {
+                if (option.id === verdict.answerMemberId) {
+                  mark = ' class="right"';
+                } else if (option.id === verdict.picked) {
+                  mark = ' class="wrong"';
+                }
+              }
+              return (
+                '<button data-answer="' + escapeHtml(option.id) + '"' + mark + (verdict ? ' disabled' : '') + '>' +
+                escapeHtml(option.name) +
+                '</button>'
+              );
+            })
+            .join('');
+
+          var footer;
+          if (verdict) {
+            footer =
+              '<p class="quiz-verdict ' + (verdict.correct ? 'right' : 'wrong') + '">' +
+              (verdict.correct
+                ? 'Right &mdash; ' + escapeHtml(verdict.points) + ' points'
+                : 'It was ' + escapeHtml(memberName(verdict.answerMemberId))) +
+              '</p>';
+          } else {
+            footer =
+              '<div class="quiz-timer"><i></i></div>' +
+              '<p class="small muted"><span class="quiz-clock" id="quiz-clock">20</span>s left</p>';
+          }
+
+          return (
+            '<div class="card quiz-shell">' +
+            '<p class="quiz-count">Question ' + escapeHtml(question.number) + ' of ' + escapeHtml(question.total) +
+            ' &middot; ' + escapeHtml(quiz.score) + ' points</p>' +
+            (question.hasImage ? '<div class="quiz-photo" data-quiz-photo="' + escapeHtml(question.quoteId) + '"></div>' : '') +
+            '<p class="quiz-quote">&#8220;' + escapeHtml(question.text) + '&#8221;</p>' +
+            '<div class="quiz-answers">' + answers + '</div>' +
+            footer +
+            '</div>'
+          );
+        }
+
+        function quizSummary() {
+          var summary = state.quiz.summary;
+
+          return (
+            '<div class="card quiz-shell">' +
+            '<p class="quiz-count">Round over</p>' +
+            '<div class="quiz-score">' + escapeHtml(summary.score) + '</div>' +
+            '<p class="muted">' + escapeHtml(summary.correct) + ' of ' + escapeHtml(summary.total) + ' right</p>' +
+            '<button id="quiz-again">Play again</button>' +
+            '</div>' +
+            quizScoreboard()
+          );
+        }
+
+        /** Everyone's best round. A score with nothing to compare it to is not a game. */
+        function quizScoreboard() {
+          var scores = state.quizScores;
+          if (!scores || !scores.length) {
+            return '';
+          }
+
+          var rows = scores
+            .map(function (entry) {
+              var you = entry.memberId === state.group.you.memberId;
+              return (
+                '<tr' + (you ? ' class="quiz-you"' : '') + '><td>' + escapeHtml(entry.name) + '</td>' +
+                '<td class="num">' + escapeHtml(entry.correct) + '/' + escapeHtml(entry.total) + '</td>' +
+                '<td class="num">' + escapeHtml(entry.score) + '</td></tr>'
+              );
+            })
+            .join('');
+
+          return (
+            '<div class="card">' +
+            '<h2>Best rounds</h2>' +
+            '<table><thead><tr><th>Member</th><th class="num">Right</th><th class="num">Points</th></tr></thead>' +
+            '<tbody>' + rows + '</tbody></table>' +
+            '</div>'
+          );
+        }
+
         /* ---------- actions ---------- */
 
         /**
@@ -738,6 +897,8 @@ const appScript = `
             state.group = null;
             state.reveal = null;
             state.pendingImage = null;
+            state.quiz = null;
+            state.quizScores = null;
             state.tab = 'collect';
             history.pushState({}, '', '/app');
             render();
@@ -891,6 +1052,26 @@ const appScript = `
 
           if (state.tab === 'reveal' && state.reveal) {
             loadQuotePhotos();
+          }
+
+          clearQuizClock();
+          onClick('quiz-start', function () { startQuiz(); });
+          onClick('quiz-again', function () { startQuiz(); });
+          document.querySelectorAll('[data-answer]').forEach(function (button) {
+            button.addEventListener('click', function () {
+              submitAnswer(button.getAttribute('data-answer'));
+            });
+          });
+
+          if (state.quiz && state.quiz.phase === 'asking') {
+            startQuizClock();
+            if (state.quiz.question.hasImage) {
+              loadQuizPhoto();
+            }
+          }
+
+          if (state.tab === 'quiz' && !state.quizScores) {
+            loadQuizScores();
           }
 
           onSubmit('quote-form', async function (form) {
@@ -1069,6 +1250,153 @@ const appScript = `
           });
         }
 
+        /**
+         * The countdown is a CSS animation, so nothing here touches a style —
+         * this only keeps the number in step and answers for a player who let
+         * the question run out. An expired question is a real answer worth
+         * nothing, which is why it is submitted rather than skipped.
+         */
+        var quizClock = null;
+
+        function clearQuizClock() {
+          if (quizClock) {
+            clearInterval(quizClock);
+            quizClock = null;
+          }
+        }
+
+        function startQuizClock() {
+          clearQuizClock();
+          var seconds = Math.round(state.quiz.question.answerWindowMs / 1000);
+          var label = document.getElementById('quiz-clock');
+          if (label) {
+            label.textContent = seconds;
+          }
+
+          quizClock = setInterval(function () {
+            seconds -= 1;
+            var tick = document.getElementById('quiz-clock');
+            if (tick) {
+              tick.textContent = Math.max(0, seconds);
+            }
+            if (seconds <= 0) {
+              clearQuizClock();
+              submitAnswer(null);
+            }
+          }, 1000);
+        }
+
+        async function startQuiz() {
+          try {
+            var started = await api('/api/groups/' + encodeURIComponent(state.group.id) + '/quiz/start', {
+              method: 'POST',
+              body: {},
+            });
+            state.quiz = { phase: 'asking', question: started.question, score: 0, verdict: null };
+            render();
+          } catch (error) {
+            if (error.message !== 'unauthenticated') {
+              notify(error.message, 'error');
+              render();
+            }
+          }
+        }
+
+        /** A null memberId is a question that ran out of time. */
+        async function submitAnswer(memberId) {
+          var quiz = state.quiz;
+          if (!quiz || quiz.phase !== 'asking') {
+            return;
+          }
+
+          // Set before the request so a second tap cannot send a second answer.
+          quiz.phase = 'revealing';
+          clearQuizClock();
+
+          try {
+            var result = await api('/api/groups/' + encodeURIComponent(state.group.id) + '/quiz/answer', {
+              method: 'POST',
+              body: { quoteId: quiz.question.quoteId, memberId: memberId },
+            });
+
+            quiz.verdict = {
+              correct: result.correct,
+              answerMemberId: result.answerMemberId,
+              picked: memberId,
+              points: result.points,
+            };
+            quiz.score = result.score;
+            quiz.pending = result.question;
+            quiz.finished = result.finished;
+            quiz.summary = result.summary;
+            render();
+
+            setTimeout(advanceQuiz, 2200);
+          } catch (error) {
+            if (error.message !== 'unauthenticated') {
+              // Back to asking, so a dropped connection costs the question and
+              // not the round.
+              quiz.phase = 'asking';
+              notify(error.message, 'error');
+              render();
+            }
+          }
+        }
+
+        function advanceQuiz() {
+          var quiz = state.quiz;
+          if (!quiz || !quiz.verdict) {
+            return;
+          }
+
+          if (quiz.finished) {
+            quiz.phase = 'over';
+            loadQuizScores();
+          } else {
+            quiz.question = quiz.pending;
+            quiz.verdict = null;
+            quiz.phase = 'asking';
+          }
+          render();
+        }
+
+        async function loadQuizScores() {
+          try {
+            var scores = await api('/api/groups/' + encodeURIComponent(state.group.id) + '/quiz/scores');
+            state.quizScores = scores.leaderboard;
+            render();
+          } catch (error) {
+            // The round still stands without the comparison.
+          }
+        }
+
+        /** The same bearer-token fetch the reveal uses; no URL carries a credential. */
+        function loadQuizPhoto() {
+          var holder = document.querySelector('[data-quiz-photo]');
+          if (!holder) {
+            return;
+          }
+
+          var quoteId = holder.getAttribute('data-quiz-photo');
+          fetch(
+            '/api/groups/' + encodeURIComponent(state.group.id) + '/quotes/' + encodeURIComponent(quoteId) + '/image',
+            { headers: { authorization: 'Bearer ' + state.token } },
+          )
+            .then(function (response) { return response.ok ? response.blob() : null; })
+            .then(function (blob) {
+              if (!blob) {
+                return;
+              }
+              var image = document.createElement('img');
+              var url = URL.createObjectURL(blob);
+              image.src = url;
+              image.alt = 'Picture attached to this quote';
+              image.addEventListener('load', function () { URL.revokeObjectURL(url); });
+              holder.appendChild(image);
+            })
+            .catch(function () {});
+        }
+
         function showInvite(code) {
           var box = document.getElementById('invite-box');
           if (box) {
@@ -1231,8 +1559,11 @@ const appScript = `
           try {
             var result = await api('/api/groups/' + encodeURIComponent(groupId));
             if (!reopening) {
-              // A picture chosen for one group's form has no meaning in another.
+              // A picture chosen for one group's form has no meaning in another,
+              // and neither does a round in progress.
               state.pendingImage = null;
+              state.quiz = null;
+              state.quizScores = null;
             }
             state.group = result.group;
             state.tab = tab || defaultTab(result.group);
