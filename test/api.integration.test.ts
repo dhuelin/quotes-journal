@@ -1511,6 +1511,10 @@ describe('the quiz round (L8)', () => {
     return { alice, group, members };
   };
 
+  /** Everything the question shows, which is what the test reads the answer from. */
+  const asked = (question: { lines: { text: string }[] }): string =>
+    question.lines.map((line) => line.text).join(' ');
+
   const start = (player: TestUser, groupId: string) =>
     request(`/api/groups/${groupId}/quiz/start`, { method: 'POST', token: player.token, body: {} });
 
@@ -1541,7 +1545,7 @@ describe('the quiz round (L8)', () => {
 
     // The quote text names who said it, which is how the test knows the answer
     // without the server ever having told the client.
-    const expected = members.find((member) => question.text.includes(member.name))!;
+    const expected = members.find((member) => asked(question).includes(member.name))!;
     const response = await answer(alice, group.id, question.quoteId, expected.id);
 
     expect(response.status).toBe(200);
@@ -1555,7 +1559,7 @@ describe('the quiz round (L8)', () => {
     const { alice, group, members } = await playableGroup();
 
     const started = await start(alice, group.id);
-    const wrong = members.find((member) => !started.body.question.text.includes(member.name))!;
+    const wrong = members.find((member) => !asked(started.body.question).includes(member.name))!;
     const missed = await answer(alice, group.id, started.body.question.quoteId, wrong.id);
     expect(missed.body.correct).toBe(false);
     expect(missed.body.points).toBe(0);
@@ -1571,7 +1575,7 @@ describe('the quiz round (L8)', () => {
     const { alice, group, members } = await playableGroup();
     const started = await start(alice, group.id);
     const first = started.body.question;
-    const right = members.find((member) => first.text.includes(member.name))!;
+    const right = members.find((member) => asked(first).includes(member.name))!;
 
     const scored = await answer(alice, group.id, first.quoteId, right.id);
     expect(scored.body.correct).toBe(true);
@@ -1589,7 +1593,7 @@ describe('the quiz round (L8)', () => {
     let last: any = null;
 
     while (current) {
-      const right = members.find((member) => current.text.includes(member.name))!;
+      const right = members.find((member) => asked(current).includes(member.name))!;
       last = await answer(alice, group.id, current.quoteId, right.id);
       current = last.body.question;
       rounds += 1;
@@ -1612,7 +1616,7 @@ describe('the quiz round (L8)', () => {
       let final: any = null;
       while (current) {
         const pick = correctly
-          ? members.find((member) => current.text.includes(member.name))!.id
+          ? members.find((member) => asked(current).includes(member.name))!.id
           : null;
         final = await answer(alice, group.id, current.quoteId, pick);
         current = final.body.question;
@@ -1810,5 +1814,166 @@ describe('choosing and moving the reveal (L9)', () => {
     const overview = await request(`/api/groups/${group.id}`, { token: alice.token });
     expect(overview.body.group.revealAt).toBe(`${nextYear + 1}-01-01T00:00:00.000Z`);
     expect(overview.body.group.locked).toBe(true);
+  });
+});
+
+/** A quote with more than one speaker, and what the quiz does with one. */
+describe('conversations (L10)', () => {
+  const conversation = [
+    { text: 'I am not lost.' },
+    { text: 'You have been driving in circles for twenty minutes.' },
+  ];
+
+  const groupWithThree = async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Road trip', nextYear);
+    for (const name of ['Bob', 'Cleo']) {
+      await request(`/api/groups/${group.id}/members`, { method: 'POST', token: alice.token, body: { name } });
+    }
+    const fresh = await request(`/api/groups/${group.id}`, { token: alice.token });
+    return { alice, group, members: fresh.body.group.members as { id: string; name: string }[] };
+  };
+
+  it('records an exchange and reads it back as one', async () => {
+    const { alice, group, members } = await groupWithThree();
+    const lines = conversation.map((line, index) => ({ ...line, saidByMemberId: members[index].id }));
+
+    const saved = await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { lines },
+    });
+    expect(saved.status).toBe(201);
+
+    await unlockGroup(group.id);
+    const quotes = await request(`/api/groups/${group.id}/quotes`, { token: alice.token });
+
+    expect(quotes.body.quotes[0].lines).toHaveLength(2);
+    expect(quotes.body.quotes[0].lines[1].text).toContain('driving in circles');
+    // The opening line is mirrored, so a client that knows nothing about
+    // conversations still shows something correct rather than nothing.
+    expect(quotes.body.quotes[0].text).toBe('I am not lost.');
+    expect(quotes.body.quotes[0].saidByMemberId).toBe(members[0].id);
+  });
+
+  it('still accepts a single remark in the shape it always had', async () => {
+    const { alice, group } = await groupWithThree();
+
+    const saved = await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { text: 'Technically the cake is a salad', saidByMemberId: group.you.memberId },
+    });
+    expect(saved.status).toBe(201);
+
+    await unlockGroup(group.id);
+    const quotes = await request(`/api/groups/${group.id}/quotes`, { token: alice.token });
+
+    // Stored as a remark, not as a one-line exchange: nothing already recorded
+    // changes shape, and neither does anything recorded the old way now.
+    expect(quotes.body.quotes[0].lines).toBeUndefined();
+    expect(quotes.body.quotes[0].text).toBe('Technically the cake is a salad');
+  });
+
+  it('refuses a line whose speaker is not in the group, and an over-long one', async () => {
+    const { alice, group, members } = await groupWithThree();
+
+    const stranger = await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { lines: [{ saidByMemberId: 'someone-else', text: 'Hello' }] },
+    });
+    expect(stranger.status).toBe(400);
+
+    const tooLong = await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: {
+        lines: [{ saidByMemberId: members[0].id, text: 'x'.repeat(LIMITS.quoteText + 1) }],
+      },
+    });
+    expect(tooLong.status).toBe(400);
+
+    const tooMany = await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: {
+        lines: Array.from({ length: LIMITS.quoteLines + 1 }, () => ({
+          saidByMemberId: members[0].id,
+          text: 'Again',
+        })),
+      },
+    });
+    expect(tooMany.status).toBe(400);
+  });
+
+  it('asks the quiz about one line, showing the rest with their speakers', async () => {
+    const { alice, group, members } = await groupWithThree();
+    await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { lines: conversation.map((line, index) => ({ ...line, saidByMemberId: members[index].id })) },
+    });
+    await unlockGroup(group.id);
+
+    const started = await request(`/api/groups/${group.id}/quiz/start`, {
+      method: 'POST',
+      token: alice.token,
+      body: {},
+    });
+    const question = started.body.question;
+
+    expect(question.lines).toHaveLength(2);
+    // Exactly one line is the question; the others are context, named.
+    expect(question.lines.filter((line: { speaker: string | null }) => line.speaker === null)).toHaveLength(1);
+    expect(question.lines[question.askedLine].speaker).toBeNull();
+    expect(JSON.stringify(question)).not.toContain('saidByMemberId');
+
+    // Both lines are asked about across the round, so a two-line exchange is
+    // two questions rather than one.
+    expect(question.total).toBe(2);
+  });
+
+  it('scores the asked line, not the first one', async () => {
+    const { alice, group, members } = await groupWithThree();
+    await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { lines: conversation.map((line, index) => ({ ...line, saidByMemberId: members[index].id })) },
+    });
+    await unlockGroup(group.id);
+
+    const started = await request(`/api/groups/${group.id}/quiz/start`, {
+      method: 'POST',
+      token: alice.token,
+      body: {},
+    });
+    const question = started.body.question;
+    const speaker = members[question.askedLine];
+
+    const response = await request(`/api/groups/${group.id}/quiz/answer`, {
+      method: 'POST',
+      token: alice.token,
+      body: { quoteId: question.quoteId, memberId: speaker.id },
+    });
+
+    expect(response.body.correct).toBe(true);
+    expect(response.body.answerMemberId).toBe(speaker.id);
+  });
+
+  it('counts an exchange once towards the quote cap, and its speakers each once', async () => {
+    const { alice, group, members } = await groupWithThree();
+    await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { lines: conversation.map((line, index) => ({ ...line, saidByMemberId: members[index].id })) },
+    });
+    await unlockGroup(group.id);
+
+    const stats = await request(`/api/groups/${group.id}/stats`, { token: alice.token });
+
+    expect(stats.body.totalQuotes).toBe(1);
+    expect(stats.body.saidBy[members[0].id]).toBe(1);
+    expect(stats.body.saidBy[members[1].id]).toBe(1);
   });
 });

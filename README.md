@@ -13,8 +13,9 @@ app and the HTTP API; a Flutter app talks to the same API on Android and iOS.
   up can still be quoted.
 - **Collecting.** Anyone in the group records a quote: the text, who said it and
   who else was there, and optionally a picture for the context the words alone
-  do not carry. The server attributes the quote to whoever is signed in, so who
-  collected what cannot be faked.
+  do not carry. A quote can be an exchange — several lines, each with its own
+  speaker — so a back-and-forth stays one thing. The server attributes the quote
+  to whoever is signed in, so who collected what cannot be faked.
 - **The lock.** Quotes, their pictures, the quiz and the statistics all return
   `423 Locked` until the group's reveal date — midnight on 1 January by default,
   or any instant the creator picks. During the year the app shows only a count,
@@ -103,6 +104,29 @@ the group value. That value is read and rewritten on every write and has a hard
 ~2.2MB ceiling ([#10](https://github.com/dhuelin/quotes-journal/issues/10)) —
 only the picture's size and type live there. R2 would be the natural home if
 this grows, and is not used today because R2 is not enabled on the account.
+
+### Conversations
+
+A quote is either a single remark or an exchange of up to ten lines, each with
+its own speaker. The 500-character limit is per line — a long exchange is
+several ordinary remarks — and the byte budget is what actually keeps a quote
+from outgrowing storage.
+
+A quote's `text` and `saidByMemberId` always hold the opening line, mirrored,
+even when `lines` carries the whole exchange. The duplication is deliberate: a
+reader that predates conversations, the Flutter client included, shows the
+opening line attributed to the right person rather than nothing at all.
+
+**In the quiz**, an exchange has no single answer, so a question asks about one
+line and shows the rest with their speakers named. That keeps the quiz to one
+question type, and a conversation makes better material than a lone remark
+precisely because the context is the joke. Each line is its own question, so a
+three-line exchange is three.
+
+**In the statistics**, every speaker in an exchange is credited once, however
+many lines they have — otherwise the leaderboard would reward rambling. The
+totals across members can therefore exceed the quote count, which is the honest
+reading of "quotes you are in".
 
 ### The reveal date, and whether it can move
 
@@ -275,7 +299,7 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | `POST` | `/api/groups/:groupId/members/claim` | `{ guestMemberId, memberId }`; owner only |
 | `POST` | `/api/groups/:groupId/members/rename` | `{ memberId, name }`; owner only |
 | `POST` | `/api/groups/:groupId/members/remove` | `{ memberId }`; owner only, refused once quoted |
-| `POST` | `/api/groups/:groupId/quotes` | `{ text, saidByMemberId, involvedMemberIds }`; `409` after the reveal |
+| `POST` | `/api/groups/:groupId/quotes` | `{ text, saidByMemberId }` or `{ lines: [{ text, saidByMemberId }] }`, plus `involvedMemberIds`; `409` after the reveal |
 | `GET` | `/api/groups/:groupId/quotes` | `423` until the reveal |
 | `POST` | `/api/groups/:groupId/quotes/:quoteId/image` | raw JPEG/PNG/WebP bytes; recorder only, `409` after the reveal |
 | `GET` | `/api/groups/:groupId/quotes/:quoteId/image` | the picture itself; `423` until the reveal |

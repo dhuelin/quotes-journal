@@ -3,6 +3,8 @@ import {
   areQuotesVisible,
   buildProgress,
   canMoveReveal,
+  quoteLinesOf,
+  quoteSpeakers,
   revealInstant,
   buildQuiz,
   QUIZ,
@@ -315,7 +317,8 @@ describe('the inlined client under CSP', () => {
     // Silent truncation hid an error the server states clearly; a counter and
     // the server's own message replaced it.
     expect(renderAppHtml()).not.toContain('maxlength=');
-    expect(renderAppHtml()).toContain('id="quote-count"');
+    // One counter per line of a quote, since the limit is per line.
+    expect(renderAppHtml()).toContain("id=\"quote-count-'");
   });
 
   it('carries no backtick or interpolation into the inlined blocks', async () => {
@@ -442,5 +445,60 @@ describe('the picture budget', () => {
 
     expect(groupByteSize(many)).toBeLessThan(LIMITS.groupBytes);
     expect(groupImageByteSize(many)).toBeGreaterThan(LIMITS.groupBytes);
+  });
+});
+
+/**
+ * A quote with more than one speaker. The single-speaker quote is the one-line
+ * case, so nothing already recorded changes shape.
+ */
+describe('conversations', () => {
+  const exchange = (): Quote => ({
+    id: 'q9',
+    // Mirrors of the opening line, kept so a reader that predates conversations
+    // still shows something correct.
+    text: 'I am not lost.',
+    saidByMemberId: 'm1',
+    recordedByMemberId: 'm2',
+    involvedMemberIds: [],
+    createdAt: '2026-05-01T00:00:00.000Z',
+    lines: [
+      { saidByMemberId: 'm1', text: 'I am not lost.' },
+      { saidByMemberId: 'm2', text: 'You have been driving in circles for twenty minutes.' },
+      { saidByMemberId: 'm1', text: 'Scenically.' },
+    ],
+  });
+
+  it('reads a single remark as a one-line exchange', () => {
+    const [line, ...rest] = quoteLinesOf(group().quotes[0]);
+
+    expect(rest).toHaveLength(0);
+    expect(line).toEqual({ saidByMemberId: 'm1', text: 'Hello' });
+  });
+
+  it('counts a speaker once however many lines they have', () => {
+    // Otherwise the leaderboard would reward rambling rather than being quotable.
+    expect(quoteSpeakers(exchange())).toEqual(['m1', 'm2']);
+  });
+
+  it('credits every speaker in an exchange, and the recorder only once', () => {
+    const withExchange = group();
+    withExchange.quotes = [exchange()];
+
+    const stats = buildStats(withExchange);
+
+    expect(stats.saidBy).toEqual({ m1: 1, m2: 1, m3: 0 });
+    expect(stats.persistedBy).toEqual({ m1: 0, m2: 1, m3: 0 });
+    // One quote, two people in it: the totals across members can exceed the
+    // quote count, which is the honest reading of "quotes you are in".
+    expect(stats.totalQuotes).toBe(1);
+  });
+
+  it('keeps the opening line as the fallback view of the quote', () => {
+    const quote = exchange();
+
+    // A client that knows nothing about `lines` shows this, correctly attributed.
+    expect(quote.text).toBe(quote.lines![0].text);
+    expect(quote.saidByMemberId).toBe(quote.lines![0].saidByMemberId);
   });
 });

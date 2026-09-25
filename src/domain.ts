@@ -28,13 +28,30 @@ export type QuoteImage = {
   addedAt: string;
 };
 
+/** One turn in an exchange. A quote with a single speaker is the one-line case. */
+export type QuoteLine = {
+  saidByMemberId: string;
+  text: string;
+};
+
 export type Quote = {
   id: string;
+  /**
+   * The first line's text and speaker, always populated.
+   *
+   * On a conversation these mirror `lines[0]` rather than replacing it. The
+   * duplication is deliberate: every existing reader — the Flutter client, and
+   * any quote recorded before conversations existed — keeps working and shows
+   * the opening line attributed to the right person, instead of rendering
+   * nothing. `lines` is what a client that understands exchanges should read.
+   */
   text: string;
   saidByMemberId: string;
   recordedByMemberId: string;
   involvedMemberIds: string[];
   createdAt: string;
+  /** Present when the quote is an exchange rather than a single remark. */
+  lines?: QuoteLine[];
   /** Optional: a photo giving the quote its context. */
   image?: QuoteImage;
 };
@@ -69,7 +86,14 @@ export const LIMITS = {
   email: 254,
   passwordMin: 10,
   passwordMax: 200,
+  /** Per line, not per quote: a long exchange is several ordinary remarks. */
   quoteText: 500,
+  /**
+   * Lines in one exchange. The real guard is the byte budget, which measures
+   * the quote as storage sees it; this is what keeps a single quote from being
+   * a transcript.
+   */
+  quoteLines: 10,
   involvedMembers: 25,
   membersPerGroup: 100,
   /**
@@ -133,10 +157,13 @@ export const QUIZ = {
   maxQuestions: 20,
 } as const;
 
+/** One question in a round: a quote, and which of its lines is being asked about. */
+export type QuizAsk = { quoteId: string; line: number };
+
 /** One player's progress through one round. Kept out of the group value. */
 export type QuizRun = {
-  /** Quote ids, shuffled when the round starts, so two players differ. */
-  order: string[];
+  /** Shuffled when the round starts, so two players differ. */
+  order: QuizAsk[];
   index: number;
   /** When the current question was served. The clock the score is read from. */
   askedAt: string;
@@ -265,27 +292,62 @@ export const canMoveReveal = (
  * The question set as the client is allowed to see it: no `answerMemberId`.
  * Answers stay on the server, which is what makes a score mean anything.
  */
+/** The exchange, or the single remark read as a one-line exchange. */
+export const quoteLinesOf = (quote: Quote): QuoteLine[] =>
+  quote.lines && quote.lines.length > 0
+    ? quote.lines
+    : [{ saidByMemberId: quote.saidByMemberId, text: quote.text }];
+
+/**
+ * Everyone who speaks in a quote, each counted once however many lines they
+ * have. Someone who says three lines in one exchange featured in one quote, not
+ * three — otherwise the leaderboard would reward rambling.
+ */
+export const quoteSpeakers = (quote: Quote): string[] => [
+  ...new Set(quoteLinesOf(quote).map((line) => line.saidByMemberId)),
+];
+
 export const buildQuiz = (group: GroupState) => {
   const options = group.members.map((member) => ({ id: member.id, name: member.name }));
 
   return group.quotes.map((quote) => ({
     quoteId: quote.id,
     quote: quote.text,
+    lines: quoteLinesOf(quote).length,
     hasImage: quote.image !== undefined,
     options,
   }));
 };
 
-/** One question, shaped for the round in progress. Never carries the answer. */
+/**
+ * One question, shaped for the round in progress. Never carries the answer.
+ *
+ * An exchange has no single speaker, so a question asks about one of its lines
+ * and shows the rest as context with their speakers named. That keeps the quiz
+ * to one question type, and a conversation makes better material than a lone
+ * remark precisely because the context is the joke. The alternative — leaving
+ * conversations out — would quietly shrink the quiz as people used the feature.
+ */
 export const quizQuestion = (group: GroupState, run: QuizRun) => {
-  const quote = group.quotes.find((entry) => entry.id === run.order[run.index]);
+  const ask = run.order[run.index];
+  const quote = ask ? group.quotes.find((entry) => entry.id === ask.quoteId) : undefined;
   if (!quote) {
     return null;
   }
 
+  const lines = quoteLinesOf(quote);
+  const asked = Math.min(ask.line, lines.length - 1);
+  const names = new Map(group.members.map((member) => [member.id, member.name]));
+
   return {
     quoteId: quote.id,
-    text: quote.text,
+    askedLine: asked,
+    // The asked line carries no speaker; the others do, because that context is
+    // what makes the question answerable rather than a guess.
+    lines: lines.map((line, index) => ({
+      text: line.text,
+      speaker: index === asked ? null : (names.get(line.saidByMemberId) ?? null),
+    })),
     hasImage: quote.image !== undefined,
     options: shuffled(group.members.map((member) => ({ id: member.id, name: member.name }))),
     number: run.index + 1,
@@ -293,6 +355,12 @@ export const quizQuestion = (group: GroupState, run: QuizRun) => {
     answerWindowMs: QUIZ.answerWindowMs,
   };
 };
+
+/** Every line of every quote, as the questions a round is drawn from. */
+export const quizAsks = (group: GroupState): QuizAsk[] =>
+  group.quotes.flatMap((quote) =>
+    quoteLinesOf(quote).map((_line, index) => ({ quoteId: quote.id, line: index })),
+  );
 
 export const buildStats = (group: GroupState) => {
   const persistedBy: Record<string, number> = {};
@@ -305,7 +373,12 @@ export const buildStats = (group: GroupState) => {
 
   for (const quote of group.quotes) {
     persistedBy[quote.recordedByMemberId] = (persistedBy[quote.recordedByMemberId] ?? 0) + 1;
-    saidBy[quote.saidByMemberId] = (saidBy[quote.saidByMemberId] ?? 0) + 1;
+    // Every speaker in an exchange featured in it, so the totals across members
+    // can exceed the quote count. That is the honest reading of "quotes you are
+    // in", and the leaderboard is labelled accordingly.
+    for (const speaker of quoteSpeakers(quote)) {
+      saidBy[speaker] = (saidBy[speaker] ?? 0) + 1;
+    }
   }
 
   const leaderboard = group.members

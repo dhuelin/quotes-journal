@@ -12,7 +12,9 @@ import {
   revealInstant,
   LIMITS,
   QUIZ,
+  quizAsks,
   quizQuestion,
+  quoteLinesOf,
   scoreAnswer,
   shuffled,
   type GroupState,
@@ -22,7 +24,7 @@ import {
 } from './domain';
 import { IMAGE_CONTENT_TYPES } from './domain';
 import { imageResponseHeaders } from './images';
-import { readJsonBody, validateMemberIdList, validateText } from './validation';
+import { readJsonBody, validateMemberIdList, validateQuoteLines, validateText } from './validation';
 
 const jsonResponse = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), {
@@ -528,9 +530,24 @@ export class GroupStore {
       return jsonResponse({ error: 'This group has been revealed and is no longer collecting quotes' }, 409);
     }
 
-    const text = validateText(body.value.text, 'Quote', LIMITS.quoteText, { allowLineBreaks: true });
-    if (!text.ok) {
-      return jsonResponse({ error: text.error }, 400);
+    // Either shape is accepted: a single remark as it always was, or an
+    // exchange. A one-line exchange is just a remark, so it is stored as one.
+    let lines: { saidByMemberId: string; text: string }[];
+    if (body.value.lines !== undefined) {
+      const parsed = validateQuoteLines(body.value.lines);
+      if (!parsed.ok) {
+        return jsonResponse({ error: parsed.error }, 400);
+      }
+      lines = parsed.value;
+    } else {
+      const text = validateText(body.value.text, 'Quote', LIMITS.quoteText, { allowLineBreaks: true });
+      if (!text.ok) {
+        return jsonResponse({ error: text.error }, 400);
+      }
+      if (typeof body.value.saidByMemberId !== 'string') {
+        return jsonResponse({ error: 'The quoted member is not part of this group' }, 400);
+      }
+      lines = [{ saidByMemberId: body.value.saidByMemberId, text: text.value }];
     }
 
     const involved = validateMemberIdList(body.value.involvedMemberIds, 'Involved members');
@@ -543,7 +560,7 @@ export class GroupStore {
     }
 
     const memberIds = new Set(group.members.map((member) => member.id));
-    if (typeof body.value.saidByMemberId !== 'string' || !memberIds.has(body.value.saidByMemberId)) {
+    if (lines.some((line) => !memberIds.has(line.saidByMemberId))) {
       return jsonResponse({ error: 'The quoted member is not part of this group' }, 400);
     }
 
@@ -553,8 +570,12 @@ export class GroupStore {
 
     const quote = {
       id: crypto.randomUUID(),
-      text: text.value,
-      saidByMemberId: body.value.saidByMemberId,
+      // Mirrors of the opening line, so a reader that predates conversations —
+      // the Flutter client, say — still shows something correct rather than
+      // nothing at all.
+      text: lines[0].text,
+      saidByMemberId: lines[0].saidByMemberId,
+      ...(lines.length > 1 ? { lines } : {}),
       // Always the caller: attribution of who collected a quote is not
       // client-controlled, otherwise the stats could be gamed.
       recordedByMemberId: author.id,
@@ -712,7 +733,7 @@ export class GroupStore {
     }
 
     const run: QuizRun = {
-      order: shuffled(group.quotes.map((quote) => quote.id)).slice(0, QUIZ.maxQuestions),
+      order: shuffled(quizAsks(group)).slice(0, QUIZ.maxQuestions),
       index: 0,
       askedAt: new Date().toISOString(),
       score: 0,
@@ -747,8 +768,9 @@ export class GroupStore {
       return jsonResponse({ error: 'That round is over, start a new one' }, 409);
     }
 
-    const current = group.quotes.find((quote) => quote.id === run.order[run.index]);
-    if (!current) {
+    const ask = run.order[run.index];
+    const current = ask ? group.quotes.find((quote) => quote.id === ask.quoteId) : undefined;
+    if (!current || !ask) {
       return jsonResponse({ error: 'That round is over, start a new one' }, 409);
     }
 
@@ -758,13 +780,16 @@ export class GroupStore {
       return jsonResponse({ error: 'That is not the question you are on' }, 409);
     }
 
+    const lines = quoteLinesOf(current);
+    const askedLine = lines[Math.min(ask.line, lines.length - 1)];
+
     // null is a question that ran out of time, which is a real answer worth nothing.
     const guess = body.value.memberId;
     if (guess !== null && guess !== undefined && typeof guess !== 'string') {
       return jsonResponse({ error: 'Invalid answer' }, 400);
     }
 
-    const correct = typeof guess === 'string' && guess === current.saidByMemberId;
+    const correct = typeof guess === 'string' && guess === askedLine.saidByMemberId;
     const elapsedMs = Date.now() - new Date(run.askedAt).getTime();
     const points = scoreAnswer(correct, elapsedMs);
 
@@ -790,7 +815,7 @@ export class GroupStore {
     return jsonResponse({
       correct,
       // Only now, with the answer already banked, is it safe to say.
-      answerMemberId: current.saidByMemberId,
+      answerMemberId: askedLine.saidByMemberId,
       points,
       score: run.score,
       finished,

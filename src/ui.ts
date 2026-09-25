@@ -160,6 +160,23 @@ const appStyles = `
          one whose picture fails to load — reads exactly as it did before. */
       .quote-photo img { max-width: 100%; border-radius: 10px; margin-top: .7rem; display: block; }
 
+      .quote-line { border-top: 1px solid var(--line); margin-top: 1rem; padding-top: .25rem; }
+      .quote-line:first-of-type { border-top: none; margin-top: 0; padding-top: 0; }
+      .remove-line { margin-top: .5rem; font-size: .85rem; }
+
+      /* An exchange, in the reveal and in the quiz alike. */
+      p.said { margin: 0 0 .5rem; }
+      p.said:last-of-type { margin-bottom: 0; }
+      .speaker {
+        display: inline-block; min-width: 3.5rem; margin-right: .5rem;
+        color: var(--accent); font-weight: 650;
+      }
+
+      .quiz-lines { text-align: left; margin: 1rem 0; }
+      .quiz-lines p.said { font-size: 1.05rem; }
+      .quiz-lines p.asked { font-weight: 650; }
+      .quiz-lines p.asked .speaker { color: var(--muted); }
+
       .quiz-shell { text-align: center; }
       .quiz-count { color: var(--muted); font-size: .85rem; letter-spacing: .04em; text-transform: uppercase; }
       .quiz-quote { font-size: 1.3rem; font-weight: 650; line-height: 1.35; margin: .9rem 0; }
@@ -223,6 +240,8 @@ const appScript = `
           pendingInvite: readInviteFromLocation(),
           /** The shrunk, re-encoded photo waiting to go up with the next quote. */
           pendingImage: null,
+          /** How many lines the quote form is showing. One is the common case. */
+          lineCount: 1,
           /** The round in progress, if the quiz tab is being played. */
           quiz: null,
           /** Everyone's best round, loaded when the quiz tab is opened. */
@@ -569,11 +588,9 @@ const appScript = `
           return (
             '<div class="card">' +
             '<form id="quote-form">' +
-            '<label for="quote-text">What was said?</label>' +
-            '<textarea id="quote-text" name="text" required placeholder="&#8220;I am not lost, the map is wrong.&#8221;"></textarea>' +
-            '<p class="small muted" id="quote-count">0 / 500</p>' +
-            '<label for="quote-said-by">Who said it?</label>' +
-            '<select id="quote-said-by" name="saidByMemberId" required>' + options + '</select>' +
+            lineFields(options) +
+            '<button type="button" class="secondary" id="add-line">Add another line</button>' +
+            '<p class="small muted">For a back-and-forth: each line keeps its own speaker, so an exchange stays an exchange.</p>' +
             (involved ? '<label>Who else was there?</label><div class="checks">' + involved + '</div>' : '') +
             '<label for="quote-photo">Add a picture (optional)</label>' +
             '<input id="quote-photo" name="photo" type="file" accept="image/jpeg,image/png,image/webp" />' +
@@ -588,6 +605,35 @@ const appScript = `
             '<p class="muted">quotes collected so far &middot; ' + escapeHtml(group.progress.recordedByYou) + ' by you</p>' +
             '</div>'
           );
+        }
+
+        /**
+         * One block per line. A single remark looks exactly as it always did —
+         * one box, one speaker — and a conversation is the same thing repeated,
+         * which keeps the common case from paying for the rare one.
+         */
+        function lineFields(options) {
+          var blocks = [];
+          for (var index = 0; index < state.lineCount; index += 1) {
+            var first = index === 0;
+            blocks.push(
+              '<div class="quote-line">' +
+              '<label for="quote-text-' + index + '">' +
+              (first ? 'What was said?' : 'And then?') +
+              '</label>' +
+              '<textarea id="quote-text-' + index + '" name="lineText" required placeholder="' +
+              (first ? '&#8220;I am not lost, the map is wrong.&#8221;' : '&#8220;You have been driving in circles.&#8221;') +
+              '"></textarea>' +
+              '<p class="small muted" id="quote-count-' + index + '">0 / 500</p>' +
+              '<label for="quote-said-by-' + index + '">Who said it?</label>' +
+              '<select id="quote-said-by-' + index + '" name="lineSpeaker" required>' + options + '</select>' +
+              (first
+                ? ''
+                : '<button type="button" class="link remove-line" data-remove-line="' + index + '">Remove this line</button>') +
+              '</div>',
+            );
+          }
+          return blocks.join('');
         }
 
         function membersTab() {
@@ -649,12 +695,30 @@ const appScript = `
                 .filter(function (id) { return id !== quote.saidByMemberId; })
                 .map(memberName);
 
+              var body;
+              var attribution;
+              if (quote.lines && quote.lines.length > 1) {
+                body = quote.lines
+                  .map(function (line) {
+                    return (
+                      '<p class="said"><span class="speaker">' + escapeHtml(memberName(line.saidByMemberId)) +
+                      '</span>' + escapeHtml(line.text) + '</p>'
+                    );
+                  })
+                  .join('');
+                attribution = 'recorded by ' + escapeHtml(memberName(quote.recordedByMemberId));
+              } else {
+                body = escapeHtml(quote.text);
+                attribution =
+                  '&mdash; ' + escapeHtml(memberName(quote.saidByMemberId)) +
+                  ', recorded by ' + escapeHtml(memberName(quote.recordedByMemberId));
+              }
+
               return (
                 '<blockquote>' +
-                escapeHtml(quote.text) +
+                body +
                 (quote.image ? '<div class="quote-photo" data-photo="' + escapeHtml(quote.id) + '"></div>' : '') +
-                '<footer>&mdash; ' + escapeHtml(memberName(quote.saidByMemberId)) +
-                ', recorded by ' + escapeHtml(memberName(quote.recordedByMemberId)) +
+                '<footer>' + attribution +
                 (involved.length ? ' &middot; with ' + escapeHtml(involved.join(', ')) : '') +
                 '</footer></blockquote>'
               );
@@ -757,9 +821,36 @@ const appScript = `
             '<p class="quiz-count">Question ' + escapeHtml(question.number) + ' of ' + escapeHtml(question.total) +
             ' &middot; ' + escapeHtml(quiz.score) + ' points</p>' +
             (question.hasImage ? '<div class="quiz-photo" data-quiz-photo="' + escapeHtml(question.quoteId) + '"></div>' : '') +
-            '<p class="quiz-quote">&#8220;' + escapeHtml(question.text) + '&#8221;</p>' +
+            quizLinesHtml(question) +
             '<div class="quiz-answers">' + answers + '</div>' +
             footer +
+            '</div>'
+          );
+        }
+
+        /**
+         * A single remark reads as one big quote, as it always has. An exchange
+         * shows every line, with the one being asked about left unattributed —
+         * the others are named, because that context is what makes the question
+         * answerable rather than a guess.
+         */
+        function quizLinesHtml(question) {
+          if (question.lines.length === 1) {
+            return '<p class="quiz-quote">&#8220;' + escapeHtml(question.lines[0].text) + '&#8221;</p>';
+          }
+
+          return (
+            '<div class="quiz-lines">' +
+            question.lines
+              .map(function (line) {
+                return (
+                  '<p class="said' + (line.speaker === null ? ' asked' : '') + '">' +
+                  '<span class="speaker">' + (line.speaker === null ? '&#63;' : escapeHtml(line.speaker)) + '</span>' +
+                  escapeHtml(line.text) +
+                  '</p>'
+                );
+              })
+              .join('') +
             '</div>'
           );
         }
@@ -1076,16 +1167,53 @@ const appScript = `
             render();
           });
 
-          var quoteText = document.getElementById('quote-text');
-          var quoteCount = document.getElementById('quote-count');
-          if (quoteText && quoteCount) {
+          document.querySelectorAll('[name="lineText"]').forEach(function (field, index) {
+            var counter = document.getElementById('quote-count-' + index);
+            if (!counter) {
+              return;
+            }
             var showCount = function () {
-              quoteCount.textContent = quoteText.value.length + ' / 500';
-              quoteCount.className = quoteText.value.length > 500 ? 'small' : 'small muted';
+              counter.textContent = field.value.length + ' / 500';
+              counter.className = field.value.length > 500 ? 'small' : 'small muted';
             };
-            quoteText.addEventListener('input', showCount);
+            field.addEventListener('input', showCount);
             showCount();
-          }
+          });
+
+          onClick('add-line', function () {
+            if (state.lineCount < 10) {
+              state.lineCount += 1;
+              render({ keepInput: true });
+            }
+          });
+
+          document.querySelectorAll('[data-remove-line]').forEach(function (button) {
+            button.addEventListener('click', function () {
+              // Re-read what is typed, drop the removed line, and put the rest
+              // back — otherwise removing line 2 of 3 would silently shift the
+              // third line's text up into its place.
+              var texts = [];
+              var speakers = [];
+              document.querySelectorAll('[name="lineText"]').forEach(function (field) { texts.push(field.value); });
+              document.querySelectorAll('[name="lineSpeaker"]').forEach(function (field) { speakers.push(field.value); });
+
+              var gone = Number(button.getAttribute('data-remove-line'));
+              texts.splice(gone, 1);
+              speakers.splice(gone, 1);
+              state.lineCount = Math.max(1, state.lineCount - 1);
+              render();
+
+              document.querySelectorAll('[name="lineText"]').forEach(function (field, index) {
+                field.value = texts[index] || '';
+                field.dispatchEvent(new Event('input'));
+              });
+              document.querySelectorAll('[name="lineSpeaker"]').forEach(function (field, index) {
+                if (speakers[index]) {
+                  field.value = speakers[index];
+                }
+              });
+            });
+          });
 
           var photoField = document.getElementById('quote-photo');
           if (photoField) {
@@ -1140,13 +1268,15 @@ const appScript = `
               .call(form.querySelectorAll('input[name="involved"]:checked'))
               .map(function (input) { return input.value; });
 
+            var texts = Array.prototype.slice.call(form.querySelectorAll('[name="lineText"]'));
+            var speakers = Array.prototype.slice.call(form.querySelectorAll('[name="lineSpeaker"]'));
+            var lines = texts.map(function (field, index) {
+              return { text: field.value, saidByMemberId: speakers[index].value };
+            });
+
             var saved = await api('/api/groups/' + encodeURIComponent(state.group.id) + '/quotes', {
               method: 'POST',
-              body: {
-                text: form.text.value,
-                saidByMemberId: form.saidByMemberId.value,
-                involvedMemberIds: involved,
-              },
+              body: { lines: lines, involvedMemberIds: involved },
             });
 
             // The picture goes up second, against the quote that now exists. If
@@ -1163,6 +1293,7 @@ const appScript = `
               state.pendingImage = null;
             }
 
+            state.lineCount = 1;
             await openGroup(state.group.id, 'collect');
             notify(
               imageError
