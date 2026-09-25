@@ -2,19 +2,19 @@
  * The whole client is one document: small enough to inline, which keeps the
  * Worker a single deployable unit with no build step or asset bucket.
  */
-const html = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="theme-color" content="#0f1020" />
-    <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <link rel="manifest" href="/manifest.webmanifest" />
-    <link rel="apple-touch-icon" href="/icon.svg" />
-    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <title>Quotes Journal</title>
-    <style nonce="__CSP_NONCE__">
+
+/**
+ * The style and the script are their own strings so that the CSP can name them
+ * by content hash. A nonce would have done the same job, but a nonce changes on
+ * every response, which makes the document uncacheable — and an app shell that
+ * cannot be cached cannot work offline. A hash also says something stronger than
+ * a nonce does: a nonce authorises whatever inline block carries it, while a
+ * hash authorises exactly this text and nothing else.
+ *
+ * They are interpolated verbatim between the tags, so what the hash covers and
+ * what the browser executes are the same bytes by construction.
+ */
+const appStyles = `
       :root {
         --bg: #0f1020;
         --surface: #191a30;
@@ -160,14 +160,12 @@ const html = `<!doctype html>
          one whose picture fails to load — reads exactly as it did before. */
       .quote-photo img { max-width: 100%; border-radius: 10px; margin-top: .7rem; display: block; }
 
-      /* Inline style attributes cannot carry the CSP nonce, so every rule lives here. */
+      /* Inline style attributes cannot be hashed or nonced, so every rule lives here. */
       .group-title { margin-top: .6rem; }
       .vault-note { margin-top: .7rem; }
-    </style>
-  </head>
-  <body>
-    <main id="app" aria-live="polite"></main>
-    <script nonce="__CSP_NONCE__">
+    `;
+
+const appScript = `
       (function () {
         'use strict';
 
@@ -183,6 +181,8 @@ const html = `<!doctype html>
           token: localStorage.getItem(TOKEN_KEY),
           user: null,
           groups: [],
+          /** Whether the group list on screen came from the server this session. */
+          groupsLoaded: false,
           group: null,
           tab: 'collect',
           reveal: null,
@@ -229,11 +229,23 @@ const html = `<!doctype html>
             headers.authorization = 'Bearer ' + state.token;
           }
 
-          var response = await fetch(path, {
-            method: settings.method || 'GET',
-            headers: headers,
-            body: settings.body ? JSON.stringify(settings.body) : undefined,
-          });
+          var response;
+          try {
+            response = await fetch(path, {
+              method: settings.method || 'GET',
+              headers: headers,
+              body: settings.body ? JSON.stringify(settings.body) : undefined,
+            });
+          } catch (error) {
+            // The service worker can open the app with no connection, but every
+            // quote lives on the server. Saying so is more use than the
+            // browser's own "Failed to fetch".
+            throw new Error(
+              navigator.onLine === false
+                ? 'You are offline. Quotes are kept on the server, so this needs a connection.'
+                : 'Could not reach the server. Check your connection and try again.',
+            );
+          }
 
           var payload = {};
           try {
@@ -270,6 +282,7 @@ const html = `<!doctype html>
           state.token = null;
           state.user = null;
           state.groups = [];
+          state.groupsLoaded = false;
           state.group = null;
           state.pendingImage = null;
           localStorage.removeItem(TOKEN_KEY);
@@ -369,7 +382,12 @@ const html = `<!doctype html>
             noticeHtml() +
             '<div class="card">' +
             '<h2>Your groups</h2>' +
-            (items || '<p class="muted">No groups yet. Create one below, or paste an invite link from a friend.</p>') +
+            (items ||
+              (state.groupsLoaded
+                ? '<p class="muted">No groups yet. Create one below, or paste an invite link from a friend.</p>'
+                : // Not the same thing as having none, and saying so would be a
+                  // lie to anyone who opened the installed app on a train.
+                  '<p class="muted">Your groups could not be loaded. They are on the server and need a connection.</p>')) +
             '</div>' +
             '<div class="card">' +
             '<h2>Start a group</h2>' +
@@ -1145,6 +1163,7 @@ const html = `<!doctype html>
           var account = await api('/api/auth/me');
           state.user = account.user;
           state.groups = account.groups;
+          state.groupsLoaded = true;
         }
 
         /**
@@ -1301,15 +1320,33 @@ const html = `<!doctype html>
 
         boot();
       })();
-    </script>
+    `;
+
+const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0f1020" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <title>Quotes Journal</title>
+    <style>${appStyles}</style>
+  </head>
+  <body>
+    <main id="app" aria-live="polite"></main>
+    <script>${appScript}</script>
   </body>
 </html>`;
 
-/**
- * The inline <style> and <script> are allowed by a per-response CSP nonce, which
- * is stamped into both tags here.
- */
-export const renderAppHtml = (nonce: string): string => html.replaceAll('__CSP_NONCE__', nonce);
+/** The one document the app is served as, identical on every response. */
+export const renderAppHtml = (): string => html;
+
+/** What the policy has to name for the app shell to run at all. */
+export const appInline = { styles: appStyles, script: appScript };
 
 /**
  * The privacy policy, served at /privacy. Both app stores require a reachable
@@ -1317,17 +1354,10 @@ export const renderAppHtml = (nonce: string): string => html.replaceAll('__CSP_N
  * match what this says — so it describes exactly what the code does and nothing
  * aspirational.
  *
- * Kept in the same file and under the same CSP as the app: one inline style,
- * carrying the nonce, no scripts at all.
+ * Kept in the same file and under the same kind of policy as the app: one
+ * inline style, named by its hash, and no scripts at all.
  */
-const privacyHtml = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#0f1020" />
-    <title>Privacy — Quotes Journal</title>
-    <style nonce="__CSP_NONCE__">
+const privacyStyles = `
       :root { --bg:#0f1020; --surface:#191a30; --line:#32345a; --text:#f2f2f7; --muted:#a2a4c4; --accent:#f8c630; color-scheme: dark; }
       * { box-sizing: border-box; }
       body { margin:0; background:var(--bg); color:var(--text);
@@ -1340,9 +1370,18 @@ const privacyHtml = `<!doctype html>
       a { color:var(--accent); }
       .muted { color:var(--muted); }
       .card { background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:1rem 1.25rem; margin-top:1.5rem; }
-      /* A nonce authorises inline style blocks but never style attributes. */
+      /* A hash names an inline style block; a style attribute cannot be named at all. */
       .flush { margin-top:0; }
-    </style>
+    `;
+
+const privacyHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0f1020" />
+    <title>Privacy — Quotes Journal</title>
+    <style>${privacyStyles}</style>
   </head>
   <body>
     <main>
@@ -1414,4 +1453,7 @@ const privacyHtml = `<!doctype html>
   </body>
 </html>`;
 
-export const renderPrivacyHtml = (nonce: string): string => privacyHtml.replaceAll('__CSP_NONCE__', nonce);
+
+export const renderPrivacyHtml = (): string => privacyHtml;
+
+export const privacyInline = { styles: privacyStyles };

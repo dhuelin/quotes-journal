@@ -186,28 +186,26 @@ describe('the stored-value budget', () => {
 });
 
 /**
- * The client is served under `style-src 'nonce-…'`. A nonce authorises inline
- * <style> blocks but never style="" attributes, which browsers drop silently —
- * no test that stops at the HTTP layer can see it, so guard the source instead.
+ * The client is served under `style-src 'sha256-…'`. A hash names an inline
+ * <style> block; a style="" attribute cannot be named at all and browsers drop
+ * it silently — no test that stops at the HTTP layer can see that, so guard the
+ * source instead.
  */
 describe('the inlined client under CSP', () => {
   it('carries no inline style attributes on any page', async () => {
     const { renderAppHtml, renderPrivacyHtml } = await import('../src/ui');
 
-    // Every page served under the nonce policy, not just the app: a style=""
-    // attribute cannot carry the nonce and is dropped silently by the browser.
-    expect(renderAppHtml('test-nonce')).not.toContain('style="');
-    expect(renderPrivacyHtml('test-nonce')).not.toContain('style="');
+    // Every page under the policy, not just the app: a style="" attribute is
+    // outside what a hash or a nonce can authorise, either way.
+    expect(renderAppHtml()).not.toContain('style="');
+    expect(renderPrivacyHtml()).not.toContain('style="');
   });
 
-  it('stamps the nonce onto the privacy page too', async () => {
+  it('carries no script at all on the privacy page', async () => {
     const { renderPrivacyHtml } = await import('../src/ui');
-    const page = renderPrivacyHtml('test-nonce');
 
-    expect(page).toContain('<style nonce="test-nonce">');
-    expect(page).not.toContain('__CSP_NONCE__');
-    // No scripts at all on this page, so none should be authorised.
-    expect(page).not.toContain('<script');
+    // Nothing to execute means nothing for the policy to authorise.
+    expect(renderPrivacyHtml()).not.toContain('<script');
   });
 
   it('sets no maxlength, so a pasted over-long value is reported rather than trimmed', async () => {
@@ -215,8 +213,8 @@ describe('the inlined client under CSP', () => {
 
     // Silent truncation hid an error the server states clearly; a counter and
     // the server's own message replaced it.
-    expect(renderAppHtml('n')).not.toContain('maxlength=');
-    expect(renderAppHtml('n')).toContain('id="quote-count"');
+    expect(renderAppHtml()).not.toContain('maxlength=');
+    expect(renderAppHtml()).toContain('id="quote-count"');
   });
 
   it('escapes nothing into a regex literal, which a template literal would eat', async () => {
@@ -225,12 +223,12 @@ describe('the inlined client under CSP', () => {
     // ui.ts is one big template literal: a backslash written here never reaches
     // the browser, so a regex like /^\/groups/ silently becomes /^/groups/ and
     // throws "invalid flags" at load. Path parsing uses split() instead.
-    expect(renderAppHtml('n')).not.toMatch(/match\(\/\^/);
+    expect(renderAppHtml()).not.toMatch(/match\(\/\^/);
   });
 
   it('asks for the password twice at registration and never sends the second copy', async () => {
     const { renderAppHtml } = await import('../src/ui');
-    const page = renderAppHtml('n');
+    const page = renderAppHtml();
 
     // There is no password reset yet (#6), so a typo at registration locks
     // someone out of an account they cannot recover.
@@ -243,7 +241,7 @@ describe('the inlined client under CSP', () => {
 
   it('offers a picture field that is prepared on the device before upload', async () => {
     const { renderAppHtml } = await import('../src/ui');
-    const page = renderAppHtml('n');
+    const page = renderAppHtml();
 
     expect(page).toContain('id="quote-photo"');
     expect(page).toContain('accept="image/jpeg,image/png,image/webp"');
@@ -254,13 +252,34 @@ describe('the inlined client under CSP', () => {
     expect(page).toContain("authorization: 'Bearer ' + state.token");
   });
 
-  it('stamps the nonce onto both inline blocks and leaves no placeholder behind', async () => {
-    const { renderAppHtml } = await import('../src/ui');
-    const page = renderAppHtml('test-nonce');
+  it('hashes exactly the bytes it serves between the tags', async () => {
+    const { appInline, privacyInline, renderAppHtml, renderPrivacyHtml } = await import('../src/ui');
+    const { policies } = await import('../src/csp');
+    const page = renderAppHtml();
 
-    expect(page).toContain('<style nonce="test-nonce">');
-    expect(page).toContain('<script nonce="test-nonce">');
+    // The whole scheme rests on this: what the policy names and what the browser
+    // runs have to be the same bytes. They are interpolated, so they are — and
+    // this is the test that notices if anyone reintroduces a wrapper or a trim.
+    expect(page).toContain(`<style>${appInline.styles}</style>`);
+    expect(page).toContain(`<script>${appInline.script}</script>`);
+    expect(renderPrivacyHtml()).toContain(`<style>${privacyInline.styles}</style>`);
     expect(page).not.toContain('__CSP_NONCE__');
+
+    const policy = await policies();
+    expect(policy.app).toMatch(/script-src 'sha256-[A-Za-z0-9+/=]{44}'/);
+    expect(policy.app).toMatch(/style-src 'sha256-[A-Za-z0-9+/=]{44}'/);
+    // The privacy page has no script, so it authorises none.
+    expect(policy.privacy).not.toContain('script-src');
+  });
+
+  it('fingerprints the client so a deployed change reaches an installed app', async () => {
+    const { policies } = await import('../src/csp');
+
+    // The service worker names its cache with this. If it did not change when
+    // the client changes, a browser would keep serving a shell cached months
+    // ago and never install the new worker that would have replaced it.
+    const { version } = await policies();
+    expect(version).toMatch(/^[A-Za-z0-9]{16}$/);
   });
 });
 

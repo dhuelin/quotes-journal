@@ -56,8 +56,11 @@ app and the HTTP API; a Flutter app talks to the same API on Android and iOS.
   `default-src 'none'; sandbox` policy, and are read with a bearer token rather
   than through a URL that would have to carry a credential.
 - The app shell is served with a strict `Content-Security-Policy`
-  (`default-src 'none'`, a per-response nonce for the one inline script and
-  style), plus `nosniff`, `no-referrer`, `frame-ancestors 'none'` and HSTS.
+  (`default-src 'none'`, plus a SHA-256 hash naming the one inline script and
+  the one inline style), and `nosniff`, `no-referrer`, `frame-ancestors 'none'`
+  and HSTS. Hashes rather than a per-response nonce: a nonce authorises whatever
+  inline block carries it, while a hash authorises exactly that text — and a
+  hash is stable, which is what lets the shell be cached and opened offline.
 
 ### PBKDF2 cost
 
@@ -97,6 +100,25 @@ the group value. That value is read and rewritten on every write and has a hard
 ~2.2MB ceiling ([#10](https://github.com/dhuelin/quotes-journal/issues/10)) —
 only the picture's size and type live there. R2 would be the natural home if
 this grows, and is not used today because R2 is not enabled on the account.
+
+### Offline and the installed app
+
+The service worker precaches the app shell, the icon and the manifest, and
+serves the shell for any in-app path — so an installed app opens with no
+connection, deep links included, instead of showing the browser's error page.
+Quotes still need the server, and the app says so rather than claiming a group
+is empty.
+
+Nothing under `/api` is ever cached. Quotes, pictures and the account are read
+with a bearer token, and a copy in Cache Storage would outlive signing out —
+readable by whoever picks up the device next, and for a group still under its
+reveal lock, readable early. The saving would be a round trip; the cost would be
+the only guarantee this app makes.
+
+The cache is named after a fingerprint of the client itself, so deploying a
+change alters the text of `/sw.js`. That is the only thing that makes a browser
+install a new worker and drop the old cache — a version baked in by hand is how
+an offline app ends up serving a build from months ago.
 
 ## Tech stack
 
@@ -236,7 +258,7 @@ Tracked in [the issue tracker](https://github.com/dhuelin/quotes-journal/issues)
 - [#7](https://github.com/dhuelin/quotes-journal/issues/7) persist the mobile session across restarts
 - [#8](https://github.com/dhuelin/quotes-journal/issues/8) store submission setup for the mobile app
 - [#9](https://github.com/dhuelin/quotes-journal/issues/9) keep the cached group name on an account in sync
-- [#13](https://github.com/dhuelin/quotes-journal/issues/13) the service worker registers but caches nothing
 - [#15](https://github.com/dhuelin/quotes-journal/issues/15) a configurable reveal date, not just the year
 - [#17](https://github.com/dhuelin/quotes-journal/issues/17) settings pages for accounts and groups
 - [#19](https://github.com/dhuelin/quotes-journal/issues/19) publishing to the app stores (low priority)
+- [#20](https://github.com/dhuelin/quotes-journal/issues/20) the Flutter client shows no quote pictures

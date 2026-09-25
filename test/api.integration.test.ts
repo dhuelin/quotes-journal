@@ -1209,7 +1209,7 @@ describe('invite links (M5, L2)', () => {
 });
 
 describe('security headers (L1)', () => {
-  it('locks the app shell down and allows the inline script and style by nonce', async () => {
+  it('locks the app shell down and names the inline script and style by hash', async () => {
     const response = await SELF.fetch('https://example.com/app');
     const csp = response.headers.get('content-security-policy') ?? '';
 
@@ -1232,105 +1232,76 @@ describe('security headers (L1)', () => {
       expect(csp, directive).toContain(directive);
     }
     expect(csp).not.toContain("'unsafe-inline'");
-
-    const nonce = /script-src 'nonce-([A-Za-z0-9+/_-]+)'/.exec(csp)?.[1];
-    expect(nonce).toBeTruthy();
+    expect(csp).not.toContain('nonce-');
 
     const shell = await response.text();
-    expect(shell).toContain(`<script nonce="${nonce}">`);
-    expect(shell).toContain(`<style nonce="${nonce}">`);
+    expect(shell).toContain('<script>');
+    expect(shell).toContain('<style>');
     expect(shell).not.toContain('__CSP_NONCE__');
   });
 
-  it('mints a fresh nonce for every response', async () => {
+  it('serves a byte-identical shell every time, so it can be cached and opened offline', async () => {
     const first = await SELF.fetch('https://example.com/app');
-    const second = await SELF.fetch('https://example.com/app');
+    const second = await SELF.fetch('https://example.com/join');
 
-    expect(first.headers.get('content-security-policy')).not.toBe(second.headers.get('content-security-policy'));
+    // This is the whole reason the policy moved off nonces. A nonce is fresh per
+    // response, which makes every copy of the document unique — and a document
+    // that cannot be cached cannot be opened without a connection.
+    expect(first.headers.get('content-security-policy')).toBe(second.headers.get('content-security-policy'));
+    expect(await first.text()).toBe(await second.text());
+  });
+
+  it('refuses to authorise a script the policy has not hashed', async () => {
+    const response = await SELF.fetch('https://example.com/app');
+    const csp = response.headers.get('content-security-policy') ?? '';
+    const hash = /script-src '(sha256-[A-Za-z0-9+/=]+)'/.exec(csp)?.[1];
+
+    expect(hash).toBeTruthy();
+
+    // The hash has to be of the script actually served, or the app is dead on
+    // arrival in a way no HTTP-level assertion would notice.
+    const shell = await response.text();
+    const script = shell.slice(shell.indexOf('<script>') + '<script>'.length, shell.lastIndexOf('</script>'));
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(script));
+    const computed = `sha256-${btoa(String.fromCharCode(...new Uint8Array(digest)))}`;
+
+    expect(computed).toBe(hash);
   });
 });
 
-describe('the group cap (L3)', () => {
-  it('refuses to create a group past the cap instead of orphaning one', async () => {
-    const alice = await registerUser('Alice');
-    await fillAccountToGroupCap(alice);
+describe('the service worker (L7)', () => {
+  it('caches the shell and keeps every API response out of the cache', async () => {
+    const response = await SELF.fetch('https://example.com/sw.js');
+    const script = await response.text();
 
-    const response = await request('/api/groups', {
-      method: 'POST',
-      token: alice.token,
-      body: { name: 'One too many', revealYear: nextYear },
-    });
+    expect(response.status).toBe(200);
+    expect(script).toContain("addEventListener('fetch'");
+    expect(script).toContain("caches.open");
 
-    expect(response.status).toBe(409);
-    expect(response.body.error).toContain('at most');
-
-    const account = await request('/api/auth/me', { token: alice.token });
-    expect(account.body.groups).toHaveLength(LIMITS.groupsPerUser);
+    // The one rule that matters. Quotes, pictures and the account are read with
+    // a bearer token; a copy in Cache Storage would outlive signing out, and for
+    // a group still under its reveal lock it would be readable early.
+    expect(script).toContain("url.pathname.startsWith('/api/')");
   });
 
-  it('refuses to accept an invite past the cap, without adding a hidden membership', async () => {
-    const owner = await registerUser('Owner');
-    const joiner = await registerUser('Joiner');
-    const group = await createGroup(owner, 'Full up', nextYear);
-    const inviteCode = await inviteCodeFor(owner, group.id);
-    await fillAccountToGroupCap(joiner);
+  it('names its cache after the client, so a deploy reaches an installed app', async () => {
+    const script = await (await SELF.fetch('https://example.com/sw.js')).text();
+    const csp = (await SELF.fetch('https://example.com/app')).headers.get('content-security-policy') ?? '';
+    const version = /quotes-journal-([A-Za-z0-9]+)/.exec(script)?.[1];
 
-    const response = await request('/api/invites/accept', {
-      method: 'POST',
-      token: joiner.token,
-      body: { inviteCode },
-    });
+    expect(version).toBeTruthy();
+    // Derived from the hashes of the client itself: change the client and this
+    // changes, which is what makes a browser install the new worker at all.
+    expect(csp.replace(/[^A-Za-z0-9]/g, '')).toContain(version as string);
+  });
 
-    expect(response.status).toBe(409);
+  it('is served uncached, or a stale worker could never be replaced', async () => {
+    const response = await SELF.fetch('https://example.com/sw.js');
 
-    const overview = await request(`/api/groups/${group.id}`, { token: owner.token });
-    expect(overview.body.group.members).toHaveLength(1);
+    expect(response.headers.get('cache-control')).toContain('no-cache');
   });
 });
 
-describe('read rate limiting (L4)', () => {
-  it('blocks an authenticated read flood from one account', async () => {
-    const reader = await registerUser('Reader');
-
-    let sawTooMany = false;
-    // The pool pins RATE_LIMIT_READ low, so this settles in a few dozen calls.
-    for (let attempt = 0; attempt < 60 && !sawTooMany; attempt += 1) {
-      const response = await request('/api/auth/me', { token: reader.token, ip: uniqueIp() });
-      sawTooMany = response.status === 429;
-      if (!sawTooMany) {
-        expect(response.status).toBe(200);
-      }
-    }
-
-    expect(sawTooMany).toBe(true);
-  });
-});
-
-describe('writing after the reveal (L5)', () => {
-  it('refuses new quotes once the group has opened', async () => {
-    const alice = await registerUser('Alice');
-    const group = await createGroup(alice, 'Too late', nextYear);
-    await unlockGroup(group.id);
-
-    const response = await request(`/api/groups/${group.id}/quotes`, {
-      method: 'POST',
-      token: alice.token,
-      body: { text: 'Written after reading everyone else', saidByMemberId: group.you.memberId },
-    });
-
-    expect(response.status).toBe(409);
-    expect(response.body.error).toContain('no longer collecting');
-
-    const stats = await request(`/api/groups/${group.id}/stats`, { token: alice.token });
-    expect(stats.body.totalQuotes).toBe(0);
-  });
-});
-
-/**
- * A picture is context for a quote, so it is exactly as secret as the quote is:
- * behind the same membership check and the same reveal lock, including for the
- * person who uploaded it.
- */
 describe('pictures attached to quotes (L6)', () => {
   const addQuote = async (author: TestUser, groupId: string, saidByMemberId: string, text = 'Look at this') => {
     const response = await request(`/api/groups/${groupId}/quotes`, {

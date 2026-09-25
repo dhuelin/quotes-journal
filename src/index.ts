@@ -3,6 +3,7 @@ import { GroupStore } from './group-store';
 import { UserStore } from './user-store';
 import { RateLimiter, type RateLimitDecision } from './rate-limiter';
 import { renderAppHtml, renderPrivacyHtml } from './ui';
+import { policies } from './csp';
 import { LIMITS } from './domain';
 import {
   createInviteCode,
@@ -239,8 +240,85 @@ const appManifest = {
   ],
 };
 
-const serviceWorkerScript = `self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));`;
+/**
+ * The service worker, which until now registered and did nothing at all: it had
+ * no fetch handler, so an installed app was a shortcut that failed exactly like
+ * the browser would.
+ *
+ * `version` is a fingerprint of the client. It names the cache, so a deploy that
+ * changes the client changes this text — and a byte-different service worker is
+ * the only thing that makes a browser install a new one and drop the old cache.
+ * A version baked in by hand is the usual way an offline app gets stuck showing
+ * a build from months ago.
+ *
+ * What is deliberately never cached: anything under /api. Quotes, pictures and
+ * the account itself are read with a bearer token, and a copy in Cache Storage
+ * would outlive signing out — readable by whoever picks up the device next, and
+ * for a group still under its reveal lock, readable early. The saving would be
+ * a round trip; the cost would be the one guarantee this app makes.
+ */
+const serviceWorker = (version: string): string => `const CACHE = 'quotes-journal-${version}';
+const SHELL = '/app';
+const PRECACHE = [SHELL, '/icon.svg', '/manifest.webmanifest'];
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(PRECACHE)).then(() => self.skipWaiting()));
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches
+      .keys()
+      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key))))
+      .then(() => self.clients.claim()),
+  );
+});
+
+/** Refreshes the cached copy in the background; failure is simply offline. */
+const revalidate = (request, key) =>
+  fetch(request)
+    .then((response) => {
+      if (response && response.ok) {
+        caches.open(CACHE).then((cache) => cache.put(key, response.clone()));
+      }
+      return response;
+    })
+    .catch(() => null);
+
+self.addEventListener('fetch', (event) => {
+  const request = event.request;
+  const url = new URL(request.url);
+
+  if (request.method !== 'GET' || url.origin !== self.location.origin) {
+    return;
+  }
+
+  // Never cached, and never served from a cache: see above.
+  if (url.pathname.startsWith('/api/')) {
+    return;
+  }
+
+  // Every in-app path is served the same shell, so one cached copy answers all
+  // of them — including a deep link to a group opened with no connection.
+  if (request.mode === 'navigate') {
+    event.respondWith(
+      caches.match(SHELL).then((cached) => {
+        const fresh = revalidate(new Request(SHELL), SHELL);
+        return cached || fresh.then((response) => response || Response.error());
+      }),
+    );
+    return;
+  }
+
+  if (PRECACHE.indexOf(url.pathname) !== -1) {
+    event.respondWith(
+      caches.match(url.pathname).then((cached) => {
+        const fresh = revalidate(request, url.pathname);
+        return cached || fresh.then((response) => response || Response.error());
+      }),
+    );
+  }
+});`;
 
 const appIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Quotes Journal">
   <rect width="256" height="256" fill="#0f1020"/>
@@ -248,33 +326,16 @@ const appIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" r
 </svg>`;
 
 /**
- * The client is one inline `<script>` and one inline `<style>`, so the policy is
- * carried by a nonce minted per response and injected into both tags — cleaner
- * than keeping hashes in step with the markup. Everything else is denied:
- * nothing here loads a third-party origin.
+ * The app shell, served with a policy that names its inline style and script by
+ * content hash. Identical on every response, which is what lets the service
+ * worker keep a copy and open the app with no connection.
  */
-const htmlResponse = (render: (nonce: string) => string = renderAppHtml): Response => {
-  const nonce = crypto.randomUUID().replaceAll('-', '');
-  const policy = [
-    "default-src 'none'",
-    `script-src 'nonce-${nonce}'`,
-    `style-src 'nonce-${nonce}'`,
-    "connect-src 'self'",
-    // blob: covers both halves of the picture feature: the local preview before
-    // a quote is saved, and the revealed picture, which is fetched with the
-    // bearer token and turned into an object URL rather than being addressed by
-    // a URL that would have to carry a credential.
-    "img-src 'self' data: blob:",
-    "manifest-src 'self'",
-    // The app registers /sw.js; without this it would fall back to script-src
-    // and the service worker would be blocked by its own nonce policy.
-    "worker-src 'self'",
-    "base-uri 'none'",
-    "form-action 'none'",
-    "frame-ancestors 'none'",
-  ].join('; ');
-
-  return new Response(render(nonce), {
+const htmlResponse = async (
+  body: string,
+  policy: string,
+  extra: Record<string, string> = {},
+): Promise<Response> =>
+  new Response(body, {
     headers: {
       'content-type': 'text/html; charset=utf-8',
       'content-security-policy': policy,
@@ -282,23 +343,28 @@ const htmlResponse = (render: (nonce: string) => string = renderAppHtml): Respon
       'referrer-policy': 'no-referrer',
       'x-frame-options': 'DENY',
       'strict-transport-security': 'max-age=31536000; includeSubDomains',
+      // Revalidated rather than held: the service worker is what serves this
+      // instantly, and it refreshes its copy in the background.
+      'cache-control': 'no-cache',
+      ...extra,
     },
   });
-};
 
-app.get('/', () => htmlResponse());
-app.get('/app', () => htmlResponse());
-app.get('/join', () => htmlResponse());
+const appShell = async (): Promise<Response> => htmlResponse(renderAppHtml(), (await policies()).app);
+
+app.get('/', () => appShell());
+app.get('/app', () => appShell());
+app.get('/join', () => appShell());
 // Both app stores require a reachable privacy policy URL in the listing.
-app.get('/privacy', () => htmlResponse(renderPrivacyHtml));
+app.get('/privacy', async () => htmlResponse(renderPrivacyHtml(), (await policies()).privacy));
 app.get('/manifest.webmanifest', (c) =>
   c.body(JSON.stringify(appManifest), 200, {
     'content-type': 'application/manifest+json; charset=utf-8',
     'x-content-type-options': 'nosniff',
   }),
 );
-app.get('/sw.js', (c) =>
-  c.body(serviceWorkerScript, 200, {
+app.get('/sw.js', async (c) =>
+  c.body(serviceWorker((await policies()).version), 200, {
     'content-type': 'application/javascript; charset=utf-8',
     'cache-control': 'no-cache',
     'x-content-type-options': 'nosniff',
@@ -717,7 +783,7 @@ app.notFound((c) => {
   // paths keep answering JSON so clients can still parse the failure.
   const wantsHtml = (c.req.header('accept') ?? '').includes('text/html');
   if (wantsHtml && !c.req.path.startsWith('/api/')) {
-    return htmlResponse();
+    return appShell();
   }
 
   return jsonError('Not found', 404);
