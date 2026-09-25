@@ -225,6 +225,22 @@ export class GroupStore {
       return jsonResponse(buildStats(group));
     }
 
+    if (url.pathname === '/leave' && request.method === 'POST') {
+      return this.leave(group, member);
+    }
+
+    if (url.pathname === '/rename' && request.method === 'POST') {
+      return member.role === 'owner'
+        ? this.renameGroup(request, group, member)
+        : jsonResponse({ error: 'Only the group owner can rename the group' }, 403);
+    }
+
+    if (url.pathname === '/members/transfer' && request.method === 'POST') {
+      return member.role === 'owner'
+        ? this.transferOwnership(request, group, member)
+        : jsonResponse({ error: 'Only the group owner can hand the group over' }, 403);
+    }
+
     if (url.pathname === '/reveal' && request.method === 'POST') {
       return member.role === 'owner'
         ? this.moveReveal(request, group, member)
@@ -876,6 +892,91 @@ export class GroupStore {
 
     group.revealAt = body.value.revealAt;
     group.revealMovedAt = new Date().toISOString();
+    await this.ctx.storage.put('group', group);
+    return jsonResponse({ group: this.overview(group, owner) });
+  }
+
+  /**
+   * Leaves the group, keeping the member row as a tombstone.
+   *
+   * Deleting the row is not an option: quotes point at it, and the group's
+   * history should not develop holes because somebody left. So the row stays
+   * with its name and every quote it appears in, and only the link to the
+   * account is cut — which is what membership is checked against, so access
+   * ends immediately. The effect is the same as a guest the owner added by
+   * name, which is a shape this group already understands.
+   *
+   * The owner cannot leave while they are the owner: a group with nobody able
+   * to manage members or rotate the invite is a group nobody can repair. They
+   * hand it over first.
+   */
+  private async leave(group: GroupState, member: Member): Promise<Response> {
+    if (member.role === 'owner') {
+      return jsonResponse(
+        {
+          error: 'Hand the group over to someone else before you leave it',
+          needsTransfer: true,
+        },
+        409,
+      );
+    }
+
+    member.userId = null;
+    member.leftAt = new Date().toISOString();
+    await this.ctx.storage.put('group', group);
+    // Their round is keyed on a row they can no longer reach.
+    await this.ctx.storage.delete(quizKey(member.id));
+    await this.ctx.storage.delete(quizBestKey(member.id));
+
+    return jsonResponse({ left: true });
+  }
+
+  /** Owner-only. The account list caches this name; see `/groups/touch`. */
+  private async renameGroup(request: Request, group: GroupState, owner: Member): Promise<Response> {
+    const body = await readJsonBody(request);
+    if (!body.ok) {
+      return jsonResponse({ error: body.error }, 400);
+    }
+
+    const name = validateText(body.value.name, 'Group name', LIMITS.groupName);
+    if (!name.ok) {
+      return jsonResponse({ error: name.error }, 400);
+    }
+
+    group.name = name.value;
+    await this.ctx.storage.put('group', group);
+    return jsonResponse({ group: this.overview(group, owner) });
+  }
+
+  /**
+   * Hands the group to another member who has an account. The outgoing owner
+   * stays as an ordinary member rather than being removed — they are in the
+   * quotes, and this is a handover, not an exit.
+   */
+  private async transferOwnership(request: Request, group: GroupState, owner: Member): Promise<Response> {
+    const body = await readJsonBody(request);
+    if (!body.ok) {
+      return jsonResponse({ error: body.error }, 400);
+    }
+
+    const target = group.members.find((entry) => entry.id === body.value.memberId);
+    if (!target) {
+      return jsonResponse({ error: 'That member is not part of this group' }, 404);
+    }
+
+    if (target.id === owner.id) {
+      return jsonResponse({ error: 'You already own this group' }, 409);
+    }
+
+    // A guest has no account to sign in with, so handing them the group would
+    // leave it ownerless in practice.
+    if (target.userId === null) {
+      return jsonResponse({ error: 'Only someone who has joined with an account can take the group over' }, 409);
+    }
+
+    target.role = 'owner';
+    owner.role = 'member';
+    group.ownerUserId = target.userId;
     await this.ctx.storage.put('group', group);
     return jsonResponse({ group: this.overview(group, owner) });
   }

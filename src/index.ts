@@ -420,6 +420,7 @@ app.use('/api/groups', requireUser);
 app.use('/api/groups/*', requireUser);
 app.use('/api/invites/*', requireUser);
 app.use('/api/auth/me', requireUser);
+app.use('/api/account/*', requireUser);
 
 app.post('/api/auth/register', async (c) => {
   const secret = requireSecret(c.env);
@@ -613,9 +614,27 @@ app.post('/api/groups', async (c) => {
   return passThrough(response);
 });
 
-app.get('/api/groups/:groupId', async (c) =>
-  passThrough(await callGroupStore(c.env, c.req.param('groupId'), '/group', c.get('user'))),
-);
+/**
+ * Opening a group is also when its cached name on the account is refreshed —
+ * see `/groups/touch` in the account object for why it heals rather than being
+ * pushed (#9). The write only happens when the cache is actually stale.
+ */
+app.get('/api/groups/:groupId', async (c) => {
+  const user = c.get('user');
+  const response = await callGroupStore(c.env, c.req.param('groupId'), '/group', user);
+  if (!response.ok) {
+    return passThrough(response);
+  }
+
+  const payload = (await response.json()) as { group: { id: string; name: string; revealYear: number } };
+  await callUserStore(c.env, user.email, '/groups/touch', {
+    groupId: payload.group.id,
+    name: payload.group.name,
+    revealYear: payload.group.revealYear,
+  });
+
+  return c.json(payload);
+});
 
 app.get('/api/groups/:groupId/quotes', async (c) =>
   passThrough(await callGroupStore(c.env, c.req.param('groupId'), '/quotes', c.get('user'))),
@@ -655,6 +674,84 @@ app.post('/api/groups/:groupId/reveal', async (c) => {
   return passThrough(
     await callGroupStore(c.env, c.req.param('groupId'), '/reveal', user, 'POST', { revealAt: picked.value }),
   );
+});
+
+app.post('/api/groups/:groupId/members/transfer', (c) => forwardWrite(c, '/members/transfer'));
+
+/** Owner-only. The owner's own cached name is corrected here; others heal on open. */
+app.post('/api/groups/:groupId/rename', async (c) => {
+  const user = c.get('user');
+  const renamed = await forwardWrite(c, '/rename');
+  if (!renamed.ok) {
+    return renamed;
+  }
+
+  const payload = (await renamed.json()) as { group: { id: string; name: string; revealYear: number } };
+  await callUserStore(c.env, user.email, '/groups/touch', {
+    groupId: payload.group.id,
+    name: payload.group.name,
+    revealYear: payload.group.revealYear,
+  });
+
+  return c.json(payload);
+});
+
+/**
+ * Leaves a group. The member row stays behind as a tombstone so the quotes they
+ * appear in keep working; the account forgets the group so it leaves their list.
+ */
+app.post('/api/groups/:groupId/leave', async (c) => {
+  const user = c.get('user');
+  const groupId = c.req.param('groupId');
+  const left = await forwardWrite(c, '/leave');
+  if (!left.ok) {
+    return left;
+  }
+
+  await callUserStore(c.env, user.email, '/groups/forget', { groupId });
+  return c.json({ left: true });
+});
+
+/**
+ * Changes the display name. It is the name used for new groups and shown on the
+ * account; the name inside a group stays as it is, because a group's names have
+ * to be unique within it and a silent bulk rename could collide with someone
+ * else's. Renaming inside a group is the owner's existing control.
+ */
+app.post('/api/account/display-name', async (c) => {
+  const user = c.get('user');
+  const { limit, windowMs } = writeLimit(c.env);
+  const decision = await checkRateLimit(c.env, `write:${user.id}`, limit, windowMs);
+  if (!decision.allowed) {
+    return tooManyRequests(decision);
+  }
+
+  const body = await readJsonBody(c.req.raw);
+  if (!body.ok) {
+    return jsonError(body.error, 400);
+  }
+
+  const displayName = validateText(body.value.displayName, 'Display name', LIMITS.displayName, { minLength: 2 });
+  if (!displayName.ok) {
+    return jsonError(displayName.error, 400);
+  }
+
+  const secret = requireSecret(c.env);
+  if (!secret) {
+    return jsonError('Authentication is not configured on this deployment', 503);
+  }
+
+  const response = await callUserStore(c.env, user.email, '/display-name', { displayName: displayName.value });
+  if (!response.ok) {
+    return passThrough(response);
+  }
+
+  // The session token carries the display name, and it is what names the
+  // creator of a group or the joiner of one. Without a fresh token the new name
+  // would not reach either until the next sign-in.
+  const updated = (await response.json()) as { user: SessionUser };
+  const token = await createSessionToken(secret, updated.user);
+  return c.json({ token, user: updated.user });
 });
 
 app.post('/api/groups/:groupId/quiz/start', (c) => forwardWrite(c, '/quiz/start'));

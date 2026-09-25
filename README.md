@@ -105,6 +105,33 @@ the group value. That value is read and rewritten on every write and has a hard
 only the picture's size and type live there. R2 would be the natural home if
 this grows, and is not used today because R2 is not enabled on the account.
 
+### Settings, and leaving a group
+
+An account can change its display name. That name is what you are called on new
+groups and on the account itself; it does **not** rename you inside groups you
+are already in, because names have to stay unique within a group and a silent
+bulk rename could collide with somebody else's. Renaming inside a group is the
+owner's existing control. Changing the name issues a fresh session token, since
+the old one carries the old name and is what names the creator of a group.
+
+**Leaving keeps the member row as a tombstone.** Deleting it is not an option —
+quotes point at it, and a group's history should not develop holes because
+someone left. The row keeps its name and every quote it appears in; only the
+link to the account is cut, which is what membership is checked against, so
+access ends at once. The effect is a guest added by name, a shape the group
+already understands.
+
+The **owner cannot leave** while they own the group: one with nobody able to
+manage members or rotate the invite is one nobody can repair. They hand it over
+first, to a member with an account — a guest has no way to sign in — and stay on
+as an ordinary member, because a handover is not an exit.
+
+A group rename updates the owner's cached list immediately. Every other member's
+heals the next time they open the group ([#9](https://github.com/dhuelin/quotes-journal/issues/9)):
+the group object stores account ids, not addresses, and the account objects are
+keyed by address, so it cannot push. Putting every member's email inside the
+group value to make a push possible is a poor trade for a cached label.
+
 ### Conversations
 
 A quote is either a single remark or an exchange of up to ten lines, each with
@@ -292,6 +319,7 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | `POST` | `/api/auth/register` | `{ displayName, email, password }` → `{ token, user }` |
 | `POST` | `/api/auth/login` | `{ email, password }` → `{ token, user }` |
 | `GET` | `/api/auth/me` | the account and the groups it belongs to |
+| `POST` | `/api/account/display-name` | `{ displayName }` → a fresh `{ token, user }` |
 | `GET` | `/api/groups` | groups you belong to |
 | `POST` | `/api/groups` | `{ name, revealYear, revealAt? }`; the creator becomes owner |
 | `GET` | `/api/groups/:groupId` | members, your role, and progress while locked |
@@ -310,6 +338,9 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | `GET` | `/api/groups/:groupId/quiz/scores` | every member's best round |
 | `GET` | `/api/groups/:groupId/stats` | `423` until the reveal |
 | `GET` | `/api/groups/:groupId/invite` | current invite code; the client builds the link |
+| `POST` | `/api/groups/:groupId/rename` | `{ name }`; owner only |
+| `POST` | `/api/groups/:groupId/leave` | keeps your member row; owners must hand over first |
+| `POST` | `/api/groups/:groupId/members/transfer` | `{ memberId }`; owner only, account holders only |
 | `POST` | `/api/groups/:groupId/reveal` | `{ revealAt }`; owner only, later only, refused once open |
 | `POST` | `/api/groups/:groupId/invite/rotate` | owner only; invalidates old links |
 | `POST` | `/api/invites/accept` | `{ inviteCode, memberName? }`; `410` if expired or rotated |
@@ -328,7 +359,5 @@ Tracked in [the issue tracker](https://github.com/dhuelin/quotes-journal/issues)
 - [#6](https://github.com/dhuelin/quotes-journal/issues/6) session revocation and password reset
 - [#7](https://github.com/dhuelin/quotes-journal/issues/7) persist the mobile session across restarts
 - [#8](https://github.com/dhuelin/quotes-journal/issues/8) store submission setup for the mobile app
-- [#9](https://github.com/dhuelin/quotes-journal/issues/9) keep the cached group name on an account in sync
-- [#17](https://github.com/dhuelin/quotes-journal/issues/17) settings pages for accounts and groups
 - [#19](https://github.com/dhuelin/quotes-journal/issues/19) publishing to the app stores (low priority)
 - [#20](https://github.com/dhuelin/quotes-journal/issues/20) the Flutter client shows no quote pictures

@@ -321,6 +321,17 @@ describe('the inlined client under CSP', () => {
     expect(renderAppHtml()).toContain("id=\"quote-count-'");
   });
 
+  it('emits a script the browser can actually parse', async () => {
+    const { appInline } = await import('../src/ui');
+
+    // The strongest guard available at this layer, and the one that earns its
+    // keep: this file is a template literal, so a backtick ends it early and a
+    // backslash is eaten before the browser ever sees it — turning an escaped
+    // apostrophe into an unterminated string. Both have happened. Neither is
+    // visible in the HTML, and both ship a client that does not run at all.
+    expect(() => new Function(appInline.script)).not.toThrow();
+  });
+
   it('carries no backtick or interpolation into the inlined blocks', async () => {
     const { appInline, privacyInline } = await import('../src/ui');
 

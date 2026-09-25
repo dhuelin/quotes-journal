@@ -240,6 +240,8 @@ const appScript = `
           pendingInvite: readInviteFromLocation(),
           /** The shrunk, re-encoded photo waiting to go up with the next quote. */
           pendingImage: null,
+          /** 'settings' when the settings page is open, otherwise null. */
+          view: null,
           /** How many lines the quote form is showing. One is the common case. */
           lineCount: 1,
           /** The round in progress, if the quiz tab is being played. */
@@ -448,6 +450,49 @@ const appScript = `
           );
         }
 
+        function settingsView() {
+          var groups = state.groups
+            .map(function (group) {
+              return (
+                '<li><span>' + escapeHtml(group.name) +
+                '<div class="small muted">' + escapeHtml(group.role) + '</div></span>' +
+                (group.role === 'owner'
+                  ? '<span class="pill">you own this</span>'
+                  : '<button class="link" data-leave-group="' + escapeHtml(group.groupId) + '">Leave</button>') +
+                '</li>'
+              );
+            })
+            .join('');
+
+          return (
+            headerHtml() +
+            '<button class="link" id="back-to-groups">&larr; All groups</button>' +
+            '<h1 class="group-title">Settings</h1>' +
+            noticeHtml() +
+            '<div class="card">' +
+            '<h2>Your name</h2>' +
+            '<p class="small muted">Shown next to your quotes, and used when you create or join a group from now on. It does not rename you inside groups you are already in &mdash; names have to stay unique within a group, so that is the owner&rsquo;s control.</p>' +
+            '<form id="display-name-form">' +
+            '<label for="display-name">Display name</label>' +
+            '<input id="display-name" name="displayName" required value="' + escapeHtml(state.user ? state.user.displayName : '') + '" />' +
+            '<button type="submit">Save name</button>' +
+            '</form>' +
+            '</div>' +
+            '<div class="card">' +
+            '<h2>Your groups</h2>' +
+            (groups
+              ? '<ul class="list">' + groups + '</ul>' +
+                '<p class="small muted">Leaving keeps your name on the quotes you are already in &mdash; the group&rsquo;s history should not develop holes because you left &mdash; but you lose access to it. To leave a group you own, hand it to someone else first.</p>'
+              : '<p class="muted">You are not in any groups yet.</p>') +
+            '</div>' +
+            '<div class="card">' +
+            '<h2>Your account</h2>' +
+            '<p class="small muted">Signed in as ' + escapeHtml(state.user ? state.user.email : '') + '.</p>' +
+            '<p class="small muted">Changing your password and deleting your account are not built yet.</p>' +
+            '</div>'
+          );
+        }
+
         function groupsView() {
           var items = state.groups
             .map(function (group) {
@@ -507,7 +552,7 @@ const appScript = `
             '<header class="bar">' +
             '<div class="brand"><span class="mark">&#8220;&#8221;</span> Quotes Journal</div>' +
             '<div class="small muted">' +
-            escapeHtml(state.user ? state.user.displayName : '') +
+            '<button class="link" id="open-settings">' + escapeHtml(state.user ? state.user.displayName : '') + '</button>' +
             ' &middot; <button class="link" id="sign-out">Sign out</button></div>' +
             '</header>'
           );
@@ -638,6 +683,15 @@ const appScript = `
 
         function membersTab() {
           var group = state.group;
+          // Only someone with an account can take a group on; a guest has no
+          // way to sign in and manage it.
+          var handoverOptions = group.members
+            .filter(function (member) { return !member.isYou && !member.isGuest; })
+            .map(function (member) {
+              return '<option value="' + escapeHtml(member.id) + '">' + escapeHtml(member.name) + '</option>';
+            })
+            .join('');
+
           var items = group.members
             .map(function (member) {
               return (
@@ -661,6 +715,24 @@ const appScript = `
                 '<p class="small muted">Rotating makes every previously shared link stop working.</p>'
               : '') +
             '</div>' +
+            (group.you.role === 'owner'
+              ? '<div class="card">' +
+                '<h2>Group settings</h2>' +
+                '<form id="group-rename-form">' +
+                '<label for="group-rename">Group name</label>' +
+                '<input id="group-rename" name="name" required value="' + escapeHtml(group.name) + '" />' +
+                '<button class="secondary" type="submit">Rename group</button>' +
+                '</form>' +
+                (handoverOptions
+                  ? '<form id="transfer-form">' +
+                    '<label for="transfer-to">Hand the group over</label>' +
+                    '<select id="transfer-to" name="memberId">' + handoverOptions + '</select>' +
+                    '<p class="small muted">They become the owner and you stay a member. You cannot leave a group you own until you have.</p>' +
+                    '<button class="secondary" type="submit">Hand over</button>' +
+                    '</form>'
+                  : '') +
+                '</div>'
+              : '') +
             (group.you.role === 'owner' && group.locked
               ? '<div class="card">' +
                 '<h2>The reveal date</h2>' +
@@ -954,6 +1026,8 @@ const appScript = `
 
           if (!state.token) {
             app.innerHTML = authView();
+          } else if (state.view === 'settings') {
+            app.innerHTML = settingsView();
           } else if (state.group) {
             app.innerHTML = groupView();
           } else {
@@ -1029,8 +1103,48 @@ const appScript = `
           });
 
           onClick('sign-out', function () { signOut(); });
+
+          onClick('open-settings', function () {
+            state.view = 'settings';
+            state.group = null;
+            history.pushState({}, '', '/settings');
+            render();
+          });
+
+          onSubmit('display-name-form', async function (form) {
+            var result = await api('/api/account/display-name', {
+              method: 'POST',
+              body: { displayName: form.displayName.value },
+            });
+            // The token carries the name, so the new one replaces the old.
+            state.token = result.token;
+            state.user = result.user;
+            localStorage.setItem(TOKEN_KEY, result.token);
+            notify('Your name was changed.', 'ok');
+            render();
+          });
+
+          document.querySelectorAll('[data-leave-group]').forEach(function (button) {
+            button.addEventListener('click', async function () {
+              var groupId = button.getAttribute('data-leave-group');
+              var group = state.groups.filter(function (entry) { return entry.groupId === groupId; })[0];
+              if (!confirm('Leave ' + (group ? group.name : 'this group') + '? Your name stays on the quotes you are already in, but you lose access.')) {
+                return;
+              }
+
+              try {
+                await api('/api/groups/' + encodeURIComponent(groupId) + '/leave', { method: 'POST', body: {} });
+                await loadGroups();
+                notify('You left the group.', 'ok');
+              } catch (error) {
+                notify(error.message, 'error');
+              }
+              render();
+            });
+          });
           onClick('back-to-groups', function () {
             state.group = null;
+            state.view = null;
             state.reveal = null;
             state.pendingImage = null;
             state.quiz = null;
@@ -1144,6 +1258,30 @@ const appScript = `
                 : 'You are already a member of ' + joined.body.group.name + '.',
               'ok',
             );
+            render();
+          });
+
+          onSubmit('group-rename-form', async function (form) {
+            await api('/api/groups/' + encodeURIComponent(state.group.id) + '/rename', {
+              method: 'POST',
+              body: { name: form.name.value },
+            });
+            await loadGroups();
+            await openGroup(state.group.id, 'members');
+            notify('The group was renamed.', 'ok');
+            render();
+          });
+
+          onSubmit('transfer-form', async function (form) {
+            if (!confirm('Hand this group over? You stay a member, but they become the owner.')) {
+              return;
+            }
+            await api('/api/groups/' + encodeURIComponent(state.group.id) + '/members/transfer', {
+              method: 'POST',
+              body: { memberId: form.memberId.value },
+            });
+            await openGroup(state.group.id, 'members');
+            notify('The group has a new owner.', 'ok');
             render();
           });
 
@@ -1731,6 +1869,9 @@ const appScript = `
         // backslash in a regex here is eaten before the browser ever sees it.
         function locationTarget() {
           var parts = location.pathname.split('/').filter(Boolean);
+          if (parts[0] === 'settings') {
+            return { settings: true };
+          }
           if (parts[0] !== 'groups' || !parts[1]) {
             return null;
           }
@@ -1758,6 +1899,7 @@ const appScript = `
               state.quizScores = null;
             }
             state.group = result.group;
+            state.view = null;
             state.tab = tab || defaultTab(result.group);
             state.reveal = null;
 
@@ -1803,12 +1945,21 @@ const appScript = `
             return;
           }
 
+          if (target && target.settings) {
+            state.view = 'settings';
+            state.group = null;
+            render();
+            return;
+          }
+
           if (target) {
+            state.view = null;
             openGroup(target.groupId, target.tab, { fromHistory: true });
             return;
           }
 
           state.group = null;
+          state.view = null;
           state.reveal = null;
           render();
         });
@@ -1833,6 +1984,12 @@ const appScript = `
           }
 
           var target = locationTarget();
+          if (target && target.settings) {
+            state.view = 'settings';
+            render();
+            return;
+          }
+
           if (target) {
             await openGroup(target.groupId, target.tab, { fromHistory: true });
             return;

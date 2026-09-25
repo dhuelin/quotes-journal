@@ -1977,3 +1977,153 @@ describe('conversations (L10)', () => {
     expect(stats.body.saidBy[members[1].id]).toBe(1);
   });
 });
+
+/** Account and group settings: the name, the group list, and the way out. */
+describe('settings (L11)', () => {
+  it('changes the display name and hands back a token that carries it', async () => {
+    const alice = await registerUser('Alice');
+
+    const renamed = await request('/api/account/display-name', {
+      method: 'POST',
+      token: alice.token,
+      body: { displayName: 'Alicia' },
+    });
+
+    expect(renamed.status).toBe(200);
+    expect(renamed.body.user.displayName).toBe('Alicia');
+    expect(renamed.body.token).toBeTruthy();
+
+    // The token names the creator of a group. Without a fresh one the new name
+    // would not reach a group made straight afterwards.
+    const group = await createGroup({ ...alice, token: renamed.body.token }, 'After the rename', nextYear);
+    expect(group.members[0].name).toBe('Alicia');
+  });
+
+  it('leaves the member row behind, so quotes about someone who left still read', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Leavers', nextYear);
+    await joinGroup(alice, bob, group.id);
+
+    const fresh = await request(`/api/groups/${group.id}`, { token: alice.token });
+    const bobMember = (fresh.body.group.members as { id: string; name: string }[]).find((m) => m.name === 'Bob')!;
+
+    await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { text: 'Something Bob said', saidByMemberId: bobMember.id },
+    });
+
+    const left = await request(`/api/groups/${group.id}/leave`, { method: 'POST', token: bob.token, body: {} });
+    expect(left.status).toBe(200);
+
+    // Access ends immediately, and the group is off his list.
+    const denied = await request(`/api/groups/${group.id}`, { token: bob.token });
+    expect(denied.status).toBe(404);
+    const account = await request('/api/auth/me', { token: bob.token });
+    expect(account.body.groups).toHaveLength(0);
+
+    // The history does not develop a hole. Bob is still on the quote.
+    await unlockGroup(group.id);
+    const stats = await request(`/api/groups/${group.id}/stats`, { token: alice.token });
+    expect(stats.body.leaderboard.find((entry: { name: string }) => entry.name === 'Bob')).toMatchObject({ said: 1 });
+
+    const quotes = await request(`/api/groups/${group.id}/quotes`, { token: alice.token });
+    expect(quotes.body.quotes[0].saidByMemberId).toBe(bobMember.id);
+  });
+
+  it('will not let the owner leave a group nobody could then manage', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Ownerless', nextYear);
+
+    const response = await request(`/api/groups/${group.id}/leave`, { method: 'POST', token: alice.token, body: {} });
+
+    expect(response.status).toBe(409);
+    expect(response.body.needsTransfer).toBe(true);
+  });
+
+  it('hands the group over, and then the old owner can leave', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Handover', nextYear);
+    await joinGroup(alice, bob, group.id);
+
+    const fresh = await request(`/api/groups/${group.id}`, { token: alice.token });
+    const bobMember = (fresh.body.group.members as { id: string; name: string }[]).find((m) => m.name === 'Bob')!;
+
+    const handed = await request(`/api/groups/${group.id}/members/transfer`, {
+      method: 'POST',
+      token: alice.token,
+      body: { memberId: bobMember.id },
+    });
+    expect(handed.status).toBe(200);
+    // The outgoing owner stays a member: this is a handover, not an exit.
+    expect(handed.body.group.you.role).toBe('member');
+
+    const asBob = await request(`/api/groups/${group.id}`, { token: bob.token });
+    expect(asBob.body.group.you.role).toBe('owner');
+
+    const left = await request(`/api/groups/${group.id}/leave`, { method: 'POST', token: alice.token, body: {} });
+    expect(left.status).toBe(200);
+  });
+
+  it('refuses to hand a group to a guest, who has no account to sign in with', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'No guests', nextYear);
+    const guest = await request(`/api/groups/${group.id}/members`, {
+      method: 'POST',
+      token: alice.token,
+      body: { name: 'Cleo' },
+    });
+
+    const response = await request(`/api/groups/${group.id}/members/transfer`, {
+      method: 'POST',
+      token: alice.token,
+      body: { memberId: guest.body.member.id },
+    });
+
+    expect(response.status).toBe(409);
+  });
+
+  it('renames a group, and the stale cached name heals when a member opens it (#9)', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Old name', nextYear);
+    await joinGroup(alice, bob, group.id);
+
+    const renamed = await request(`/api/groups/${group.id}/rename`, {
+      method: 'POST',
+      token: alice.token,
+      body: { name: 'New name' },
+    });
+    expect(renamed.status).toBe(200);
+
+    // The owner's own list is right straight away.
+    const ownerList = await request('/api/auth/me', { token: alice.token });
+    expect(ownerList.body.groups[0].name).toBe('New name');
+
+    // Bob's is stale until he looks at the group, and then it is not.
+    const staleList = await request('/api/auth/me', { token: bob.token });
+    expect(staleList.body.groups[0].name).toBe('Old name');
+
+    await request(`/api/groups/${group.id}`, { token: bob.token });
+
+    const healed = await request('/api/auth/me', { token: bob.token });
+    expect(healed.body.groups[0].name).toBe('New name');
+  });
+
+  it('lets nobody but the owner rename the group', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Not yours', nextYear);
+    await joinGroup(alice, bob, group.id);
+
+    const response = await request(`/api/groups/${group.id}/rename`, {
+      method: 'POST',
+      token: bob.token,
+      body: { name: 'Mine now' },
+    });
+
+    expect(response.status).toBe(403);
+  });
+});

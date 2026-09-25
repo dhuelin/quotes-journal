@@ -166,6 +166,72 @@ export class UserStore {
       return jsonResponse({ groups: user.groups }, 201);
     }
 
+    if (url.pathname === '/display-name' && request.method === 'POST') {
+      const body = await readJsonBody(request);
+      if (!body.ok) {
+        return jsonResponse({ error: body.error }, 400);
+      }
+
+      if (typeof body.value.displayName !== 'string') {
+        return jsonResponse({ error: 'Invalid display name' }, 400);
+      }
+
+      user.displayName = body.value.displayName;
+      await this.ctx.storage.put('user', user);
+      return jsonResponse({ user: publicUser(user) });
+    }
+
+    /**
+     * Drops a group from the account's list. Used both when leaving and when a
+     * group turns out to be unreachable; harmless if it was not there.
+     */
+    if (url.pathname === '/groups/forget' && request.method === 'POST') {
+      const body = await readJsonBody(request);
+      if (!body.ok) {
+        return jsonResponse({ error: body.error }, 400);
+      }
+
+      user.groups = user.groups.filter((group) => group.groupId !== body.value.groupId);
+      await this.ctx.storage.put('user', user);
+      return jsonResponse({ groups: user.groups });
+    }
+
+    /**
+     * Refreshes the cached name of one group (#9).
+     *
+     * The account caches each group's name so the group list needs no fan-out
+     * of reads. A rename makes that cache stale, and the group object cannot
+     * push the new name to the other members — it stores their account ids, not
+     * their addresses, and the account objects are keyed by address. Storing
+     * emails on the group to make a push possible would put every member's
+     * address inside the group value, which is a poor trade for a cached label.
+     *
+     * So it heals instead of pushing: whoever opens the group is holding the
+     * real name, and writes it back to their own account. The owner's list is
+     * correct immediately, everyone else's the next time they look at the group.
+     */
+    if (url.pathname === '/groups/touch' && request.method === 'POST') {
+      const body = await readJsonBody(request);
+      if (!body.ok) {
+        return jsonResponse({ error: body.error }, 400);
+      }
+
+      const { groupId, name, revealYear } = body.value;
+      const cached = user.groups.find((group) => group.groupId === groupId);
+      if (!cached || typeof name !== 'string' || typeof revealYear !== 'number') {
+        return jsonResponse({ groups: user.groups });
+      }
+
+      if (cached.name === name && cached.revealYear === revealYear) {
+        return jsonResponse({ groups: user.groups });
+      }
+
+      cached.name = name;
+      cached.revealYear = revealYear;
+      await this.ctx.storage.put('user', user);
+      return jsonResponse({ groups: user.groups });
+    }
+
     return jsonResponse({ error: 'Not found' }, 404);
   }
 }

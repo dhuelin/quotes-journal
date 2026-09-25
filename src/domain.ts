@@ -12,6 +12,11 @@ export type Member = {
   userId: string | null;
   role: MemberRole;
   joinedAt: string;
+  /**
+   * Set when the member left. The row stays so the quotes they appear in keep
+   * working; only the link to their account is cut, which ends their access.
+   */
+  leftAt?: string;
 };
 
 /**
