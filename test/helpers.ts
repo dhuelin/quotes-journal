@@ -66,6 +66,7 @@ export const createGroup = async (owner: TestUser, name: string, revealYear?: nu
     id: string;
     name: string;
     revealYear: number;
+    revealAt: string;
     locked: boolean;
     you: { memberId: string; role: string };
     members: Array<{ id: string; name: string; isYou: boolean }>;

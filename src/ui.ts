@@ -329,6 +329,37 @@ const appScript = `
           render();
         }
 
+        /**
+         * The picker works in the browser's own zone and the value it produces
+         * is turned into an absolute instant on submit, so what someone picks is
+         * what their group gets. Reading it back uses the viewer's zone, which
+         * is the honest answer to "when does this open for me".
+         */
+        function revealLabel(iso) {
+          var when = new Date(iso);
+          return when.toLocaleString(undefined, {
+            day: 'numeric',
+            month: 'long',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+          });
+        }
+
+        /** What the date field starts on: midnight on 1 January, as it always was. */
+        function defaultRevealLocal() {
+          return localInputValue(new Date(new Date().getUTCFullYear() + 1, 0, 1, 0, 0, 0));
+        }
+
+        /** A Date as a datetime-local field wants it: local time, no zone, no seconds. */
+        function localInputValue(date) {
+          var pad = function (value) { return String(value).padStart(2, '0'); };
+          return (
+            date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) +
+            'T' + pad(date.getHours()) + ':' + pad(date.getMinutes())
+          );
+        }
+
         function daysUntil(iso) {
           var diff = new Date(iso).getTime() - Date.now();
           return Math.max(0, Math.ceil(diff / 86400000));
@@ -435,7 +466,9 @@ const appScript = `
             '<input id="group-name" name="name" required placeholder="Sunday football crew" />' +
             '<label for="group-year">Collect quotes for</label>' +
             '<input id="group-year" name="revealYear" type="number" required value="' + new Date().getUTCFullYear() + '" />' +
-            '<p class="small muted">Everything unlocks on 1 January of the following year.</p>' +
+            '<label for="group-reveal">Open on</label>' +
+            '<input id="group-reveal" name="revealAt" type="datetime-local" required value="' + escapeHtml(defaultRevealLocal()) + '" />' +
+            '<p class="small muted">Your own clock, not UTC. The date can be pushed back later, but never pulled forward &mdash; everyone who records a quote is promised it stays sealed until then.</p>' +
             '<button type="submit">Create group</button>' +
             '</form>' +
             '</div>' +
@@ -501,8 +534,9 @@ const appScript = `
             '<h1 class="group-title">' + escapeHtml(group.name) + '</h1>' +
             '<p class="muted small">' +
             (group.locked
-              ? 'Sealed until 1 January ' + (group.revealYear + 1) + ' &middot; ' + daysUntil(group.revealAt) + ' days to go'
-              : 'Open since 1 January ' + (group.revealYear + 1)) +
+              ? 'Sealed until ' + escapeHtml(revealLabel(group.revealAt)) + ' &middot; ' + daysUntil(group.revealAt) + ' days to go'
+              : 'Open since ' + escapeHtml(revealLabel(group.revealAt))) +
+            (group.revealMovedAt ? ' <span class="pill">date moved</span>' : '') +
             '</p>' +
             noticeHtml() +
             '<div class="tabs" role="tablist">' + tabsHtml + '</div>' +
@@ -581,6 +615,17 @@ const appScript = `
                 '<p class="small muted">Rotating makes every previously shared link stop working.</p>'
               : '') +
             '</div>' +
+            (group.you.role === 'owner' && group.locked
+              ? '<div class="card">' +
+                '<h2>The reveal date</h2>' +
+                '<p class="small muted">Opens ' + escapeHtml(revealLabel(group.revealAt)) + '. You can push this back, but not pull it forward: everyone who has recorded a quote did it on the promise that nobody reads it before then.</p>' +
+                '<form id="reveal-form">' +
+                '<label for="reveal-at">Move it later</label>' +
+                '<input id="reveal-at" name="revealAt" type="datetime-local" required value="' + escapeHtml(localInputValue(new Date(group.revealAt))) + '" />' +
+                '<button class="secondary" type="submit">Postpone the reveal</button>' +
+                '</form>' +
+                '</div>'
+              : '') +
             '<div class="card">' +
             '<h2>Add someone without an account</h2>' +
             '<p class="small muted">Use this for friends who should be quotable but are not using the app.</p>' +
@@ -975,7 +1020,13 @@ const appScript = `
           onSubmit('create-group-form', async function (form) {
             var created = await api('/api/groups', {
               method: 'POST',
-              body: { name: form.name.value, revealYear: Number(form.revealYear.value) },
+              body: {
+                name: form.name.value,
+                revealYear: Number(form.revealYear.value),
+                // A datetime-local value has no zone, so the browser reads it in
+                // its own — which is exactly what the person picking it meant.
+                revealAt: form.revealAt.value ? new Date(form.revealAt.value).toISOString() : undefined,
+              },
             });
             await loadGroups();
             state.group = created.group;
@@ -1002,6 +1053,16 @@ const appScript = `
                 : 'You are already a member of ' + joined.body.group.name + '.',
               'ok',
             );
+            render();
+          });
+
+          onSubmit('reveal-form', async function (form) {
+            await api('/api/groups/' + encodeURIComponent(state.group.id) + '/reveal', {
+              method: 'POST',
+              body: { revealAt: new Date(form.revealAt.value).toISOString() },
+            });
+            await openGroup(state.group.id, 'members');
+            notify('The reveal was moved. Everyone in the group can see the new date.', 'ok');
             render();
           });
 

@@ -14,7 +14,14 @@ import {
   verifySessionToken,
   type SessionUser,
 } from './auth';
-import { readJsonBody, validateEmail, validatePassword, validateRevealYear, validateText } from './validation';
+import {
+  readJsonBody,
+  validateEmail,
+  validatePassword,
+  validateRevealAt,
+  validateRevealYear,
+  validateText,
+} from './validation';
 import { readImageUpload } from './images';
 
 export { GroupStore, UserStore, RateLimiter };
@@ -565,6 +572,17 @@ app.post('/api/groups', async (c) => {
     return jsonError(revealYear.error, 400);
   }
 
+  // Optional: without it the group opens at midnight UTC on 1 January, which is
+  // what every group did before the date was configurable.
+  let revealAt: string | undefined;
+  if (body.value.revealAt !== undefined && body.value.revealAt !== null && body.value.revealAt !== '') {
+    const picked = validateRevealAt(body.value.revealAt);
+    if (!picked.ok) {
+      return jsonError(picked.error, 400);
+    }
+    revealAt = picked.value;
+  }
+
   if (!(await accountHasGroupCapacity(c.env, user))) {
     return jsonError(`You can belong to at most ${LIMITS.groupsPerUser} groups`, 409);
   }
@@ -574,6 +592,7 @@ app.post('/api/groups', async (c) => {
     id: groupId,
     name: name.value,
     revealYear: revealYear.value,
+    revealAt,
   });
 
   if (!response.ok) {
@@ -610,6 +629,33 @@ app.get('/api/groups/:groupId/quiz', async (c) =>
 app.get('/api/groups/:groupId/quiz/scores', async (c) =>
   passThrough(await callGroupStore(c.env, c.req.param('groupId'), '/quiz/scores', c.get('user'))),
 );
+
+/**
+ * Postpones the reveal. Owner-only and later-only, both enforced in the group
+ * object; this validates the instant before it gets there.
+ */
+app.post('/api/groups/:groupId/reveal', async (c) => {
+  const body = await readJsonBody(c.req.raw);
+  if (!body.ok) {
+    return jsonError(body.error, 400);
+  }
+
+  const picked = validateRevealAt(body.value.revealAt);
+  if (!picked.ok) {
+    return jsonError(picked.error, 400);
+  }
+
+  const user = c.get('user');
+  const { limit, windowMs } = writeLimit(c.env);
+  const decision = await checkRateLimit(c.env, `write:${user.id}`, limit, windowMs);
+  if (!decision.allowed) {
+    return tooManyRequests(decision);
+  }
+
+  return passThrough(
+    await callGroupStore(c.env, c.req.param('groupId'), '/reveal', user, 'POST', { revealAt: picked.value }),
+  );
+});
 
 app.post('/api/groups/:groupId/quiz/start', (c) => forwardWrite(c, '/quiz/start'));
 app.post('/api/groups/:groupId/quiz/answer', (c) => forwardWrite(c, '/quiz/answer'));

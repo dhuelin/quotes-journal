@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   areQuotesVisible,
   buildProgress,
+  canMoveReveal,
+  revealInstant,
   buildQuiz,
   QUIZ,
   scoreAnswer,
@@ -58,16 +60,80 @@ const group = (): GroupState => ({
 });
 
 describe('reveal timing', () => {
-  it('locks quotes until the first moment of the following year', () => {
-    expect(areQuotesVisible(2026, new Date('2026-12-31T23:59:59.999Z'))).toBe(false);
-    expect(areQuotesVisible(2026, new Date('2027-01-01T00:00:00.000Z'))).toBe(true);
+  it('locks quotes until the first moment of the following year by default', () => {
+    expect(areQuotesVisible({ revealYear: 2026 }, new Date('2026-12-31T23:59:59.999Z'))).toBe(false);
+    expect(areQuotesVisible({ revealYear: 2026 }, new Date('2027-01-01T00:00:00.000Z'))).toBe(true);
     expect(getRevealAtIso(2026)).toBe('2027-01-01T00:00:00.000Z');
   });
 
   it('handles leap years and far-future years', () => {
     expect(getRevealAtIso(2023)).toBe('2024-01-01T00:00:00.000Z');
     expect(getRevealAtIso(2999)).toBe('3000-01-01T00:00:00.000Z');
-    expect(areQuotesVisible(2024, new Date('2024-12-31T12:00:00.000Z'))).toBe(false);
+    expect(areQuotesVisible({ revealYear: 2024 }, new Date('2024-12-31T12:00:00.000Z'))).toBe(false);
+  });
+
+  it('opens on a chosen instant instead, to the millisecond', () => {
+    // The Christmas-party case: a group that wants to read its quotes on the
+    // 29th rather than waiting for midnight on 1 January.
+    const party = { revealYear: 2026, revealAt: '2026-12-29T19:00:00.000Z' };
+
+    expect(areQuotesVisible(party, new Date('2026-12-29T18:59:59.999Z'))).toBe(false);
+    expect(areQuotesVisible(party, new Date('2026-12-29T19:00:00.000Z'))).toBe(true);
+    // And the default no longer applies, in either direction.
+    expect(areQuotesVisible(party, new Date('2026-12-30T00:00:00.000Z'))).toBe(true);
+  });
+
+  it('leaves a group stored before the date was configurable exactly where it was', () => {
+    // The migration story: there is none, because a group with no instant keeps
+    // deriving the one it has always had. Nothing shifts mid-collection.
+    const legacy = { revealYear: 2026 };
+
+    expect(revealInstant(legacy)).toBe('2027-01-01T00:00:00.000Z');
+    expect(revealInstant({ revealYear: 2026, revealAt: '2026-12-29T19:00:00.000Z' })).toBe(
+      '2026-12-29T19:00:00.000Z',
+    );
+  });
+});
+
+/**
+ * The rule the product rests on. Everyone who recorded a quote did so on the
+ * promise that nobody reads it before a stated moment; pulling that moment
+ * forward breaks a promise they cannot take back.
+ */
+describe('moving the reveal', () => {
+  const sealed = { revealYear: 2026, revealAt: '2026-12-29T19:00:00.000Z' };
+  const during = new Date('2026-06-01T00:00:00.000Z');
+
+  it('allows a later date', () => {
+    expect(canMoveReveal(sealed, '2026-12-31T19:00:00.000Z', during).ok).toBe(true);
+  });
+
+  it('refuses an earlier one, and refuses standing still', () => {
+    const earlier = canMoveReveal(sealed, '2026-12-01T19:00:00.000Z', during);
+    expect(earlier.ok).toBe(false);
+    expect(earlier.ok === false && earlier.error).toContain('only be moved later');
+
+    // The same instant is not a move, and allowing it would only ever be a way
+    // to reset the "moved" marker.
+    expect(canMoveReveal(sealed, sealed.revealAt, during).ok).toBe(false);
+  });
+
+  it('refuses any change once the group has opened', () => {
+    // Re-sealing would re-open collecting to people who have now read
+    // everything everyone else wrote.
+    const after = new Date('2027-01-05T00:00:00.000Z');
+
+    expect(canMoveReveal(sealed, '2027-06-01T00:00:00.000Z', after).ok).toBe(false);
+    expect(canMoveReveal(sealed, '2027-06-01T00:00:00.000Z', after)).toMatchObject({
+      error: expect.stringContaining('already opened'),
+    });
+  });
+
+  it('measures a legacy group against the instant it derives', () => {
+    const legacy = { revealYear: 2026 };
+
+    expect(canMoveReveal(legacy, '2027-03-01T00:00:00.000Z', during).ok).toBe(true);
+    expect(canMoveReveal(legacy, '2026-12-29T00:00:00.000Z', during).ok).toBe(false);
   });
 });
 

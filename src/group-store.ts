@@ -8,7 +8,8 @@ import {
   buildQuiz,
   buildStats,
   findMemberByUserId,
-  getRevealAtIso,
+  canMoveReveal,
+  revealInstant,
   LIMITS,
   QUIZ,
   quizQuestion,
@@ -33,7 +34,7 @@ const lockedResponse = (group: GroupState, subject: string): Response =>
   jsonResponse(
     {
       error: `${subject} stay locked until the year is over`,
-      revealAt: getRevealAtIso(group.revealYear),
+      revealAt: revealInstant(group),
     },
     423,
   );
@@ -190,14 +191,14 @@ export class GroupStore {
     }
 
     if (url.pathname === '/quotes' && request.method === 'GET') {
-      if (!areQuotesVisible(group.revealYear)) {
+      if (!areQuotesVisible(group)) {
         return lockedResponse(group, 'Quotes');
       }
       return jsonResponse({ quotes: group.quotes, members: group.members.map((entry) => publicMember(entry, member.id)) });
     }
 
     if (url.pathname === '/quiz' && request.method === 'GET') {
-      if (!areQuotesVisible(group.revealYear)) {
+      if (!areQuotesVisible(group)) {
         return lockedResponse(group, 'The quiz and its answers');
       }
       return jsonResponse({ questions: buildQuiz(group) });
@@ -216,10 +217,16 @@ export class GroupStore {
     }
 
     if (url.pathname === '/stats' && request.method === 'GET') {
-      if (!areQuotesVisible(group.revealYear)) {
+      if (!areQuotesVisible(group)) {
         return lockedResponse(group, 'Statistics');
       }
       return jsonResponse(buildStats(group));
+    }
+
+    if (url.pathname === '/reveal' && request.method === 'POST') {
+      return member.role === 'owner'
+        ? this.moveReveal(request, group, member)
+        : jsonResponse({ error: 'Only the group owner can change the reveal date' }, 403);
     }
 
     if (url.pathname === '/invite/rotate' && request.method === 'POST') {
@@ -241,8 +248,14 @@ export class GroupStore {
       return jsonResponse({ error: body.error }, 400);
     }
 
-    const { id, name, revealYear } = body.value;
+    const { id, name, revealYear, revealAt } = body.value;
     if (typeof id !== 'string' || typeof name !== 'string' || typeof revealYear !== 'number') {
+      return jsonResponse({ error: 'Invalid payload' }, 400);
+    }
+
+    // Validated by the Worker; absent means the group keeps the old default of
+    // midnight UTC on 1 January, derived from the year.
+    if (revealAt !== undefined && typeof revealAt !== 'string') {
       return jsonResponse({ error: 'Invalid payload' }, 400);
     }
 
@@ -258,6 +271,7 @@ export class GroupStore {
       id,
       name,
       revealYear,
+      ...(revealAt === undefined ? {} : { revealAt }),
       createdAt: new Date().toISOString(),
       ownerUserId: caller.userId,
       inviteVersion: 1,
@@ -510,7 +524,7 @@ export class GroupStore {
 
     // Once the vault is open a quote could be written with full knowledge of what
     // everyone else collected, which would make the leaderboard meaningless.
-    if (areQuotesVisible(group.revealYear)) {
+    if (areQuotesVisible(group)) {
       return jsonResponse({ error: 'This group has been revealed and is no longer collecting quotes' }, 409);
     }
 
@@ -577,7 +591,7 @@ export class GroupStore {
     author: Member,
     quoteId: string,
   ): Promise<Response> {
-    if (areQuotesVisible(group.revealYear)) {
+    if (areQuotesVisible(group)) {
       return jsonResponse({ error: 'This group has been revealed and is no longer collecting quotes' }, 409);
     }
 
@@ -627,7 +641,7 @@ export class GroupStore {
 
   /** The recorder's undo, for the moment the wrong photo goes up. */
   private async removeQuoteImage(group: GroupState, author: Member, quoteId: string): Promise<Response> {
-    if (areQuotesVisible(group.revealYear)) {
+    if (areQuotesVisible(group)) {
       return jsonResponse({ error: 'This group has been revealed and is no longer collecting quotes' }, 409);
     }
 
@@ -655,7 +669,7 @@ export class GroupStore {
    * the same lock — including for the person who uploaded it.
    */
   private async getQuoteImage(group: GroupState, quoteId: string): Promise<Response> {
-    if (!areQuotesVisible(group.revealYear)) {
+    if (!areQuotesVisible(group)) {
       return lockedResponse(group, 'Pictures');
     }
 
@@ -679,7 +693,7 @@ export class GroupStore {
    * restarting can never cost someone a score they already earned.
    */
   private async startQuiz(group: GroupState, player: Member): Promise<Response> {
-    if (!areQuotesVisible(group.revealYear)) {
+    if (!areQuotesVisible(group)) {
       return lockedResponse(group, 'The quiz and its answers');
     }
 
@@ -719,7 +733,7 @@ export class GroupStore {
    * replayed or skipped-ahead request cannot bank points twice.
    */
   private async answerQuiz(request: Request, group: GroupState, player: Member): Promise<Response> {
-    if (!areQuotesVisible(group.revealYear)) {
+    if (!areQuotesVisible(group)) {
       return lockedResponse(group, 'The quiz and its answers');
     }
 
@@ -790,7 +804,7 @@ export class GroupStore {
    * compare it to; this is what makes it a game the group plays.
    */
   private async quizScores(group: GroupState): Promise<Response> {
-    if (!areQuotesVisible(group.revealYear)) {
+    if (!areQuotesVisible(group)) {
       return lockedResponse(group, 'Quiz scores');
     }
 
@@ -815,14 +829,43 @@ export class GroupStore {
     return jsonResponse({ leaderboard });
   }
 
+  /**
+   * Postpones the reveal. Later only, and only while the group is still sealed —
+   * the reasoning is in `canMoveReveal`, and it is enforced here rather than in
+   * the UI because a rule that only the UI knows is not a rule.
+   */
+  private async moveReveal(request: Request, group: GroupState, owner: Member): Promise<Response> {
+    const body = await readJsonBody(request);
+    if (!body.ok) {
+      return jsonResponse({ error: body.error }, 400);
+    }
+
+    if (typeof body.value.revealAt !== 'string') {
+      return jsonResponse({ error: 'Invalid payload' }, 400);
+    }
+
+    const allowed = canMoveReveal(group, body.value.revealAt);
+    if (!allowed.ok) {
+      return jsonResponse({ error: allowed.error }, 409);
+    }
+
+    group.revealAt = body.value.revealAt;
+    group.revealMovedAt = new Date().toISOString();
+    await this.ctx.storage.put('group', group);
+    return jsonResponse({ group: this.overview(group, owner) });
+  }
+
   private overview(group: GroupState, viewer: Member) {
-    const locked = !areQuotesVisible(group.revealYear);
+    const locked = !areQuotesVisible(group);
 
     return {
       id: group.id,
       name: group.name,
       revealYear: group.revealYear,
-      revealAt: getRevealAtIso(group.revealYear),
+      revealAt: revealInstant(group),
+      // Shown to every member, not just the owner: a date that can move is only
+      // honest if everyone can see that it did.
+      revealMovedAt: group.revealMovedAt ?? null,
       locked,
       createdAt: group.createdAt,
       inviteVersion: group.inviteVersion,

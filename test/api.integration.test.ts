@@ -1673,3 +1673,142 @@ describe('the quiz round (L8)', () => {
     expect(response.body.error).toBe('Group not found');
   });
 });
+
+/**
+ * A reveal date can be chosen, and can only ever be pushed later. The rule is
+ * enforced in the group object rather than the UI, because a rule only the UI
+ * knows is not a rule.
+ */
+describe('choosing and moving the reveal (L9)', () => {
+  const inDays = (days: number): string => new Date(Date.now() + days * 86_400_000).toISOString();
+
+  it('opens on the chosen instant instead of 1 January', async () => {
+    const alice = await registerUser('Alice');
+    const party = inDays(30);
+
+    const created = await request('/api/groups', {
+      method: 'POST',
+      token: alice.token,
+      body: { name: 'Christmas party', revealYear: nextYear, revealAt: party },
+    });
+
+    expect(created.status).toBe(201);
+    expect(created.body.group.revealAt).toBe(party);
+    expect(created.body.group.locked).toBe(true);
+  });
+
+  it('still defaults to 1 January when no date is given', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'The usual', nextYear);
+
+    expect(group.revealAt).toBe(`${nextYear + 1}-01-01T00:00:00.000Z`);
+  });
+
+  it('refuses a date in the past or beyond ten years', async () => {
+    const alice = await registerUser('Alice');
+
+    for (const revealAt of [inDays(-1), inDays(365 * 11), 'not a date']) {
+      const response = await request('/api/groups', {
+        method: 'POST',
+        token: alice.token,
+        body: { name: 'Nope', revealYear: nextYear, revealAt },
+      });
+      expect(response.status, String(revealAt)).toBe(400);
+    }
+  });
+
+  it('lets the owner postpone, and shows every member that it moved', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const created = await request('/api/groups', {
+      method: 'POST',
+      token: alice.token,
+      body: { name: 'Moved', revealYear: nextYear, revealAt: inDays(30) },
+    });
+    const group = created.body.group;
+    await joinGroup(alice, bob, group.id);
+
+    const later = inDays(60);
+    const moved = await request(`/api/groups/${group.id}/reveal`, {
+      method: 'POST',
+      token: alice.token,
+      body: { revealAt: later },
+    });
+
+    expect(moved.status).toBe(200);
+    expect(moved.body.group.revealAt).toBe(later);
+
+    // Bob sees both the new date and the fact that it was changed at all.
+    const asBob = await request(`/api/groups/${group.id}`, { token: bob.token });
+    expect(asBob.body.group.revealAt).toBe(later);
+    expect(asBob.body.group.revealMovedAt).toBeTruthy();
+  });
+
+  it('refuses to pull the reveal forward, which is the whole promise', async () => {
+    const alice = await registerUser('Alice');
+    const created = await request('/api/groups', {
+      method: 'POST',
+      token: alice.token,
+      body: { name: 'Impatient', revealYear: nextYear, revealAt: inDays(30) },
+    });
+
+    const response = await request(`/api/groups/${created.body.group.id}/reveal`, {
+      method: 'POST',
+      token: alice.token,
+      body: { revealAt: inDays(2) },
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error).toContain('only be moved later');
+
+    const unchanged = await request(`/api/groups/${created.body.group.id}`, { token: alice.token });
+    expect(unchanged.body.group.revealAt).toBe(created.body.group.revealAt);
+  });
+
+  it('lets nobody but the owner move it', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Not yours', nextYear);
+    await joinGroup(alice, bob, group.id);
+
+    const response = await request(`/api/groups/${group.id}/reveal`, {
+      method: 'POST',
+      token: bob.token,
+      body: { revealAt: inDays(400) },
+    });
+
+    expect(response.status).toBe(403);
+  });
+
+  it('refuses any change once the group has opened', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Already read', nextYear);
+    await unlockGroup(group.id);
+
+    // Re-sealing would reopen collecting to someone who has read everything.
+    const response = await request(`/api/groups/${group.id}/reveal`, {
+      method: 'POST',
+      token: alice.token,
+      body: { revealAt: inDays(400) },
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error).toContain('already opened');
+  });
+
+  it('keeps a group stored with only a year exactly where it was', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Legacy', nextYear);
+
+    // Strip the instant, as a group created before this feature would be.
+    await runInDurableObject(env.GROUPS.get(env.GROUPS.idFromName(group.id)), async (_instance, state) => {
+      const stored = (await state.storage.get<GroupState>('group')) as GroupState;
+      delete stored.revealAt;
+      await state.storage.put('group', stored);
+    });
+
+    const overview = await request(`/api/groups/${group.id}`, { token: alice.token });
+    expect(overview.body.group.revealAt).toBe(`${nextYear + 1}-01-01T00:00:00.000Z`);
+    expect(overview.body.group.locked).toBe(true);
+  });
+});

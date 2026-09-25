@@ -42,7 +42,16 @@ export type Quote = {
 export type GroupState = {
   id: string;
   name: string;
+  /** The collection this group is for, used for labelling: "the 2026 quotes". */
   revealYear: number;
+  /**
+   * The exact instant the vault opens. Absent on groups created before the date
+   * was configurable, which fall back to midnight UTC on 1 January — so nothing
+   * shifts under a group that is mid-collection.
+   */
+  revealAt?: string;
+  /** When the owner last postponed the reveal, if they ever did. */
+  revealMovedAt?: string;
   createdAt: string;
   ownerUserId: string;
   /** Bumped when an invite link is rotated, which invalidates older codes. */
@@ -204,11 +213,53 @@ export const exceedsImageBudget = (group: GroupState, quoteId: string, bytes: nu
 export const fitsWithinHardCap = (group: GroupState, extraBytes: number): boolean =>
   groupByteSize(group) + extraBytes <= LIMITS.groupBytesHardCap;
 
+/** The default a group gets when the creator does not pick a date. */
 export const getRevealAtIso = (revealYear: number): string =>
   new Date(Date.UTC(revealYear + 1, 0, 1, 0, 0, 0)).toISOString();
 
-export const areQuotesVisible = (revealYear: number, now: Date = new Date()): boolean =>
-  now >= new Date(getRevealAtIso(revealYear));
+/** Enough of a group to know when it opens. */
+export type Revealable = { revealYear: number; revealAt?: string };
+
+/**
+ * When a group opens. An explicit instant wins; a group stored before the date
+ * was configurable has none, and keeps the instant it has always had.
+ */
+export const revealInstant = (group: Revealable): string => group.revealAt ?? getRevealAtIso(group.revealYear);
+
+export const areQuotesVisible = (group: Revealable, now: Date = new Date()): boolean =>
+  now >= new Date(revealInstant(group));
+
+/**
+ * Whether the reveal may be moved to `next`.
+ *
+ * Later only, and only while the group is still sealed. This is the rule the
+ * whole product rests on: everyone who recorded a quote did so on the promise
+ * that nobody reads it before a stated moment, and pulling that moment forward
+ * breaks a promise they cannot take back. Delaying disappoints people; it does
+ * not betray them.
+ *
+ * Refusing it after the reveal matters just as much for a different reason: the
+ * group is already read, and re-sealing it would re-open collecting to people
+ * who now know everything everyone else wrote.
+ */
+export const canMoveReveal = (
+  group: Revealable,
+  next: string,
+  now: Date = new Date(),
+): { ok: true } | { ok: false; error: string } => {
+  if (areQuotesVisible(group, now)) {
+    return { ok: false, error: 'This group has already opened, so its date can no longer be changed' };
+  }
+
+  if (new Date(next).getTime() <= new Date(revealInstant(group)).getTime()) {
+    return {
+      ok: false,
+      error: 'A reveal can only be moved later. Everyone who recorded a quote did so expecting it to stay sealed until the date they were shown.',
+    };
+  }
+
+  return { ok: true };
+};
 
 /**
  * The question set as the client is allowed to see it: no `answerMemberId`.

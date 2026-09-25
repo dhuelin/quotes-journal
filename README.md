@@ -15,10 +15,10 @@ app and the HTTP API; a Flutter app talks to the same API on Android and iOS.
   who else was there, and optionally a picture for the context the words alone
   do not carry. The server attributes the quote to whoever is signed in, so who
   collected what cannot be faked.
-- **The lock.** Quotes, their pictures, the quiz and the statistics all return `423 Locked`
-  until midnight UTC on 1 January of the following year. During the year the app
-  shows only a count, so nothing is spoiled — not even for the person who wrote
-  the quote down.
+- **The lock.** Quotes, their pictures, the quiz and the statistics all return
+  `423 Locked` until the group's reveal date — midnight on 1 January by default,
+  or any instant the creator picks. During the year the app shows only a count,
+  so nothing is spoiled — not even for the person who wrote the quote down.
 - **The reveal.** From 1 January the group can read every quote, see the
   statistics (how many quotes each person said, and how many each person
   collected) and play the quiz.
@@ -103,6 +103,26 @@ the group value. That value is read and rewritten on every write and has a hard
 ~2.2MB ceiling ([#10](https://github.com/dhuelin/quotes-journal/issues/10)) —
 only the picture's size and type live there. R2 would be the natural home if
 this grows, and is not used today because R2 is not enabled on the account.
+
+### The reveal date, and whether it can move
+
+A group opens at an instant its creator picks. The default is midnight on
+1 January of the following year, which is what every group did before, and a
+group stored with only a year keeps deriving exactly that — so nothing shifts
+under a group mid-collection and there is no migration.
+
+The date is picked in the browser's own zone and stored as an absolute instant,
+so what someone picks is what their group gets.
+
+**The owner can push the date back, never pull it forward.** That is the rule
+the product rests on: everyone who recorded a quote did so on the promise that
+nobody reads it before a stated moment, and pulling that moment forward breaks a
+promise they cannot take back. Delaying disappoints people; it does not betray
+them. Every member sees the current date and a marker when it has moved.
+
+Changes are refused entirely once the group has opened — re-sealing a group that
+has been read would reopen collecting to people who now know what everyone else
+wrote.
 
 ### Scoring the quiz
 
@@ -249,7 +269,7 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | `POST` | `/api/auth/login` | `{ email, password }` → `{ token, user }` |
 | `GET` | `/api/auth/me` | the account and the groups it belongs to |
 | `GET` | `/api/groups` | groups you belong to |
-| `POST` | `/api/groups` | `{ name, revealYear }`; the creator becomes owner |
+| `POST` | `/api/groups` | `{ name, revealYear, revealAt? }`; the creator becomes owner |
 | `GET` | `/api/groups/:groupId` | members, your role, and progress while locked |
 | `POST` | `/api/groups/:groupId/members` | `{ name }`, for friends without an account; owner only |
 | `POST` | `/api/groups/:groupId/members/claim` | `{ guestMemberId, memberId }`; owner only |
@@ -266,6 +286,7 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | `GET` | `/api/groups/:groupId/quiz/scores` | every member's best round |
 | `GET` | `/api/groups/:groupId/stats` | `423` until the reveal |
 | `GET` | `/api/groups/:groupId/invite` | current invite code; the client builds the link |
+| `POST` | `/api/groups/:groupId/reveal` | `{ revealAt }`; owner only, later only, refused once open |
 | `POST` | `/api/groups/:groupId/invite/rotate` | owner only; invalidates old links |
 | `POST` | `/api/invites/accept` | `{ inviteCode, memberName? }`; `410` if expired or rotated |
 
@@ -284,7 +305,6 @@ Tracked in [the issue tracker](https://github.com/dhuelin/quotes-journal/issues)
 - [#7](https://github.com/dhuelin/quotes-journal/issues/7) persist the mobile session across restarts
 - [#8](https://github.com/dhuelin/quotes-journal/issues/8) store submission setup for the mobile app
 - [#9](https://github.com/dhuelin/quotes-journal/issues/9) keep the cached group name on an account in sync
-- [#15](https://github.com/dhuelin/quotes-journal/issues/15) a configurable reveal date, not just the year
 - [#17](https://github.com/dhuelin/quotes-journal/issues/17) settings pages for accounts and groups
 - [#19](https://github.com/dhuelin/quotes-journal/issues/19) publishing to the app stores (low priority)
 - [#20](https://github.com/dhuelin/quotes-journal/issues/20) the Flutter client shows no quote pictures
