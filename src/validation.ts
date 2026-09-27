@@ -88,6 +88,78 @@ export const validateRevealYear = (raw: unknown, now: Date = new Date()): Valida
   return { ok: true, value };
 };
 
+/**
+ * An explicit reveal instant, as an ISO timestamp.
+ *
+ * Must be in the future — a group that opens the moment it is created has
+ * nothing to seal — and within ten years, which is the same horizon the year
+ * has always had. A near-term date is deliberately allowed: recording quotes at
+ * a party and opening them at midnight is a real way to use this.
+ */
+/**
+ * A conversation: one or more lines, each with its own speaker and text. The
+ * 500-character limit is per line rather than per quote, because a long
+ * exchange is simply several ordinary remarks — the byte budget in
+ * `exceedsGroupBudget` is what actually keeps a quote from outgrowing storage.
+ */
+export const validateQuoteLines = (raw: unknown): Validated<{ saidByMemberId: string; text: string }[]> => {
+  if (!Array.isArray(raw)) {
+    return invalid('A conversation must be a list of lines');
+  }
+
+  if (raw.length === 0) {
+    return invalid('A conversation needs at least one line');
+  }
+
+  if (raw.length > LIMITS.quoteLines) {
+    return invalid(`A quote can have at most ${LIMITS.quoteLines} lines`);
+  }
+
+  const lines: { saidByMemberId: string; text: string }[] = [];
+  for (const [index, entry] of raw.entries()) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      return invalid(`Line ${index + 1} is not a line`);
+    }
+
+    const line = entry as Record<string, unknown>;
+    const text = validateText(line.text, `Line ${index + 1}`, LIMITS.quoteText, { allowLineBreaks: true });
+    if (!text.ok) {
+      return text;
+    }
+
+    if (typeof line.saidByMemberId !== 'string' || line.saidByMemberId.length === 0) {
+      return invalid(`Line ${index + 1} needs someone who said it`);
+    }
+
+    lines.push({ saidByMemberId: line.saidByMemberId, text: text.value });
+  }
+
+  return { ok: true, value: lines };
+};
+
+export const validateRevealAt = (raw: unknown, now: Date = new Date()): Validated<string> => {
+  if (typeof raw !== 'string') {
+    return invalid('Reveal date must be a string');
+  }
+
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    return invalid('Reveal date must be a valid date');
+  }
+
+  if (parsed.getTime() <= now.getTime()) {
+    return invalid('The reveal has to be in the future');
+  }
+
+  const horizon = new Date(now);
+  horizon.setUTCFullYear(horizon.getUTCFullYear() + 10);
+  if (parsed.getTime() > horizon.getTime()) {
+    return invalid('The reveal has to be within the next ten years');
+  }
+
+  return { ok: true, value: parsed.toISOString() };
+};
+
 export const validateMemberIdList = (raw: unknown, field: string): Validated<string[]> => {
   if (raw === undefined || raw === null) {
     return { ok: true, value: [] };

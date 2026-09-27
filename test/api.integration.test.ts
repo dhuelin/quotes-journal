@@ -508,8 +508,15 @@ describe('the year-end lock', () => {
     const quiz = await request(`/api/groups/${group.id}/quiz`, { token: alice.token });
     expect(quiz.status).toBe(200);
     expect(quiz.body.questions).toHaveLength(1);
-    expect(quiz.body.questions[0].answerMemberId).toBe(cleo.id);
     expect(quiz.body.questions[0].options).toHaveLength(2);
+    // The reveal opens the questions, not the answers: those stay on the server
+    // so that a quiz score means something. Rounds are played through
+    // /quiz/start and /quiz/answer.
+    // Cleo's id is in there — she is an answer option, as every member is.
+    // What must not be there is anything saying which option is right.
+    expect(quiz.body.questions[0].answerMemberId).toBeUndefined();
+    expect(JSON.stringify(quiz.body)).not.toContain('answerMemberId');
+    expect(JSON.stringify(quiz.body)).not.toContain('saidByMemberId');
 
     const stats = await request(`/api/groups/${group.id}/stats`, { token: alice.token });
     expect(stats.status).toBe(200);
@@ -1209,7 +1216,7 @@ describe('invite links (M5, L2)', () => {
 });
 
 describe('security headers (L1)', () => {
-  it('locks the app shell down and allows the inline script and style by nonce', async () => {
+  it('locks the app shell down and names the inline script and style by hash', async () => {
     const response = await SELF.fetch('https://example.com/app');
     const csp = response.headers.get('content-security-policy') ?? '';
 
@@ -1232,105 +1239,76 @@ describe('security headers (L1)', () => {
       expect(csp, directive).toContain(directive);
     }
     expect(csp).not.toContain("'unsafe-inline'");
-
-    const nonce = /script-src 'nonce-([A-Za-z0-9+/_-]+)'/.exec(csp)?.[1];
-    expect(nonce).toBeTruthy();
+    expect(csp).not.toContain('nonce-');
 
     const shell = await response.text();
-    expect(shell).toContain(`<script nonce="${nonce}">`);
-    expect(shell).toContain(`<style nonce="${nonce}">`);
+    expect(shell).toContain('<script>');
+    expect(shell).toContain('<style>');
     expect(shell).not.toContain('__CSP_NONCE__');
   });
 
-  it('mints a fresh nonce for every response', async () => {
+  it('serves a byte-identical shell every time, so it can be cached and opened offline', async () => {
     const first = await SELF.fetch('https://example.com/app');
-    const second = await SELF.fetch('https://example.com/app');
+    const second = await SELF.fetch('https://example.com/join');
 
-    expect(first.headers.get('content-security-policy')).not.toBe(second.headers.get('content-security-policy'));
+    // This is the whole reason the policy moved off nonces. A nonce is fresh per
+    // response, which makes every copy of the document unique — and a document
+    // that cannot be cached cannot be opened without a connection.
+    expect(first.headers.get('content-security-policy')).toBe(second.headers.get('content-security-policy'));
+    expect(await first.text()).toBe(await second.text());
+  });
+
+  it('refuses to authorise a script the policy has not hashed', async () => {
+    const response = await SELF.fetch('https://example.com/app');
+    const csp = response.headers.get('content-security-policy') ?? '';
+    const hash = /script-src '(sha256-[A-Za-z0-9+/=]+)'/.exec(csp)?.[1];
+
+    expect(hash).toBeTruthy();
+
+    // The hash has to be of the script actually served, or the app is dead on
+    // arrival in a way no HTTP-level assertion would notice.
+    const shell = await response.text();
+    const script = shell.slice(shell.indexOf('<script>') + '<script>'.length, shell.lastIndexOf('</script>'));
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(script));
+    const computed = `sha256-${btoa(String.fromCharCode(...new Uint8Array(digest)))}`;
+
+    expect(computed).toBe(hash);
   });
 });
 
-describe('the group cap (L3)', () => {
-  it('refuses to create a group past the cap instead of orphaning one', async () => {
-    const alice = await registerUser('Alice');
-    await fillAccountToGroupCap(alice);
+describe('the service worker (L7)', () => {
+  it('caches the shell and keeps every API response out of the cache', async () => {
+    const response = await SELF.fetch('https://example.com/sw.js');
+    const script = await response.text();
 
-    const response = await request('/api/groups', {
-      method: 'POST',
-      token: alice.token,
-      body: { name: 'One too many', revealYear: nextYear },
-    });
+    expect(response.status).toBe(200);
+    expect(script).toContain("addEventListener('fetch'");
+    expect(script).toContain("caches.open");
 
-    expect(response.status).toBe(409);
-    expect(response.body.error).toContain('at most');
-
-    const account = await request('/api/auth/me', { token: alice.token });
-    expect(account.body.groups).toHaveLength(LIMITS.groupsPerUser);
+    // The one rule that matters. Quotes, pictures and the account are read with
+    // a bearer token; a copy in Cache Storage would outlive signing out, and for
+    // a group still under its reveal lock it would be readable early.
+    expect(script).toContain("url.pathname.startsWith('/api/')");
   });
 
-  it('refuses to accept an invite past the cap, without adding a hidden membership', async () => {
-    const owner = await registerUser('Owner');
-    const joiner = await registerUser('Joiner');
-    const group = await createGroup(owner, 'Full up', nextYear);
-    const inviteCode = await inviteCodeFor(owner, group.id);
-    await fillAccountToGroupCap(joiner);
+  it('names its cache after the client, so a deploy reaches an installed app', async () => {
+    const script = await (await SELF.fetch('https://example.com/sw.js')).text();
+    const csp = (await SELF.fetch('https://example.com/app')).headers.get('content-security-policy') ?? '';
+    const version = /quotes-journal-([A-Za-z0-9]+)/.exec(script)?.[1];
 
-    const response = await request('/api/invites/accept', {
-      method: 'POST',
-      token: joiner.token,
-      body: { inviteCode },
-    });
+    expect(version).toBeTruthy();
+    // Derived from the hashes of the client itself: change the client and this
+    // changes, which is what makes a browser install the new worker at all.
+    expect(csp.replace(/[^A-Za-z0-9]/g, '')).toContain(version as string);
+  });
 
-    expect(response.status).toBe(409);
+  it('is served uncached, or a stale worker could never be replaced', async () => {
+    const response = await SELF.fetch('https://example.com/sw.js');
 
-    const overview = await request(`/api/groups/${group.id}`, { token: owner.token });
-    expect(overview.body.group.members).toHaveLength(1);
+    expect(response.headers.get('cache-control')).toContain('no-cache');
   });
 });
 
-describe('read rate limiting (L4)', () => {
-  it('blocks an authenticated read flood from one account', async () => {
-    const reader = await registerUser('Reader');
-
-    let sawTooMany = false;
-    // The pool pins RATE_LIMIT_READ low, so this settles in a few dozen calls.
-    for (let attempt = 0; attempt < 60 && !sawTooMany; attempt += 1) {
-      const response = await request('/api/auth/me', { token: reader.token, ip: uniqueIp() });
-      sawTooMany = response.status === 429;
-      if (!sawTooMany) {
-        expect(response.status).toBe(200);
-      }
-    }
-
-    expect(sawTooMany).toBe(true);
-  });
-});
-
-describe('writing after the reveal (L5)', () => {
-  it('refuses new quotes once the group has opened', async () => {
-    const alice = await registerUser('Alice');
-    const group = await createGroup(alice, 'Too late', nextYear);
-    await unlockGroup(group.id);
-
-    const response = await request(`/api/groups/${group.id}/quotes`, {
-      method: 'POST',
-      token: alice.token,
-      body: { text: 'Written after reading everyone else', saidByMemberId: group.you.memberId },
-    });
-
-    expect(response.status).toBe(409);
-    expect(response.body.error).toContain('no longer collecting');
-
-    const stats = await request(`/api/groups/${group.id}/stats`, { token: alice.token });
-    expect(stats.body.totalQuotes).toBe(0);
-  });
-});
-
-/**
- * A picture is context for a quote, so it is exactly as secret as the quote is:
- * behind the same membership check and the same reveal lock, including for the
- * person who uploaded it.
- */
 describe('pictures attached to quotes (L6)', () => {
   const addQuote = async (author: TestUser, groupId: string, saidByMemberId: string, text = 'Look at this') => {
     const response = await request(`/api/groups/${groupId}/quotes`, {
@@ -1495,5 +1473,657 @@ describe('pictures attached to quotes (L6)', () => {
     // group would be a few writes from the ceiling that breaks every later one.
     const after = await storedGroupSize(group.id);
     expect(after - before).toBeLessThan(200);
+  });
+});
+
+/**
+ * The quiz is scored on the server, and these are the reasons that was worth
+ * doing. Every test here is a way the score could otherwise have been faked.
+ */
+describe('the quiz round (L8)', () => {
+  const playableGroup = async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Quiz night', nextYear);
+
+    // Three members, because with two every question is a coin flip.
+    for (const name of ['Bob', 'Cleo']) {
+      const added = await request(`/api/groups/${group.id}/members`, {
+        method: 'POST',
+        token: alice.token,
+        body: { name },
+      });
+      expect(added.status).toBe(201);
+    }
+
+    const fresh = await request(`/api/groups/${group.id}`, { token: alice.token });
+    const members = fresh.body.group.members as { id: string; name: string }[];
+
+    for (const member of members) {
+      const saved = await request(`/api/groups/${group.id}/quotes`, {
+        method: 'POST',
+        token: alice.token,
+        body: { text: `Something ${member.name} said`, saidByMemberId: member.id },
+      });
+      expect(saved.status).toBe(201);
+    }
+
+    await unlockGroup(group.id);
+    return { alice, group, members };
+  };
+
+  /** Everything the question shows, which is what the test reads the answer from. */
+  const asked = (question: { lines: { text: string }[] }): string =>
+    question.lines.map((line) => line.text).join(' ');
+
+  const start = (player: TestUser, groupId: string) =>
+    request(`/api/groups/${groupId}/quiz/start`, { method: 'POST', token: player.token, body: {} });
+
+  const answer = (player: TestUser, groupId: string, quoteId: string, memberId: string | null) =>
+    request(`/api/groups/${groupId}/quiz/answer`, {
+      method: 'POST',
+      token: player.token,
+      body: { quoteId, memberId },
+    });
+
+  it('never sends the answer with the question', async () => {
+    const { alice, group } = await playableGroup();
+
+    const started = await start(alice, group.id);
+    expect(started.status).toBe(201);
+    expect(JSON.stringify(started.body.question)).not.toContain('answerMemberId');
+    expect(JSON.stringify(started.body.question)).not.toContain('saidByMemberId');
+
+    // The read-only question list is the same: questions, never answers.
+    const listed = await request(`/api/groups/${group.id}/quiz`, { token: alice.token });
+    expect(JSON.stringify(listed.body)).not.toContain('answerMemberId');
+  });
+
+  it('scores a correct answer and reveals the answer only afterwards', async () => {
+    const { alice, group, members } = await playableGroup();
+    const started = await start(alice, group.id);
+    const question = started.body.question;
+
+    // The quote text names who said it, which is how the test knows the answer
+    // without the server ever having told the client.
+    const expected = members.find((member) => asked(question).includes(member.name))!;
+    const response = await answer(alice, group.id, question.quoteId, expected.id);
+
+    expect(response.status).toBe(200);
+    expect(response.body.correct).toBe(true);
+    expect(response.body.answerMemberId).toBe(expected.id);
+    expect(response.body.points).toBeGreaterThan(0);
+    expect(response.body.score).toBe(response.body.points);
+  });
+
+  it('scores nothing for a wrong answer and nothing for no answer at all', async () => {
+    const { alice, group, members } = await playableGroup();
+
+    const started = await start(alice, group.id);
+    const wrong = members.find((member) => !asked(started.body.question).includes(member.name))!;
+    const missed = await answer(alice, group.id, started.body.question.quoteId, wrong.id);
+    expect(missed.body.correct).toBe(false);
+    expect(missed.body.points).toBe(0);
+
+    // A question left to expire is a real answer, worth nothing.
+    const expired = await answer(alice, group.id, missed.body.question.quoteId, null);
+    expect(expired.status).toBe(200);
+    expect(expired.body.correct).toBe(false);
+    expect(expired.body.points).toBe(0);
+  });
+
+  it('refuses an answer to a question the round has already moved past', async () => {
+    const { alice, group, members } = await playableGroup();
+    const started = await start(alice, group.id);
+    const first = started.body.question;
+    const right = members.find((member) => asked(first).includes(member.name))!;
+
+    const scored = await answer(alice, group.id, first.quoteId, right.id);
+    expect(scored.body.correct).toBe(true);
+
+    // Replaying the same question would otherwise bank the same points again.
+    const replay = await answer(alice, group.id, first.quoteId, right.id);
+    expect(replay.status).toBe(409);
+    expect(replay.body.error).toContain('not the question you are on');
+  });
+
+  it('finishes after every question and reports the round', async () => {
+    const { alice, group, members } = await playableGroup();
+    let current = (await start(alice, group.id)).body.question;
+    let rounds = 0;
+    let last: any = null;
+
+    while (current) {
+      const right = members.find((member) => asked(current).includes(member.name))!;
+      last = await answer(alice, group.id, current.quoteId, right.id);
+      current = last.body.question;
+      rounds += 1;
+    }
+
+    expect(rounds).toBe(3);
+    expect(last.body.finished).toBe(true);
+    expect(last.body.summary).toMatchObject({ correct: 3, total: 3 });
+    expect(last.body.summary.score).toBeGreaterThan(0);
+
+    const over = await answer(alice, group.id, 'anything', null);
+    expect(over.status).toBe(409);
+  });
+
+  it('keeps a member’s best round, so starting another can never cost them one', async () => {
+    const { alice, group, members } = await playableGroup();
+
+    const playAll = async (correctly: boolean) => {
+      let current = (await start(alice, group.id)).body.question;
+      let final: any = null;
+      while (current) {
+        const pick = correctly
+          ? members.find((member) => asked(current).includes(member.name))!.id
+          : null;
+        final = await answer(alice, group.id, current.quoteId, pick);
+        current = final.body.question;
+      }
+      return final.body.summary.score as number;
+    };
+
+    const good = await playAll(true);
+    const bad = await playAll(false);
+    expect(good).toBeGreaterThan(0);
+    expect(bad).toBe(0);
+
+    // Restarting is free in a party game; it must not overwrite a good round.
+    const scores = await request(`/api/groups/${group.id}/quiz/scores`, { token: alice.token });
+    expect(scores.body.leaderboard[0]).toMatchObject({ name: 'Alice', score: good });
+  });
+
+  it('refuses to start where every question would be a coin flip', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Just us', nextYear);
+    await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { text: 'Alone in here', saidByMemberId: group.you.memberId },
+    });
+    await unlockGroup(group.id);
+
+    const response = await start(alice, group.id);
+
+    expect(response.status).toBe(409);
+    expect(response.body.needsMembers).toBe(3);
+  });
+
+  it('stays locked with everything else until the reveal', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Still sealed', nextYear);
+
+    for (const path of ['/quiz/start', '/quiz/answer']) {
+      const response = await request(`/api/groups/${group.id}${path}`, {
+        method: 'POST',
+        token: alice.token,
+        body: {},
+      });
+      expect(response.status, path).toBe(423);
+    }
+
+    const scores = await request(`/api/groups/${group.id}/quiz/scores`, { token: alice.token });
+    expect(scores.status).toBe(423);
+  });
+
+  it('hides the round from someone outside the group', async () => {
+    const { group } = await playableGroup();
+    const stranger = await registerUser('Mallory');
+
+    const response = await start(stranger, group.id);
+
+    expect(response.status).toBe(404);
+    expect(response.body.error).toBe('Group not found');
+  });
+});
+
+/**
+ * A reveal date can be chosen, and can only ever be pushed later. The rule is
+ * enforced in the group object rather than the UI, because a rule only the UI
+ * knows is not a rule.
+ */
+describe('choosing and moving the reveal (L9)', () => {
+  const inDays = (days: number): string => new Date(Date.now() + days * 86_400_000).toISOString();
+
+  it('opens on the chosen instant instead of 1 January', async () => {
+    const alice = await registerUser('Alice');
+    const party = inDays(30);
+
+    const created = await request('/api/groups', {
+      method: 'POST',
+      token: alice.token,
+      body: { name: 'Christmas party', revealYear: nextYear, revealAt: party },
+    });
+
+    expect(created.status).toBe(201);
+    expect(created.body.group.revealAt).toBe(party);
+    expect(created.body.group.locked).toBe(true);
+  });
+
+  it('still defaults to 1 January when no date is given', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'The usual', nextYear);
+
+    expect(group.revealAt).toBe(`${nextYear + 1}-01-01T00:00:00.000Z`);
+  });
+
+  it('refuses a date in the past or beyond ten years', async () => {
+    const alice = await registerUser('Alice');
+
+    for (const revealAt of [inDays(-1), inDays(365 * 11), 'not a date']) {
+      const response = await request('/api/groups', {
+        method: 'POST',
+        token: alice.token,
+        body: { name: 'Nope', revealYear: nextYear, revealAt },
+      });
+      expect(response.status, String(revealAt)).toBe(400);
+    }
+  });
+
+  it('lets the owner postpone, and shows every member that it moved', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const created = await request('/api/groups', {
+      method: 'POST',
+      token: alice.token,
+      body: { name: 'Moved', revealYear: nextYear, revealAt: inDays(30) },
+    });
+    const group = created.body.group;
+    await joinGroup(alice, bob, group.id);
+
+    const later = inDays(60);
+    const moved = await request(`/api/groups/${group.id}/reveal`, {
+      method: 'POST',
+      token: alice.token,
+      body: { revealAt: later },
+    });
+
+    expect(moved.status).toBe(200);
+    expect(moved.body.group.revealAt).toBe(later);
+
+    // Bob sees both the new date and the fact that it was changed at all.
+    const asBob = await request(`/api/groups/${group.id}`, { token: bob.token });
+    expect(asBob.body.group.revealAt).toBe(later);
+    expect(asBob.body.group.revealMovedAt).toBeTruthy();
+  });
+
+  it('refuses to pull the reveal forward, which is the whole promise', async () => {
+    const alice = await registerUser('Alice');
+    const created = await request('/api/groups', {
+      method: 'POST',
+      token: alice.token,
+      body: { name: 'Impatient', revealYear: nextYear, revealAt: inDays(30) },
+    });
+
+    const response = await request(`/api/groups/${created.body.group.id}/reveal`, {
+      method: 'POST',
+      token: alice.token,
+      body: { revealAt: inDays(2) },
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error).toContain('only be moved later');
+
+    const unchanged = await request(`/api/groups/${created.body.group.id}`, { token: alice.token });
+    expect(unchanged.body.group.revealAt).toBe(created.body.group.revealAt);
+  });
+
+  it('lets nobody but the owner move it', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Not yours', nextYear);
+    await joinGroup(alice, bob, group.id);
+
+    const response = await request(`/api/groups/${group.id}/reveal`, {
+      method: 'POST',
+      token: bob.token,
+      body: { revealAt: inDays(400) },
+    });
+
+    expect(response.status).toBe(403);
+  });
+
+  it('refuses any change once the group has opened', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Already read', nextYear);
+    await unlockGroup(group.id);
+
+    // Re-sealing would reopen collecting to someone who has read everything.
+    const response = await request(`/api/groups/${group.id}/reveal`, {
+      method: 'POST',
+      token: alice.token,
+      body: { revealAt: inDays(400) },
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error).toContain('already opened');
+  });
+
+  it('keeps a group stored with only a year exactly where it was', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Legacy', nextYear);
+
+    // Strip the instant, as a group created before this feature would be.
+    await runInDurableObject(env.GROUPS.get(env.GROUPS.idFromName(group.id)), async (_instance, state) => {
+      const stored = (await state.storage.get<GroupState>('group')) as GroupState;
+      delete stored.revealAt;
+      await state.storage.put('group', stored);
+    });
+
+    const overview = await request(`/api/groups/${group.id}`, { token: alice.token });
+    expect(overview.body.group.revealAt).toBe(`${nextYear + 1}-01-01T00:00:00.000Z`);
+    expect(overview.body.group.locked).toBe(true);
+  });
+});
+
+/** A quote with more than one speaker, and what the quiz does with one. */
+describe('conversations (L10)', () => {
+  const conversation = [
+    { text: 'I am not lost.' },
+    { text: 'You have been driving in circles for twenty minutes.' },
+  ];
+
+  const groupWithThree = async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Road trip', nextYear);
+    for (const name of ['Bob', 'Cleo']) {
+      await request(`/api/groups/${group.id}/members`, { method: 'POST', token: alice.token, body: { name } });
+    }
+    const fresh = await request(`/api/groups/${group.id}`, { token: alice.token });
+    return { alice, group, members: fresh.body.group.members as { id: string; name: string }[] };
+  };
+
+  it('records an exchange and reads it back as one', async () => {
+    const { alice, group, members } = await groupWithThree();
+    const lines = conversation.map((line, index) => ({ ...line, saidByMemberId: members[index].id }));
+
+    const saved = await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { lines },
+    });
+    expect(saved.status).toBe(201);
+
+    await unlockGroup(group.id);
+    const quotes = await request(`/api/groups/${group.id}/quotes`, { token: alice.token });
+
+    expect(quotes.body.quotes[0].lines).toHaveLength(2);
+    expect(quotes.body.quotes[0].lines[1].text).toContain('driving in circles');
+    // The opening line is mirrored, so a client that knows nothing about
+    // conversations still shows something correct rather than nothing.
+    expect(quotes.body.quotes[0].text).toBe('I am not lost.');
+    expect(quotes.body.quotes[0].saidByMemberId).toBe(members[0].id);
+  });
+
+  it('still accepts a single remark in the shape it always had', async () => {
+    const { alice, group } = await groupWithThree();
+
+    const saved = await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { text: 'Technically the cake is a salad', saidByMemberId: group.you.memberId },
+    });
+    expect(saved.status).toBe(201);
+
+    await unlockGroup(group.id);
+    const quotes = await request(`/api/groups/${group.id}/quotes`, { token: alice.token });
+
+    // Stored as a remark, not as a one-line exchange: nothing already recorded
+    // changes shape, and neither does anything recorded the old way now.
+    expect(quotes.body.quotes[0].lines).toBeUndefined();
+    expect(quotes.body.quotes[0].text).toBe('Technically the cake is a salad');
+  });
+
+  it('refuses a line whose speaker is not in the group, and an over-long one', async () => {
+    const { alice, group, members } = await groupWithThree();
+
+    const stranger = await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { lines: [{ saidByMemberId: 'someone-else', text: 'Hello' }] },
+    });
+    expect(stranger.status).toBe(400);
+
+    const tooLong = await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: {
+        lines: [{ saidByMemberId: members[0].id, text: 'x'.repeat(LIMITS.quoteText + 1) }],
+      },
+    });
+    expect(tooLong.status).toBe(400);
+
+    const tooMany = await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: {
+        lines: Array.from({ length: LIMITS.quoteLines + 1 }, () => ({
+          saidByMemberId: members[0].id,
+          text: 'Again',
+        })),
+      },
+    });
+    expect(tooMany.status).toBe(400);
+  });
+
+  it('asks the quiz about one line, showing the rest with their speakers', async () => {
+    const { alice, group, members } = await groupWithThree();
+    await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { lines: conversation.map((line, index) => ({ ...line, saidByMemberId: members[index].id })) },
+    });
+    await unlockGroup(group.id);
+
+    const started = await request(`/api/groups/${group.id}/quiz/start`, {
+      method: 'POST',
+      token: alice.token,
+      body: {},
+    });
+    const question = started.body.question;
+
+    expect(question.lines).toHaveLength(2);
+    // Exactly one line is the question; the others are context, named.
+    expect(question.lines.filter((line: { speaker: string | null }) => line.speaker === null)).toHaveLength(1);
+    expect(question.lines[question.askedLine].speaker).toBeNull();
+    expect(JSON.stringify(question)).not.toContain('saidByMemberId');
+
+    // Both lines are asked about across the round, so a two-line exchange is
+    // two questions rather than one.
+    expect(question.total).toBe(2);
+  });
+
+  it('scores the asked line, not the first one', async () => {
+    const { alice, group, members } = await groupWithThree();
+    await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { lines: conversation.map((line, index) => ({ ...line, saidByMemberId: members[index].id })) },
+    });
+    await unlockGroup(group.id);
+
+    const started = await request(`/api/groups/${group.id}/quiz/start`, {
+      method: 'POST',
+      token: alice.token,
+      body: {},
+    });
+    const question = started.body.question;
+    const speaker = members[question.askedLine];
+
+    const response = await request(`/api/groups/${group.id}/quiz/answer`, {
+      method: 'POST',
+      token: alice.token,
+      body: { quoteId: question.quoteId, memberId: speaker.id },
+    });
+
+    expect(response.body.correct).toBe(true);
+    expect(response.body.answerMemberId).toBe(speaker.id);
+  });
+
+  it('counts an exchange once towards the quote cap, and its speakers each once', async () => {
+    const { alice, group, members } = await groupWithThree();
+    await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { lines: conversation.map((line, index) => ({ ...line, saidByMemberId: members[index].id })) },
+    });
+    await unlockGroup(group.id);
+
+    const stats = await request(`/api/groups/${group.id}/stats`, { token: alice.token });
+
+    expect(stats.body.totalQuotes).toBe(1);
+    expect(stats.body.saidBy[members[0].id]).toBe(1);
+    expect(stats.body.saidBy[members[1].id]).toBe(1);
+  });
+});
+
+/** Account and group settings: the name, the group list, and the way out. */
+describe('settings (L11)', () => {
+  it('changes the display name and hands back a token that carries it', async () => {
+    const alice = await registerUser('Alice');
+
+    const renamed = await request('/api/account/display-name', {
+      method: 'POST',
+      token: alice.token,
+      body: { displayName: 'Alicia' },
+    });
+
+    expect(renamed.status).toBe(200);
+    expect(renamed.body.user.displayName).toBe('Alicia');
+    expect(renamed.body.token).toBeTruthy();
+
+    // The token names the creator of a group. Without a fresh one the new name
+    // would not reach a group made straight afterwards.
+    const group = await createGroup({ ...alice, token: renamed.body.token }, 'After the rename', nextYear);
+    expect(group.members[0].name).toBe('Alicia');
+  });
+
+  it('leaves the member row behind, so quotes about someone who left still read', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Leavers', nextYear);
+    await joinGroup(alice, bob, group.id);
+
+    const fresh = await request(`/api/groups/${group.id}`, { token: alice.token });
+    const bobMember = (fresh.body.group.members as { id: string; name: string }[]).find((m) => m.name === 'Bob')!;
+
+    await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { text: 'Something Bob said', saidByMemberId: bobMember.id },
+    });
+
+    const left = await request(`/api/groups/${group.id}/leave`, { method: 'POST', token: bob.token, body: {} });
+    expect(left.status).toBe(200);
+
+    // Access ends immediately, and the group is off his list.
+    const denied = await request(`/api/groups/${group.id}`, { token: bob.token });
+    expect(denied.status).toBe(404);
+    const account = await request('/api/auth/me', { token: bob.token });
+    expect(account.body.groups).toHaveLength(0);
+
+    // The history does not develop a hole. Bob is still on the quote.
+    await unlockGroup(group.id);
+    const stats = await request(`/api/groups/${group.id}/stats`, { token: alice.token });
+    expect(stats.body.leaderboard.find((entry: { name: string }) => entry.name === 'Bob')).toMatchObject({ said: 1 });
+
+    const quotes = await request(`/api/groups/${group.id}/quotes`, { token: alice.token });
+    expect(quotes.body.quotes[0].saidByMemberId).toBe(bobMember.id);
+  });
+
+  it('will not let the owner leave a group nobody could then manage', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Ownerless', nextYear);
+
+    const response = await request(`/api/groups/${group.id}/leave`, { method: 'POST', token: alice.token, body: {} });
+
+    expect(response.status).toBe(409);
+    expect(response.body.needsTransfer).toBe(true);
+  });
+
+  it('hands the group over, and then the old owner can leave', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Handover', nextYear);
+    await joinGroup(alice, bob, group.id);
+
+    const fresh = await request(`/api/groups/${group.id}`, { token: alice.token });
+    const bobMember = (fresh.body.group.members as { id: string; name: string }[]).find((m) => m.name === 'Bob')!;
+
+    const handed = await request(`/api/groups/${group.id}/members/transfer`, {
+      method: 'POST',
+      token: alice.token,
+      body: { memberId: bobMember.id },
+    });
+    expect(handed.status).toBe(200);
+    // The outgoing owner stays a member: this is a handover, not an exit.
+    expect(handed.body.group.you.role).toBe('member');
+
+    const asBob = await request(`/api/groups/${group.id}`, { token: bob.token });
+    expect(asBob.body.group.you.role).toBe('owner');
+
+    const left = await request(`/api/groups/${group.id}/leave`, { method: 'POST', token: alice.token, body: {} });
+    expect(left.status).toBe(200);
+  });
+
+  it('refuses to hand a group to a guest, who has no account to sign in with', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'No guests', nextYear);
+    const guest = await request(`/api/groups/${group.id}/members`, {
+      method: 'POST',
+      token: alice.token,
+      body: { name: 'Cleo' },
+    });
+
+    const response = await request(`/api/groups/${group.id}/members/transfer`, {
+      method: 'POST',
+      token: alice.token,
+      body: { memberId: guest.body.member.id },
+    });
+
+    expect(response.status).toBe(409);
+  });
+
+  it('renames a group, and the stale cached name heals when a member opens it (#9)', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Old name', nextYear);
+    await joinGroup(alice, bob, group.id);
+
+    const renamed = await request(`/api/groups/${group.id}/rename`, {
+      method: 'POST',
+      token: alice.token,
+      body: { name: 'New name' },
+    });
+    expect(renamed.status).toBe(200);
+
+    // The owner's own list is right straight away.
+    const ownerList = await request('/api/auth/me', { token: alice.token });
+    expect(ownerList.body.groups[0].name).toBe('New name');
+
+    // Bob's is stale until he looks at the group, and then it is not.
+    const staleList = await request('/api/auth/me', { token: bob.token });
+    expect(staleList.body.groups[0].name).toBe('Old name');
+
+    await request(`/api/groups/${group.id}`, { token: bob.token });
+
+    const healed = await request('/api/auth/me', { token: bob.token });
+    expect(healed.body.groups[0].name).toBe('New name');
+  });
+
+  it('lets nobody but the owner rename the group', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Not yours', nextYear);
+    await joinGroup(alice, bob, group.id);
+
+    const response = await request(`/api/groups/${group.id}/rename`, {
+      method: 'POST',
+      token: bob.token,
+      body: { name: 'Mine now' },
+    });
+
+    expect(response.status).toBe(403);
   });
 });

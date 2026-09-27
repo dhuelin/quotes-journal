@@ -2,19 +2,19 @@
  * The whole client is one document: small enough to inline, which keeps the
  * Worker a single deployable unit with no build step or asset bucket.
  */
-const html = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="theme-color" content="#0f1020" />
-    <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <link rel="manifest" href="/manifest.webmanifest" />
-    <link rel="apple-touch-icon" href="/icon.svg" />
-    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <title>Quotes Journal</title>
-    <style nonce="__CSP_NONCE__">
+
+/**
+ * The style and the script are their own strings so that the CSP can name them
+ * by content hash. A nonce would have done the same job, but a nonce changes on
+ * every response, which makes the document uncacheable — and an app shell that
+ * cannot be cached cannot work offline. A hash also says something stronger than
+ * a nonce does: a nonce authorises whatever inline block carries it, while a
+ * hash authorises exactly this text and nothing else.
+ *
+ * They are interpolated verbatim between the tags, so what the hash covers and
+ * what the browser executes are the same bytes by construction.
+ */
+const appStyles = `
       :root {
         --bg: #0f1020;
         --surface: #191a30;
@@ -160,14 +160,62 @@ const html = `<!doctype html>
          one whose picture fails to load — reads exactly as it did before. */
       .quote-photo img { max-width: 100%; border-radius: 10px; margin-top: .7rem; display: block; }
 
-      /* Inline style attributes cannot carry the CSP nonce, so every rule lives here. */
+      .quote-line { border-top: 1px solid var(--line); margin-top: 1rem; padding-top: .25rem; }
+      .quote-line:first-of-type { border-top: none; margin-top: 0; padding-top: 0; }
+      .remove-line { margin-top: .5rem; font-size: .85rem; }
+
+      /* An exchange, in the reveal and in the quiz alike. */
+      p.said { margin: 0 0 .5rem; }
+      p.said:last-of-type { margin-bottom: 0; }
+      .speaker {
+        display: inline-block; min-width: 3.5rem; margin-right: .5rem;
+        color: var(--accent); font-weight: 650;
+      }
+
+      .quiz-lines { text-align: left; margin: 1rem 0; }
+      .quiz-lines p.said { font-size: 1.05rem; }
+      .quiz-lines p.asked { font-weight: 650; }
+      .quiz-lines p.asked .speaker { color: var(--muted); }
+
+      .quiz-shell { text-align: center; }
+      .quiz-count { color: var(--muted); font-size: .85rem; letter-spacing: .04em; text-transform: uppercase; }
+      .quiz-quote { font-size: 1.3rem; font-weight: 650; line-height: 1.35; margin: .9rem 0; }
+      .quiz-photo img { max-width: 100%; max-height: 13rem; border-radius: 10px; margin: 0 auto .5rem; display: block; }
+
+      .quiz-answers { display: grid; gap: .5rem; margin-top: 1.1rem; }
+      .quiz-answers button {
+        margin: 0; text-align: left; font-weight: 550;
+        background: var(--surface-2); color: var(--text); border: 1px solid var(--line);
+      }
+      .quiz-answers button.right { background: var(--ok); color: #06281c; border-color: var(--ok); }
+      .quiz-answers button.wrong { background: var(--danger); color: #3a0d0d; border-color: var(--danger); }
+      /* The reveal colours have to stay readable, and every option becomes a
+         disabled button the moment an answer is in. */
+      .quiz-answers button:disabled { opacity: 1; cursor: default; }
+
+      /* Driven by a keyframe rather than a width set from script: a style
+         attribute is outside what the policy can authorise, and a CSS animation
+         needs no attribute at all. Re-rendering replaces the node, which is
+         what restarts the countdown for the next question. */
+      .quiz-timer { height: .45rem; border-radius: 999px; background: var(--surface-2); overflow: hidden; margin-top: 1rem; }
+      .quiz-timer i { display: block; height: 100%; background: var(--accent); transform-origin: left;
+        animation: quiz-countdown 20s linear forwards; }
+      @keyframes quiz-countdown { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+      @media (prefers-reduced-motion: reduce) { .quiz-timer i { animation: none; transform: scaleX(1); } }
+
+      .quiz-clock { font-variant-numeric: tabular-nums; }
+      .quiz-verdict { font-weight: 700; margin-top: 1rem; }
+      .quiz-verdict.right { color: var(--ok); }
+      .quiz-verdict.wrong { color: var(--danger); }
+      .quiz-score { font-size: 2.4rem; font-weight: 700; color: var(--accent); line-height: 1.1; }
+      tr.quiz-you td { color: var(--accent); }
+
+      /* Inline style attributes cannot be hashed or nonced, so every rule lives here. */
       .group-title { margin-top: .6rem; }
       .vault-note { margin-top: .7rem; }
-    </style>
-  </head>
-  <body>
-    <main id="app" aria-live="polite"></main>
-    <script nonce="__CSP_NONCE__">
+    `;
+
+const appScript = `
       (function () {
         'use strict';
 
@@ -183,6 +231,8 @@ const html = `<!doctype html>
           token: localStorage.getItem(TOKEN_KEY),
           user: null,
           groups: [],
+          /** Whether the group list on screen came from the server this session. */
+          groupsLoaded: false,
           group: null,
           tab: 'collect',
           reveal: null,
@@ -190,6 +240,14 @@ const html = `<!doctype html>
           pendingInvite: readInviteFromLocation(),
           /** The shrunk, re-encoded photo waiting to go up with the next quote. */
           pendingImage: null,
+          /** 'settings' when the settings page is open, otherwise null. */
+          view: null,
+          /** How many lines the quote form is showing. One is the common case. */
+          lineCount: 1,
+          /** The round in progress, if the quiz tab is being played. */
+          quiz: null,
+          /** Everyone's best round, loaded when the quiz tab is opened. */
+          quizScores: null,
         };
 
         /**
@@ -229,11 +287,23 @@ const html = `<!doctype html>
             headers.authorization = 'Bearer ' + state.token;
           }
 
-          var response = await fetch(path, {
-            method: settings.method || 'GET',
-            headers: headers,
-            body: settings.body ? JSON.stringify(settings.body) : undefined,
-          });
+          var response;
+          try {
+            response = await fetch(path, {
+              method: settings.method || 'GET',
+              headers: headers,
+              body: settings.body ? JSON.stringify(settings.body) : undefined,
+            });
+          } catch (error) {
+            // The service worker can open the app with no connection, but every
+            // quote lives on the server. Saying so is more use than the
+            // browser's own "Failed to fetch".
+            throw new Error(
+              navigator.onLine === false
+                ? 'You are offline. Quotes are kept on the server, so this needs a connection.'
+                : 'Could not reach the server. Check your connection and try again.',
+            );
+          }
 
           var payload = {};
           try {
@@ -270,11 +340,45 @@ const html = `<!doctype html>
           state.token = null;
           state.user = null;
           state.groups = [];
+          state.groupsLoaded = false;
           state.group = null;
           state.pendingImage = null;
+          state.quiz = null;
+          state.quizScores = null;
           localStorage.removeItem(TOKEN_KEY);
           notify(message || null, 'error');
           render();
+        }
+
+        /**
+         * The picker works in the browser's own zone and the value it produces
+         * is turned into an absolute instant on submit, so what someone picks is
+         * what their group gets. Reading it back uses the viewer's zone, which
+         * is the honest answer to "when does this open for me".
+         */
+        function revealLabel(iso) {
+          var when = new Date(iso);
+          return when.toLocaleString(undefined, {
+            day: 'numeric',
+            month: 'long',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+          });
+        }
+
+        /** What the date field starts on: midnight on 1 January, as it always was. */
+        function defaultRevealLocal() {
+          return localInputValue(new Date(new Date().getUTCFullYear() + 1, 0, 1, 0, 0, 0));
+        }
+
+        /** A Date as a datetime-local field wants it: local time, no zone, no seconds. */
+        function localInputValue(date) {
+          var pad = function (value) { return String(value).padStart(2, '0'); };
+          return (
+            date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) +
+            'T' + pad(date.getHours()) + ':' + pad(date.getMinutes())
+          );
         }
 
         function daysUntil(iso) {
@@ -346,6 +450,49 @@ const html = `<!doctype html>
           );
         }
 
+        function settingsView() {
+          var groups = state.groups
+            .map(function (group) {
+              return (
+                '<li><span>' + escapeHtml(group.name) +
+                '<div class="small muted">' + escapeHtml(group.role) + '</div></span>' +
+                (group.role === 'owner'
+                  ? '<span class="pill">you own this</span>'
+                  : '<button class="link" data-leave-group="' + escapeHtml(group.groupId) + '">Leave</button>') +
+                '</li>'
+              );
+            })
+            .join('');
+
+          return (
+            headerHtml() +
+            '<button class="link" id="back-to-groups">&larr; All groups</button>' +
+            '<h1 class="group-title">Settings</h1>' +
+            noticeHtml() +
+            '<div class="card">' +
+            '<h2>Your name</h2>' +
+            '<p class="small muted">Shown next to your quotes, and used when you create or join a group from now on. It does not rename you inside groups you are already in &mdash; names have to stay unique within a group, so that is the owner&rsquo;s control.</p>' +
+            '<form id="display-name-form">' +
+            '<label for="display-name">Display name</label>' +
+            '<input id="display-name" name="displayName" required value="' + escapeHtml(state.user ? state.user.displayName : '') + '" />' +
+            '<button type="submit">Save name</button>' +
+            '</form>' +
+            '</div>' +
+            '<div class="card">' +
+            '<h2>Your groups</h2>' +
+            (groups
+              ? '<ul class="list">' + groups + '</ul>' +
+                '<p class="small muted">Leaving keeps your name on the quotes you are already in &mdash; the group&rsquo;s history should not develop holes because you left &mdash; but you lose access to it. To leave a group you own, hand it to someone else first.</p>'
+              : '<p class="muted">You are not in any groups yet.</p>') +
+            '</div>' +
+            '<div class="card">' +
+            '<h2>Your account</h2>' +
+            '<p class="small muted">Signed in as ' + escapeHtml(state.user ? state.user.email : '') + '.</p>' +
+            '<p class="small muted">Changing your password and deleting your account are not built yet.</p>' +
+            '</div>'
+          );
+        }
+
         function groupsView() {
           var items = state.groups
             .map(function (group) {
@@ -369,7 +516,12 @@ const html = `<!doctype html>
             noticeHtml() +
             '<div class="card">' +
             '<h2>Your groups</h2>' +
-            (items || '<p class="muted">No groups yet. Create one below, or paste an invite link from a friend.</p>') +
+            (items ||
+              (state.groupsLoaded
+                ? '<p class="muted">No groups yet. Create one below, or paste an invite link from a friend.</p>'
+                : // Not the same thing as having none, and saying so would be a
+                  // lie to anyone who opened the installed app on a train.
+                  '<p class="muted">Your groups could not be loaded. They are on the server and need a connection.</p>')) +
             '</div>' +
             '<div class="card">' +
             '<h2>Start a group</h2>' +
@@ -378,7 +530,9 @@ const html = `<!doctype html>
             '<input id="group-name" name="name" required placeholder="Sunday football crew" />' +
             '<label for="group-year">Collect quotes for</label>' +
             '<input id="group-year" name="revealYear" type="number" required value="' + new Date().getUTCFullYear() + '" />' +
-            '<p class="small muted">Everything unlocks on 1 January of the following year.</p>' +
+            '<label for="group-reveal">Open on</label>' +
+            '<input id="group-reveal" name="revealAt" type="datetime-local" required value="' + escapeHtml(defaultRevealLocal()) + '" />' +
+            '<p class="small muted">Your own clock, not UTC. The date can be pushed back later, but never pulled forward &mdash; everyone who records a quote is promised it stays sealed until then.</p>' +
             '<button type="submit">Create group</button>' +
             '</form>' +
             '</div>' +
@@ -398,7 +552,7 @@ const html = `<!doctype html>
             '<header class="bar">' +
             '<div class="brand"><span class="mark">&#8220;&#8221;</span> Quotes Journal</div>' +
             '<div class="small muted">' +
-            escapeHtml(state.user ? state.user.displayName : '') +
+            '<button class="link" id="open-settings">' + escapeHtml(state.user ? state.user.displayName : '') + '</button>' +
             ' &middot; <button class="link" id="sign-out">Sign out</button></div>' +
             '</header>'
           );
@@ -408,10 +562,7 @@ const html = `<!doctype html>
           var group = state.group;
           // Once the reveal has passed the server refuses new quotes, so
           // offering the form would be a promise the app cannot keep.
-          var tabs = group.locked ? ['collect', 'members'] : ['members'];
-          if (!group.locked) {
-            tabs.unshift('reveal');
-          }
+          var tabs = group.locked ? ['collect', 'members'] : ['reveal', 'quiz', 'members'];
 
           // A tab from a URL or an earlier group may not exist here — a revealed
           // group has no collect tab — so settle on a real one before rendering.
@@ -421,7 +572,7 @@ const html = `<!doctype html>
 
           var tabsHtml = tabs
             .map(function (tab) {
-              var labels = { collect: 'Add a quote', members: 'Members', reveal: 'The reveal' };
+              var labels = { collect: 'Add a quote', members: 'Members', reveal: 'The reveal', quiz: 'Quiz' };
               return (
                 '<button role="tab" data-tab="' + tab + '" aria-selected="' + (state.tab === tab) + '">' +
                 labels[tab] +
@@ -435,6 +586,8 @@ const html = `<!doctype html>
             body = membersTab();
           } else if (state.tab === 'reveal') {
             body = revealTab();
+          } else if (state.tab === 'quiz') {
+            body = quizTab();
           } else {
             body = collectTab();
           }
@@ -445,8 +598,9 @@ const html = `<!doctype html>
             '<h1 class="group-title">' + escapeHtml(group.name) + '</h1>' +
             '<p class="muted small">' +
             (group.locked
-              ? 'Sealed until 1 January ' + (group.revealYear + 1) + ' &middot; ' + daysUntil(group.revealAt) + ' days to go'
-              : 'Open since 1 January ' + (group.revealYear + 1)) +
+              ? 'Sealed until ' + escapeHtml(revealLabel(group.revealAt)) + ' &middot; ' + daysUntil(group.revealAt) + ' days to go'
+              : 'Open since ' + escapeHtml(revealLabel(group.revealAt))) +
+            (group.revealMovedAt ? ' <span class="pill">date moved</span>' : '') +
             '</p>' +
             noticeHtml() +
             '<div class="tabs" role="tablist">' + tabsHtml + '</div>' +
@@ -479,11 +633,9 @@ const html = `<!doctype html>
           return (
             '<div class="card">' +
             '<form id="quote-form">' +
-            '<label for="quote-text">What was said?</label>' +
-            '<textarea id="quote-text" name="text" required placeholder="&#8220;I am not lost, the map is wrong.&#8221;"></textarea>' +
-            '<p class="small muted" id="quote-count">0 / 500</p>' +
-            '<label for="quote-said-by">Who said it?</label>' +
-            '<select id="quote-said-by" name="saidByMemberId" required>' + options + '</select>' +
+            lineFields(options) +
+            '<button type="button" class="secondary" id="add-line">Add another line</button>' +
+            '<p class="small muted">For a back-and-forth: each line keeps its own speaker, so an exchange stays an exchange.</p>' +
             (involved ? '<label>Who else was there?</label><div class="checks">' + involved + '</div>' : '') +
             '<label for="quote-photo">Add a picture (optional)</label>' +
             '<input id="quote-photo" name="photo" type="file" accept="image/jpeg,image/png,image/webp" />' +
@@ -500,8 +652,46 @@ const html = `<!doctype html>
           );
         }
 
+        /**
+         * One block per line. A single remark looks exactly as it always did —
+         * one box, one speaker — and a conversation is the same thing repeated,
+         * which keeps the common case from paying for the rare one.
+         */
+        function lineFields(options) {
+          var blocks = [];
+          for (var index = 0; index < state.lineCount; index += 1) {
+            var first = index === 0;
+            blocks.push(
+              '<div class="quote-line">' +
+              '<label for="quote-text-' + index + '">' +
+              (first ? 'What was said?' : 'And then?') +
+              '</label>' +
+              '<textarea id="quote-text-' + index + '" name="lineText" required placeholder="' +
+              (first ? '&#8220;I am not lost, the map is wrong.&#8221;' : '&#8220;You have been driving in circles.&#8221;') +
+              '"></textarea>' +
+              '<p class="small muted" id="quote-count-' + index + '">0 / 500</p>' +
+              '<label for="quote-said-by-' + index + '">Who said it?</label>' +
+              '<select id="quote-said-by-' + index + '" name="lineSpeaker" required>' + options + '</select>' +
+              (first
+                ? ''
+                : '<button type="button" class="link remove-line" data-remove-line="' + index + '">Remove this line</button>') +
+              '</div>',
+            );
+          }
+          return blocks.join('');
+        }
+
         function membersTab() {
           var group = state.group;
+          // Only someone with an account can take a group on; a guest has no
+          // way to sign in and manage it.
+          var handoverOptions = group.members
+            .filter(function (member) { return !member.isYou && !member.isGuest; })
+            .map(function (member) {
+              return '<option value="' + escapeHtml(member.id) + '">' + escapeHtml(member.name) + '</option>';
+            })
+            .join('');
+
           var items = group.members
             .map(function (member) {
               return (
@@ -525,6 +715,35 @@ const html = `<!doctype html>
                 '<p class="small muted">Rotating makes every previously shared link stop working.</p>'
               : '') +
             '</div>' +
+            (group.you.role === 'owner'
+              ? '<div class="card">' +
+                '<h2>Group settings</h2>' +
+                '<form id="group-rename-form">' +
+                '<label for="group-rename">Group name</label>' +
+                '<input id="group-rename" name="name" required value="' + escapeHtml(group.name) + '" />' +
+                '<button class="secondary" type="submit">Rename group</button>' +
+                '</form>' +
+                (handoverOptions
+                  ? '<form id="transfer-form">' +
+                    '<label for="transfer-to">Hand the group over</label>' +
+                    '<select id="transfer-to" name="memberId">' + handoverOptions + '</select>' +
+                    '<p class="small muted">They become the owner and you stay a member. You cannot leave a group you own until you have.</p>' +
+                    '<button class="secondary" type="submit">Hand over</button>' +
+                    '</form>'
+                  : '') +
+                '</div>'
+              : '') +
+            (group.you.role === 'owner' && group.locked
+              ? '<div class="card">' +
+                '<h2>The reveal date</h2>' +
+                '<p class="small muted">Opens ' + escapeHtml(revealLabel(group.revealAt)) + '. You can push this back, but not pull it forward: everyone who has recorded a quote did it on the promise that nobody reads it before then.</p>' +
+                '<form id="reveal-form">' +
+                '<label for="reveal-at">Move it later</label>' +
+                '<input id="reveal-at" name="revealAt" type="datetime-local" required value="' + escapeHtml(localInputValue(new Date(group.revealAt))) + '" />' +
+                '<button class="secondary" type="submit">Postpone the reveal</button>' +
+                '</form>' +
+                '</div>'
+              : '') +
             '<div class="card">' +
             '<h2>Add someone without an account</h2>' +
             '<p class="small muted">Use this for friends who should be quotable but are not using the app.</p>' +
@@ -548,12 +767,30 @@ const html = `<!doctype html>
                 .filter(function (id) { return id !== quote.saidByMemberId; })
                 .map(memberName);
 
+              var body;
+              var attribution;
+              if (quote.lines && quote.lines.length > 1) {
+                body = quote.lines
+                  .map(function (line) {
+                    return (
+                      '<p class="said"><span class="speaker">' + escapeHtml(memberName(line.saidByMemberId)) +
+                      '</span>' + escapeHtml(line.text) + '</p>'
+                    );
+                  })
+                  .join('');
+                attribution = 'recorded by ' + escapeHtml(memberName(quote.recordedByMemberId));
+              } else {
+                body = escapeHtml(quote.text);
+                attribution =
+                  '&mdash; ' + escapeHtml(memberName(quote.saidByMemberId)) +
+                  ', recorded by ' + escapeHtml(memberName(quote.recordedByMemberId));
+              }
+
               return (
                 '<blockquote>' +
-                escapeHtml(quote.text) +
+                body +
                 (quote.image ? '<div class="quote-photo" data-photo="' + escapeHtml(quote.id) + '"></div>' : '') +
-                '<footer>&mdash; ' + escapeHtml(memberName(quote.saidByMemberId)) +
-                ', recorded by ' + escapeHtml(memberName(quote.recordedByMemberId)) +
+                '<footer>' + attribution +
                 (involved.length ? ' &middot; with ' + escapeHtml(involved.join(', ')) : '') +
                 '</footer></blockquote>'
               );
@@ -579,6 +816,154 @@ const html = `<!doctype html>
             '<div class="card">' +
             '<h2>' + escapeHtml(state.reveal.quotes.length) + (state.reveal.quotes.length === 1 ? ' quote' : ' quotes') + '</h2>' +
             (quotes || '<p class="muted">This group never recorded a quote.</p>') +
+            '</div>'
+          );
+        }
+
+        /* ---------- the quiz ---------- */
+
+        function quizTab() {
+          var quiz = state.quiz;
+          if (!quiz) {
+            return quizIntro();
+          }
+          if (quiz.phase === 'over') {
+            return quizSummary();
+          }
+          return quizRound();
+        }
+
+        function quizIntro() {
+          var group = state.group;
+          var enough = group.members.length >= 3;
+
+          return (
+            '<div class="card quiz-shell">' +
+            '<h2>Who said what?</h2>' +
+            '<p class="muted">' + escapeHtml(group.progress.totalQuotes) +
+            (group.progress.totalQuotes === 1 ? ' quote' : ' quotes') +
+            ', in a random order. A faster right answer is worth more, and a wrong one is worth nothing.</p>' +
+            (enough
+              ? '<button id="quiz-start">Start the quiz</button>'
+              : '<p class="muted small">A quiz needs at least three people in the group &mdash; with two, every question is a coin flip between you and one other person.</p>') +
+            '</div>' +
+            quizScoreboard()
+          );
+        }
+
+        function quizRound() {
+          var quiz = state.quiz;
+          var question = quiz.question;
+          var verdict = quiz.verdict;
+
+          var answers = question.options
+            .map(function (option) {
+              var mark = '';
+              if (verdict) {
+                if (option.id === verdict.answerMemberId) {
+                  mark = ' class="right"';
+                } else if (option.id === verdict.picked) {
+                  mark = ' class="wrong"';
+                }
+              }
+              return (
+                '<button data-answer="' + escapeHtml(option.id) + '"' + mark + (verdict ? ' disabled' : '') + '>' +
+                escapeHtml(option.name) +
+                '</button>'
+              );
+            })
+            .join('');
+
+          var footer;
+          if (verdict) {
+            footer =
+              '<p class="quiz-verdict ' + (verdict.correct ? 'right' : 'wrong') + '">' +
+              (verdict.correct
+                ? 'Right &mdash; ' + escapeHtml(verdict.points) + ' points'
+                : 'It was ' + escapeHtml(memberName(verdict.answerMemberId))) +
+              '</p>';
+          } else {
+            footer =
+              '<div class="quiz-timer"><i></i></div>' +
+              '<p class="small muted"><span class="quiz-clock" id="quiz-clock">20</span>s left</p>';
+          }
+
+          return (
+            '<div class="card quiz-shell">' +
+            '<p class="quiz-count">Question ' + escapeHtml(question.number) + ' of ' + escapeHtml(question.total) +
+            ' &middot; ' + escapeHtml(quiz.score) + ' points</p>' +
+            (question.hasImage ? '<div class="quiz-photo" data-quiz-photo="' + escapeHtml(question.quoteId) + '"></div>' : '') +
+            quizLinesHtml(question) +
+            '<div class="quiz-answers">' + answers + '</div>' +
+            footer +
+            '</div>'
+          );
+        }
+
+        /**
+         * A single remark reads as one big quote, as it always has. An exchange
+         * shows every line, with the one being asked about left unattributed —
+         * the others are named, because that context is what makes the question
+         * answerable rather than a guess.
+         */
+        function quizLinesHtml(question) {
+          if (question.lines.length === 1) {
+            return '<p class="quiz-quote">&#8220;' + escapeHtml(question.lines[0].text) + '&#8221;</p>';
+          }
+
+          return (
+            '<div class="quiz-lines">' +
+            question.lines
+              .map(function (line) {
+                return (
+                  '<p class="said' + (line.speaker === null ? ' asked' : '') + '">' +
+                  '<span class="speaker">' + (line.speaker === null ? '&#63;' : escapeHtml(line.speaker)) + '</span>' +
+                  escapeHtml(line.text) +
+                  '</p>'
+                );
+              })
+              .join('') +
+            '</div>'
+          );
+        }
+
+        function quizSummary() {
+          var summary = state.quiz.summary;
+
+          return (
+            '<div class="card quiz-shell">' +
+            '<p class="quiz-count">Round over</p>' +
+            '<div class="quiz-score">' + escapeHtml(summary.score) + '</div>' +
+            '<p class="muted">' + escapeHtml(summary.correct) + ' of ' + escapeHtml(summary.total) + ' right</p>' +
+            '<button id="quiz-again">Play again</button>' +
+            '</div>' +
+            quizScoreboard()
+          );
+        }
+
+        /** Everyone's best round. A score with nothing to compare it to is not a game. */
+        function quizScoreboard() {
+          var scores = state.quizScores;
+          if (!scores || !scores.length) {
+            return '';
+          }
+
+          var rows = scores
+            .map(function (entry) {
+              var you = entry.memberId === state.group.you.memberId;
+              return (
+                '<tr' + (you ? ' class="quiz-you"' : '') + '><td>' + escapeHtml(entry.name) + '</td>' +
+                '<td class="num">' + escapeHtml(entry.correct) + '/' + escapeHtml(entry.total) + '</td>' +
+                '<td class="num">' + escapeHtml(entry.score) + '</td></tr>'
+              );
+            })
+            .join('');
+
+          return (
+            '<div class="card">' +
+            '<h2>Best rounds</h2>' +
+            '<table><thead><tr><th>Member</th><th class="num">Right</th><th class="num">Points</th></tr></thead>' +
+            '<tbody>' + rows + '</tbody></table>' +
             '</div>'
           );
         }
@@ -641,6 +1026,8 @@ const html = `<!doctype html>
 
           if (!state.token) {
             app.innerHTML = authView();
+          } else if (state.view === 'settings') {
+            app.innerHTML = settingsView();
           } else if (state.group) {
             app.innerHTML = groupView();
           } else {
@@ -716,10 +1103,52 @@ const html = `<!doctype html>
           });
 
           onClick('sign-out', function () { signOut(); });
+
+          onClick('open-settings', function () {
+            state.view = 'settings';
+            state.group = null;
+            history.pushState({}, '', '/settings');
+            render();
+          });
+
+          onSubmit('display-name-form', async function (form) {
+            var result = await api('/api/account/display-name', {
+              method: 'POST',
+              body: { displayName: form.displayName.value },
+            });
+            // The token carries the name, so the new one replaces the old.
+            state.token = result.token;
+            state.user = result.user;
+            localStorage.setItem(TOKEN_KEY, result.token);
+            notify('Your name was changed.', 'ok');
+            render();
+          });
+
+          document.querySelectorAll('[data-leave-group]').forEach(function (button) {
+            button.addEventListener('click', async function () {
+              var groupId = button.getAttribute('data-leave-group');
+              var group = state.groups.filter(function (entry) { return entry.groupId === groupId; })[0];
+              if (!confirm('Leave ' + (group ? group.name : 'this group') + '? Your name stays on the quotes you are already in, but you lose access.')) {
+                return;
+              }
+
+              try {
+                await api('/api/groups/' + encodeURIComponent(groupId) + '/leave', { method: 'POST', body: {} });
+                await loadGroups();
+                notify('You left the group.', 'ok');
+              } catch (error) {
+                notify(error.message, 'error');
+              }
+              render();
+            });
+          });
           onClick('back-to-groups', function () {
             state.group = null;
+            state.view = null;
             state.reveal = null;
             state.pendingImage = null;
+            state.quiz = null;
+            state.quizScores = null;
             state.tab = 'collect';
             history.pushState({}, '', '/app');
             render();
@@ -796,7 +1225,13 @@ const html = `<!doctype html>
           onSubmit('create-group-form', async function (form) {
             var created = await api('/api/groups', {
               method: 'POST',
-              body: { name: form.name.value, revealYear: Number(form.revealYear.value) },
+              body: {
+                name: form.name.value,
+                revealYear: Number(form.revealYear.value),
+                // A datetime-local value has no zone, so the browser reads it in
+                // its own — which is exactly what the person picking it meant.
+                revealAt: form.revealAt.value ? new Date(form.revealAt.value).toISOString() : undefined,
+              },
             });
             await loadGroups();
             state.group = created.group;
@@ -826,6 +1261,40 @@ const html = `<!doctype html>
             render();
           });
 
+          onSubmit('group-rename-form', async function (form) {
+            await api('/api/groups/' + encodeURIComponent(state.group.id) + '/rename', {
+              method: 'POST',
+              body: { name: form.name.value },
+            });
+            await loadGroups();
+            await openGroup(state.group.id, 'members');
+            notify('The group was renamed.', 'ok');
+            render();
+          });
+
+          onSubmit('transfer-form', async function (form) {
+            if (!confirm('Hand this group over? You stay a member, but they become the owner.')) {
+              return;
+            }
+            await api('/api/groups/' + encodeURIComponent(state.group.id) + '/members/transfer', {
+              method: 'POST',
+              body: { memberId: form.memberId.value },
+            });
+            await openGroup(state.group.id, 'members');
+            notify('The group has a new owner.', 'ok');
+            render();
+          });
+
+          onSubmit('reveal-form', async function (form) {
+            await api('/api/groups/' + encodeURIComponent(state.group.id) + '/reveal', {
+              method: 'POST',
+              body: { revealAt: new Date(form.revealAt.value).toISOString() },
+            });
+            await openGroup(state.group.id, 'members');
+            notify('The reveal was moved. Everyone in the group can see the new date.', 'ok');
+            render();
+          });
+
           onSubmit('member-form', async function (form) {
             await api('/api/groups/' + encodeURIComponent(state.group.id) + '/members', {
               method: 'POST',
@@ -836,16 +1305,53 @@ const html = `<!doctype html>
             render();
           });
 
-          var quoteText = document.getElementById('quote-text');
-          var quoteCount = document.getElementById('quote-count');
-          if (quoteText && quoteCount) {
+          document.querySelectorAll('[name="lineText"]').forEach(function (field, index) {
+            var counter = document.getElementById('quote-count-' + index);
+            if (!counter) {
+              return;
+            }
             var showCount = function () {
-              quoteCount.textContent = quoteText.value.length + ' / 500';
-              quoteCount.className = quoteText.value.length > 500 ? 'small' : 'small muted';
+              counter.textContent = field.value.length + ' / 500';
+              counter.className = field.value.length > 500 ? 'small' : 'small muted';
             };
-            quoteText.addEventListener('input', showCount);
+            field.addEventListener('input', showCount);
             showCount();
-          }
+          });
+
+          onClick('add-line', function () {
+            if (state.lineCount < 10) {
+              state.lineCount += 1;
+              render({ keepInput: true });
+            }
+          });
+
+          document.querySelectorAll('[data-remove-line]').forEach(function (button) {
+            button.addEventListener('click', function () {
+              // Re-read what is typed, drop the removed line, and put the rest
+              // back — otherwise removing line 2 of 3 would silently shift the
+              // third line's text up into its place.
+              var texts = [];
+              var speakers = [];
+              document.querySelectorAll('[name="lineText"]').forEach(function (field) { texts.push(field.value); });
+              document.querySelectorAll('[name="lineSpeaker"]').forEach(function (field) { speakers.push(field.value); });
+
+              var gone = Number(button.getAttribute('data-remove-line'));
+              texts.splice(gone, 1);
+              speakers.splice(gone, 1);
+              state.lineCount = Math.max(1, state.lineCount - 1);
+              render();
+
+              document.querySelectorAll('[name="lineText"]').forEach(function (field, index) {
+                field.value = texts[index] || '';
+                field.dispatchEvent(new Event('input'));
+              });
+              document.querySelectorAll('[name="lineSpeaker"]').forEach(function (field, index) {
+                if (speakers[index]) {
+                  field.value = speakers[index];
+                }
+              });
+            });
+          });
 
           var photoField = document.getElementById('quote-photo');
           if (photoField) {
@@ -875,18 +1381,40 @@ const html = `<!doctype html>
             loadQuotePhotos();
           }
 
+          clearQuizClock();
+          onClick('quiz-start', function () { startQuiz(); });
+          onClick('quiz-again', function () { startQuiz(); });
+          document.querySelectorAll('[data-answer]').forEach(function (button) {
+            button.addEventListener('click', function () {
+              submitAnswer(button.getAttribute('data-answer'));
+            });
+          });
+
+          if (state.quiz && state.quiz.phase === 'asking') {
+            startQuizClock();
+            if (state.quiz.question.hasImage) {
+              loadQuizPhoto();
+            }
+          }
+
+          if (state.tab === 'quiz' && !state.quizScores) {
+            loadQuizScores();
+          }
+
           onSubmit('quote-form', async function (form) {
             var involved = Array.prototype.slice
               .call(form.querySelectorAll('input[name="involved"]:checked'))
               .map(function (input) { return input.value; });
 
+            var texts = Array.prototype.slice.call(form.querySelectorAll('[name="lineText"]'));
+            var speakers = Array.prototype.slice.call(form.querySelectorAll('[name="lineSpeaker"]'));
+            var lines = texts.map(function (field, index) {
+              return { text: field.value, saidByMemberId: speakers[index].value };
+            });
+
             var saved = await api('/api/groups/' + encodeURIComponent(state.group.id) + '/quotes', {
               method: 'POST',
-              body: {
-                text: form.text.value,
-                saidByMemberId: form.saidByMemberId.value,
-                involvedMemberIds: involved,
-              },
+              body: { lines: lines, involvedMemberIds: involved },
             });
 
             // The picture goes up second, against the quote that now exists. If
@@ -903,6 +1431,7 @@ const html = `<!doctype html>
               state.pendingImage = null;
             }
 
+            state.lineCount = 1;
             await openGroup(state.group.id, 'collect');
             notify(
               imageError
@@ -1051,6 +1580,153 @@ const html = `<!doctype html>
           });
         }
 
+        /**
+         * The countdown is a CSS animation, so nothing here touches a style —
+         * this only keeps the number in step and answers for a player who let
+         * the question run out. An expired question is a real answer worth
+         * nothing, which is why it is submitted rather than skipped.
+         */
+        var quizClock = null;
+
+        function clearQuizClock() {
+          if (quizClock) {
+            clearInterval(quizClock);
+            quizClock = null;
+          }
+        }
+
+        function startQuizClock() {
+          clearQuizClock();
+          var seconds = Math.round(state.quiz.question.answerWindowMs / 1000);
+          var label = document.getElementById('quiz-clock');
+          if (label) {
+            label.textContent = seconds;
+          }
+
+          quizClock = setInterval(function () {
+            seconds -= 1;
+            var tick = document.getElementById('quiz-clock');
+            if (tick) {
+              tick.textContent = Math.max(0, seconds);
+            }
+            if (seconds <= 0) {
+              clearQuizClock();
+              submitAnswer(null);
+            }
+          }, 1000);
+        }
+
+        async function startQuiz() {
+          try {
+            var started = await api('/api/groups/' + encodeURIComponent(state.group.id) + '/quiz/start', {
+              method: 'POST',
+              body: {},
+            });
+            state.quiz = { phase: 'asking', question: started.question, score: 0, verdict: null };
+            render();
+          } catch (error) {
+            if (error.message !== 'unauthenticated') {
+              notify(error.message, 'error');
+              render();
+            }
+          }
+        }
+
+        /** A null memberId is a question that ran out of time. */
+        async function submitAnswer(memberId) {
+          var quiz = state.quiz;
+          if (!quiz || quiz.phase !== 'asking') {
+            return;
+          }
+
+          // Set before the request so a second tap cannot send a second answer.
+          quiz.phase = 'revealing';
+          clearQuizClock();
+
+          try {
+            var result = await api('/api/groups/' + encodeURIComponent(state.group.id) + '/quiz/answer', {
+              method: 'POST',
+              body: { quoteId: quiz.question.quoteId, memberId: memberId },
+            });
+
+            quiz.verdict = {
+              correct: result.correct,
+              answerMemberId: result.answerMemberId,
+              picked: memberId,
+              points: result.points,
+            };
+            quiz.score = result.score;
+            quiz.pending = result.question;
+            quiz.finished = result.finished;
+            quiz.summary = result.summary;
+            render();
+
+            setTimeout(advanceQuiz, 2200);
+          } catch (error) {
+            if (error.message !== 'unauthenticated') {
+              // Back to asking, so a dropped connection costs the question and
+              // not the round.
+              quiz.phase = 'asking';
+              notify(error.message, 'error');
+              render();
+            }
+          }
+        }
+
+        function advanceQuiz() {
+          var quiz = state.quiz;
+          if (!quiz || !quiz.verdict) {
+            return;
+          }
+
+          if (quiz.finished) {
+            quiz.phase = 'over';
+            loadQuizScores();
+          } else {
+            quiz.question = quiz.pending;
+            quiz.verdict = null;
+            quiz.phase = 'asking';
+          }
+          render();
+        }
+
+        async function loadQuizScores() {
+          try {
+            var scores = await api('/api/groups/' + encodeURIComponent(state.group.id) + '/quiz/scores');
+            state.quizScores = scores.leaderboard;
+            render();
+          } catch (error) {
+            // The round still stands without the comparison.
+          }
+        }
+
+        /** The same bearer-token fetch the reveal uses; no URL carries a credential. */
+        function loadQuizPhoto() {
+          var holder = document.querySelector('[data-quiz-photo]');
+          if (!holder) {
+            return;
+          }
+
+          var quoteId = holder.getAttribute('data-quiz-photo');
+          fetch(
+            '/api/groups/' + encodeURIComponent(state.group.id) + '/quotes/' + encodeURIComponent(quoteId) + '/image',
+            { headers: { authorization: 'Bearer ' + state.token } },
+          )
+            .then(function (response) { return response.ok ? response.blob() : null; })
+            .then(function (blob) {
+              if (!blob) {
+                return;
+              }
+              var image = document.createElement('img');
+              var url = URL.createObjectURL(blob);
+              image.src = url;
+              image.alt = 'Picture attached to this quote';
+              image.addEventListener('load', function () { URL.revokeObjectURL(url); });
+              holder.appendChild(image);
+            })
+            .catch(function () {});
+        }
+
         function showInvite(code) {
           var box = document.getElementById('invite-box');
           if (box) {
@@ -1145,6 +1821,7 @@ const html = `<!doctype html>
           var account = await api('/api/auth/me');
           state.user = account.user;
           state.groups = account.groups;
+          state.groupsLoaded = true;
         }
 
         /**
@@ -1192,6 +1869,9 @@ const html = `<!doctype html>
         // backslash in a regex here is eaten before the browser ever sees it.
         function locationTarget() {
           var parts = location.pathname.split('/').filter(Boolean);
+          if (parts[0] === 'settings') {
+            return { settings: true };
+          }
           if (parts[0] !== 'groups' || !parts[1]) {
             return null;
           }
@@ -1212,10 +1892,14 @@ const html = `<!doctype html>
           try {
             var result = await api('/api/groups/' + encodeURIComponent(groupId));
             if (!reopening) {
-              // A picture chosen for one group's form has no meaning in another.
+              // A picture chosen for one group's form has no meaning in another,
+              // and neither does a round in progress.
               state.pendingImage = null;
+              state.quiz = null;
+              state.quizScores = null;
             }
             state.group = result.group;
+            state.view = null;
             state.tab = tab || defaultTab(result.group);
             state.reveal = null;
 
@@ -1261,12 +1945,21 @@ const html = `<!doctype html>
             return;
           }
 
+          if (target && target.settings) {
+            state.view = 'settings';
+            state.group = null;
+            render();
+            return;
+          }
+
           if (target) {
+            state.view = null;
             openGroup(target.groupId, target.tab, { fromHistory: true });
             return;
           }
 
           state.group = null;
+          state.view = null;
           state.reveal = null;
           render();
         });
@@ -1291,6 +1984,12 @@ const html = `<!doctype html>
           }
 
           var target = locationTarget();
+          if (target && target.settings) {
+            state.view = 'settings';
+            render();
+            return;
+          }
+
           if (target) {
             await openGroup(target.groupId, target.tab, { fromHistory: true });
             return;
@@ -1301,15 +2000,33 @@ const html = `<!doctype html>
 
         boot();
       })();
-    </script>
+    `;
+
+const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0f1020" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <title>Quotes Journal</title>
+    <style>${appStyles}</style>
+  </head>
+  <body>
+    <main id="app" aria-live="polite"></main>
+    <script>${appScript}</script>
   </body>
 </html>`;
 
-/**
- * The inline <style> and <script> are allowed by a per-response CSP nonce, which
- * is stamped into both tags here.
- */
-export const renderAppHtml = (nonce: string): string => html.replaceAll('__CSP_NONCE__', nonce);
+/** The one document the app is served as, identical on every response. */
+export const renderAppHtml = (): string => html;
+
+/** What the policy has to name for the app shell to run at all. */
+export const appInline = { styles: appStyles, script: appScript };
 
 /**
  * The privacy policy, served at /privacy. Both app stores require a reachable
@@ -1317,17 +2034,10 @@ export const renderAppHtml = (nonce: string): string => html.replaceAll('__CSP_N
  * match what this says — so it describes exactly what the code does and nothing
  * aspirational.
  *
- * Kept in the same file and under the same CSP as the app: one inline style,
- * carrying the nonce, no scripts at all.
+ * Kept in the same file and under the same kind of policy as the app: one
+ * inline style, named by its hash, and no scripts at all.
  */
-const privacyHtml = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#0f1020" />
-    <title>Privacy — Quotes Journal</title>
-    <style nonce="__CSP_NONCE__">
+const privacyStyles = `
       :root { --bg:#0f1020; --surface:#191a30; --line:#32345a; --text:#f2f2f7; --muted:#a2a4c4; --accent:#f8c630; color-scheme: dark; }
       * { box-sizing: border-box; }
       body { margin:0; background:var(--bg); color:var(--text);
@@ -1340,9 +2050,18 @@ const privacyHtml = `<!doctype html>
       a { color:var(--accent); }
       .muted { color:var(--muted); }
       .card { background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:1rem 1.25rem; margin-top:1.5rem; }
-      /* A nonce authorises inline style blocks but never style attributes. */
+      /* A hash names an inline style block; a style attribute cannot be named at all. */
       .flush { margin-top:0; }
-    </style>
+    `;
+
+const privacyHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0f1020" />
+    <title>Privacy — Quotes Journal</title>
+    <style>${privacyStyles}</style>
   </head>
   <body>
     <main>
@@ -1414,4 +2133,7 @@ const privacyHtml = `<!doctype html>
   </body>
 </html>`;
 
-export const renderPrivacyHtml = (nonce: string): string => privacyHtml.replaceAll('__CSP_NONCE__', nonce);
+
+export const renderPrivacyHtml = (): string => privacyHtml;
+
+export const privacyInline = { styles: privacyStyles };

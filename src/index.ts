@@ -3,6 +3,7 @@ import { GroupStore } from './group-store';
 import { UserStore } from './user-store';
 import { RateLimiter, type RateLimitDecision } from './rate-limiter';
 import { renderAppHtml, renderPrivacyHtml } from './ui';
+import { policies } from './csp';
 import { LIMITS } from './domain';
 import {
   createInviteCode,
@@ -13,7 +14,14 @@ import {
   verifySessionToken,
   type SessionUser,
 } from './auth';
-import { readJsonBody, validateEmail, validatePassword, validateRevealYear, validateText } from './validation';
+import {
+  readJsonBody,
+  validateEmail,
+  validatePassword,
+  validateRevealAt,
+  validateRevealYear,
+  validateText,
+} from './validation';
 import { readImageUpload } from './images';
 
 export { GroupStore, UserStore, RateLimiter };
@@ -239,8 +247,85 @@ const appManifest = {
   ],
 };
 
-const serviceWorkerScript = `self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));`;
+/**
+ * The service worker, which until now registered and did nothing at all: it had
+ * no fetch handler, so an installed app was a shortcut that failed exactly like
+ * the browser would.
+ *
+ * `version` is a fingerprint of the client. It names the cache, so a deploy that
+ * changes the client changes this text — and a byte-different service worker is
+ * the only thing that makes a browser install a new one and drop the old cache.
+ * A version baked in by hand is the usual way an offline app gets stuck showing
+ * a build from months ago.
+ *
+ * What is deliberately never cached: anything under /api. Quotes, pictures and
+ * the account itself are read with a bearer token, and a copy in Cache Storage
+ * would outlive signing out — readable by whoever picks up the device next, and
+ * for a group still under its reveal lock, readable early. The saving would be
+ * a round trip; the cost would be the one guarantee this app makes.
+ */
+const serviceWorker = (version: string): string => `const CACHE = 'quotes-journal-${version}';
+const SHELL = '/app';
+const PRECACHE = [SHELL, '/icon.svg', '/manifest.webmanifest'];
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(PRECACHE)).then(() => self.skipWaiting()));
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches
+      .keys()
+      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key))))
+      .then(() => self.clients.claim()),
+  );
+});
+
+/** Refreshes the cached copy in the background; failure is simply offline. */
+const revalidate = (request, key) =>
+  fetch(request)
+    .then((response) => {
+      if (response && response.ok) {
+        caches.open(CACHE).then((cache) => cache.put(key, response.clone()));
+      }
+      return response;
+    })
+    .catch(() => null);
+
+self.addEventListener('fetch', (event) => {
+  const request = event.request;
+  const url = new URL(request.url);
+
+  if (request.method !== 'GET' || url.origin !== self.location.origin) {
+    return;
+  }
+
+  // Never cached, and never served from a cache: see above.
+  if (url.pathname.startsWith('/api/')) {
+    return;
+  }
+
+  // Every in-app path is served the same shell, so one cached copy answers all
+  // of them — including a deep link to a group opened with no connection.
+  if (request.mode === 'navigate') {
+    event.respondWith(
+      caches.match(SHELL).then((cached) => {
+        const fresh = revalidate(new Request(SHELL), SHELL);
+        return cached || fresh.then((response) => response || Response.error());
+      }),
+    );
+    return;
+  }
+
+  if (PRECACHE.indexOf(url.pathname) !== -1) {
+    event.respondWith(
+      caches.match(url.pathname).then((cached) => {
+        const fresh = revalidate(request, url.pathname);
+        return cached || fresh.then((response) => response || Response.error());
+      }),
+    );
+  }
+});`;
 
 const appIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Quotes Journal">
   <rect width="256" height="256" fill="#0f1020"/>
@@ -248,33 +333,16 @@ const appIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" r
 </svg>`;
 
 /**
- * The client is one inline `<script>` and one inline `<style>`, so the policy is
- * carried by a nonce minted per response and injected into both tags — cleaner
- * than keeping hashes in step with the markup. Everything else is denied:
- * nothing here loads a third-party origin.
+ * The app shell, served with a policy that names its inline style and script by
+ * content hash. Identical on every response, which is what lets the service
+ * worker keep a copy and open the app with no connection.
  */
-const htmlResponse = (render: (nonce: string) => string = renderAppHtml): Response => {
-  const nonce = crypto.randomUUID().replaceAll('-', '');
-  const policy = [
-    "default-src 'none'",
-    `script-src 'nonce-${nonce}'`,
-    `style-src 'nonce-${nonce}'`,
-    "connect-src 'self'",
-    // blob: covers both halves of the picture feature: the local preview before
-    // a quote is saved, and the revealed picture, which is fetched with the
-    // bearer token and turned into an object URL rather than being addressed by
-    // a URL that would have to carry a credential.
-    "img-src 'self' data: blob:",
-    "manifest-src 'self'",
-    // The app registers /sw.js; without this it would fall back to script-src
-    // and the service worker would be blocked by its own nonce policy.
-    "worker-src 'self'",
-    "base-uri 'none'",
-    "form-action 'none'",
-    "frame-ancestors 'none'",
-  ].join('; ');
-
-  return new Response(render(nonce), {
+const htmlResponse = async (
+  body: string,
+  policy: string,
+  extra: Record<string, string> = {},
+): Promise<Response> =>
+  new Response(body, {
     headers: {
       'content-type': 'text/html; charset=utf-8',
       'content-security-policy': policy,
@@ -282,23 +350,28 @@ const htmlResponse = (render: (nonce: string) => string = renderAppHtml): Respon
       'referrer-policy': 'no-referrer',
       'x-frame-options': 'DENY',
       'strict-transport-security': 'max-age=31536000; includeSubDomains',
+      // Revalidated rather than held: the service worker is what serves this
+      // instantly, and it refreshes its copy in the background.
+      'cache-control': 'no-cache',
+      ...extra,
     },
   });
-};
 
-app.get('/', () => htmlResponse());
-app.get('/app', () => htmlResponse());
-app.get('/join', () => htmlResponse());
+const appShell = async (): Promise<Response> => htmlResponse(renderAppHtml(), (await policies()).app);
+
+app.get('/', () => appShell());
+app.get('/app', () => appShell());
+app.get('/join', () => appShell());
 // Both app stores require a reachable privacy policy URL in the listing.
-app.get('/privacy', () => htmlResponse(renderPrivacyHtml));
+app.get('/privacy', async () => htmlResponse(renderPrivacyHtml(), (await policies()).privacy));
 app.get('/manifest.webmanifest', (c) =>
   c.body(JSON.stringify(appManifest), 200, {
     'content-type': 'application/manifest+json; charset=utf-8',
     'x-content-type-options': 'nosniff',
   }),
 );
-app.get('/sw.js', (c) =>
-  c.body(serviceWorkerScript, 200, {
+app.get('/sw.js', async (c) =>
+  c.body(serviceWorker((await policies()).version), 200, {
     'content-type': 'application/javascript; charset=utf-8',
     'cache-control': 'no-cache',
     'x-content-type-options': 'nosniff',
@@ -347,6 +420,7 @@ app.use('/api/groups', requireUser);
 app.use('/api/groups/*', requireUser);
 app.use('/api/invites/*', requireUser);
 app.use('/api/auth/me', requireUser);
+app.use('/api/account/*', requireUser);
 
 app.post('/api/auth/register', async (c) => {
   const secret = requireSecret(c.env);
@@ -499,6 +573,17 @@ app.post('/api/groups', async (c) => {
     return jsonError(revealYear.error, 400);
   }
 
+  // Optional: without it the group opens at midnight UTC on 1 January, which is
+  // what every group did before the date was configurable.
+  let revealAt: string | undefined;
+  if (body.value.revealAt !== undefined && body.value.revealAt !== null && body.value.revealAt !== '') {
+    const picked = validateRevealAt(body.value.revealAt);
+    if (!picked.ok) {
+      return jsonError(picked.error, 400);
+    }
+    revealAt = picked.value;
+  }
+
   if (!(await accountHasGroupCapacity(c.env, user))) {
     return jsonError(`You can belong to at most ${LIMITS.groupsPerUser} groups`, 409);
   }
@@ -508,6 +593,7 @@ app.post('/api/groups', async (c) => {
     id: groupId,
     name: name.value,
     revealYear: revealYear.value,
+    revealAt,
   });
 
   if (!response.ok) {
@@ -528,9 +614,27 @@ app.post('/api/groups', async (c) => {
   return passThrough(response);
 });
 
-app.get('/api/groups/:groupId', async (c) =>
-  passThrough(await callGroupStore(c.env, c.req.param('groupId'), '/group', c.get('user'))),
-);
+/**
+ * Opening a group is also when its cached name on the account is refreshed —
+ * see `/groups/touch` in the account object for why it heals rather than being
+ * pushed (#9). The write only happens when the cache is actually stale.
+ */
+app.get('/api/groups/:groupId', async (c) => {
+  const user = c.get('user');
+  const response = await callGroupStore(c.env, c.req.param('groupId'), '/group', user);
+  if (!response.ok) {
+    return passThrough(response);
+  }
+
+  const payload = (await response.json()) as { group: { id: string; name: string; revealYear: number } };
+  await callUserStore(c.env, user.email, '/groups/touch', {
+    groupId: payload.group.id,
+    name: payload.group.name,
+    revealYear: payload.group.revealYear,
+  });
+
+  return c.json(payload);
+});
 
 app.get('/api/groups/:groupId/quotes', async (c) =>
   passThrough(await callGroupStore(c.env, c.req.param('groupId'), '/quotes', c.get('user'))),
@@ -539,6 +643,119 @@ app.get('/api/groups/:groupId/quotes', async (c) =>
 app.get('/api/groups/:groupId/quiz', async (c) =>
   passThrough(await callGroupStore(c.env, c.req.param('groupId'), '/quiz', c.get('user'))),
 );
+
+/** Every member's best finished round, which is what makes the quiz a contest. */
+app.get('/api/groups/:groupId/quiz/scores', async (c) =>
+  passThrough(await callGroupStore(c.env, c.req.param('groupId'), '/quiz/scores', c.get('user'))),
+);
+
+/**
+ * Postpones the reveal. Owner-only and later-only, both enforced in the group
+ * object; this validates the instant before it gets there.
+ */
+app.post('/api/groups/:groupId/reveal', async (c) => {
+  const body = await readJsonBody(c.req.raw);
+  if (!body.ok) {
+    return jsonError(body.error, 400);
+  }
+
+  const picked = validateRevealAt(body.value.revealAt);
+  if (!picked.ok) {
+    return jsonError(picked.error, 400);
+  }
+
+  const user = c.get('user');
+  const { limit, windowMs } = writeLimit(c.env);
+  const decision = await checkRateLimit(c.env, `write:${user.id}`, limit, windowMs);
+  if (!decision.allowed) {
+    return tooManyRequests(decision);
+  }
+
+  return passThrough(
+    await callGroupStore(c.env, c.req.param('groupId'), '/reveal', user, 'POST', { revealAt: picked.value }),
+  );
+});
+
+app.post('/api/groups/:groupId/members/transfer', (c) => forwardWrite(c, '/members/transfer'));
+
+/** Owner-only. The owner's own cached name is corrected here; others heal on open. */
+app.post('/api/groups/:groupId/rename', async (c) => {
+  const user = c.get('user');
+  const renamed = await forwardWrite(c, '/rename');
+  if (!renamed.ok) {
+    return renamed;
+  }
+
+  const payload = (await renamed.json()) as { group: { id: string; name: string; revealYear: number } };
+  await callUserStore(c.env, user.email, '/groups/touch', {
+    groupId: payload.group.id,
+    name: payload.group.name,
+    revealYear: payload.group.revealYear,
+  });
+
+  return c.json(payload);
+});
+
+/**
+ * Leaves a group. The member row stays behind as a tombstone so the quotes they
+ * appear in keep working; the account forgets the group so it leaves their list.
+ */
+app.post('/api/groups/:groupId/leave', async (c) => {
+  const user = c.get('user');
+  const groupId = c.req.param('groupId');
+  const left = await forwardWrite(c, '/leave');
+  if (!left.ok) {
+    return left;
+  }
+
+  await callUserStore(c.env, user.email, '/groups/forget', { groupId });
+  return c.json({ left: true });
+});
+
+/**
+ * Changes the display name. It is the name used for new groups and shown on the
+ * account; the name inside a group stays as it is, because a group's names have
+ * to be unique within it and a silent bulk rename could collide with someone
+ * else's. Renaming inside a group is the owner's existing control.
+ */
+app.post('/api/account/display-name', async (c) => {
+  const user = c.get('user');
+  const { limit, windowMs } = writeLimit(c.env);
+  const decision = await checkRateLimit(c.env, `write:${user.id}`, limit, windowMs);
+  if (!decision.allowed) {
+    return tooManyRequests(decision);
+  }
+
+  const body = await readJsonBody(c.req.raw);
+  if (!body.ok) {
+    return jsonError(body.error, 400);
+  }
+
+  const displayName = validateText(body.value.displayName, 'Display name', LIMITS.displayName, { minLength: 2 });
+  if (!displayName.ok) {
+    return jsonError(displayName.error, 400);
+  }
+
+  const secret = requireSecret(c.env);
+  if (!secret) {
+    return jsonError('Authentication is not configured on this deployment', 503);
+  }
+
+  const response = await callUserStore(c.env, user.email, '/display-name', { displayName: displayName.value });
+  if (!response.ok) {
+    return passThrough(response);
+  }
+
+  // The session token carries the display name, and it is what names the
+  // creator of a group or the joiner of one. Without a fresh token the new name
+  // would not reach either until the next sign-in.
+  const updated = (await response.json()) as { user: SessionUser };
+  const token = await createSessionToken(secret, updated.user);
+  return c.json({ token, user: updated.user });
+});
+
+app.post('/api/groups/:groupId/quiz/start', (c) => forwardWrite(c, '/quiz/start'));
+app.post('/api/groups/:groupId/quiz/answer', (c) => forwardWrite(c, '/quiz/answer'));
 
 app.get('/api/groups/:groupId/stats', async (c) =>
   passThrough(await callGroupStore(c.env, c.req.param('groupId'), '/stats', c.get('user'))),
@@ -717,7 +934,7 @@ app.notFound((c) => {
   // paths keep answering JSON so clients can still parse the failure.
   const wantsHtml = (c.req.header('accept') ?? '').includes('text/html');
   if (wantsHtml && !c.req.path.startsWith('/api/')) {
-    return htmlResponse();
+    return appShell();
   }
 
   return jsonError('Not found', 404);
