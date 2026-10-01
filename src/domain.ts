@@ -27,11 +27,14 @@ export type Member = {
  * `contentType` is what the bytes actually are, decided by sniffing the magic
  * number rather than by trusting the upload's header.
  */
-export type QuoteImage = {
+export type StoredImage = {
   contentType: ImageContentType;
   bytes: number;
   addedAt: string;
 };
+
+/** A picture attached to a quote. Same shape as every other stored picture. */
+export type QuoteImage = StoredImage;
 
 /** One turn in an exchange. A quote with a single speaker is the one-line case. */
 export type QuoteLine = {
@@ -75,6 +78,8 @@ export type GroupState = {
   /** When the owner last postponed the reveal, if they ever did. */
   revealMovedAt?: string;
   createdAt: string;
+  /** The group's own picture, if the owner set one. */
+  picture?: StoredImage;
   ownerUserId: string;
   /** Bumped when an invite link is rotated, which invalidates older codes. */
   inviteVersion: number;
@@ -137,6 +142,14 @@ export const LIMITS = {
    * are the one way a single group could fill it.
    */
   groupImageBytes: 200_000_000,
+  /**
+   * A profile picture. Much smaller than a quote's: it is shown at avatar size
+   * and is fetched once per member per group view, so the cap is about how much
+   * is worth moving for something rendered in a circle.
+   */
+  avatarBytes: 256 * 1024,
+  /** A group's own picture — a header image rather than a thumbnail. */
+  groupPictureBytes: 512 * 1024,
 } as const;
 
 /**

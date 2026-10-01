@@ -160,6 +160,21 @@ const appStyles = `
          one whose picture fails to load — reads exactly as it did before. */
       .quote-photo img { max-width: 100%; border-radius: 10px; margin-top: .7rem; display: block; }
 
+      /* Initials until a picture arrives, and in place of one that never does —
+         a guest has no account, so no picture is the normal case, not a gap. */
+      .avatar {
+        width: 2.25rem; height: 2.25rem; border-radius: 999px; flex: 0 0 auto;
+        display: inline-flex; align-items: center; justify-content: center;
+        background: var(--surface-2); border: 1px solid var(--line);
+        color: var(--muted); font-size: .8rem; font-weight: 650; overflow: hidden;
+      }
+      .avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+      .avatar.big { width: 5rem; height: 5rem; font-size: 1.4rem; }
+      .with-avatar { display: flex; align-items: center; gap: .7rem; }
+
+      .group-picture { width: 100%; max-height: 9rem; border-radius: 12px; overflow: hidden; margin-bottom: .75rem; }
+      .group-picture img { width: 100%; height: 100%; max-height: 9rem; object-fit: cover; display: block; }
+
       .quote-line { border-top: 1px solid var(--line); margin-top: 1rem; padding-top: .25rem; }
       .quote-line:first-of-type { border-top: none; margin-top: 0; padding-top: 0; }
       .remove-line { margin-top: .5rem; font-size: .85rem; }
@@ -248,6 +263,8 @@ const appScript = `
           quiz: null,
           /** Everyone's best round, loaded when the quiz tab is opened. */
           quizScores: null,
+          /** Avatar paths already known to have nothing behind them. */
+          avatarMisses: [],
         };
 
         /**
@@ -381,6 +398,63 @@ const appScript = `
           );
         }
 
+        /** Two letters from a name, for when there is no picture to show. */
+        function initials(name) {
+          var words = String(name || '?').trim().split(' ').filter(Boolean);
+          var letters = words.length > 1 ? words[0][0] + words[words.length - 1][0] : (words[0] || '?').slice(0, 2);
+          return letters.toUpperCase();
+        }
+
+        /**
+         * A frame that starts as initials. Anything with a data-avatar attribute is
+         * filled in after render by a bearer-token fetch, the same way quote
+         * pictures are — an <img src> cannot carry an Authorization header, and
+         * a URL that could would be a credential in the browser history.
+         */
+        function avatarHtml(name, source, extraClass) {
+          return (
+            '<span class="avatar' + (extraClass ? ' ' + extraClass : '') + '"' +
+            (source ? ' data-avatar="' + escapeHtml(source) + '"' : '') + '>' +
+            escapeHtml(initials(name)) +
+            '</span>'
+          );
+        }
+
+        function loadAvatars() {
+          document.querySelectorAll('[data-avatar]').forEach(function (holder) {
+            var source = holder.getAttribute('data-avatar');
+            // Most people have no picture, and asking again on every re-render
+            // would mean a round trip per member per tab switch for an answer
+            // that will not change while the page is open.
+            if (state.avatarMisses.indexOf(source) !== -1) {
+              return;
+            }
+
+            fetch(source, { headers: { authorization: 'Bearer ' + state.token } })
+              .then(function (response) {
+                if (!response.ok) {
+                  state.avatarMisses.push(source);
+                  return null;
+                }
+                return response.blob();
+              })
+              .then(function (blob) {
+                if (!blob) {
+                  return;
+                }
+                var image = document.createElement('img');
+                var url = URL.createObjectURL(blob);
+                image.src = url;
+                image.alt = '';
+                image.addEventListener('load', function () { URL.revokeObjectURL(url); });
+                holder.textContent = '';
+                holder.appendChild(image);
+              })
+              // No picture is the ordinary case: the initials simply stay.
+              .catch(function () {});
+          });
+        }
+
         function daysUntil(iso) {
           var diff = new Date(iso).getTime() - Date.now();
           return Math.max(0, Math.ceil(diff / 86400000));
@@ -469,6 +543,19 @@ const appScript = `
             '<button class="link" id="back-to-groups">&larr; All groups</button>' +
             '<h1 class="group-title">Settings</h1>' +
             noticeHtml() +
+            '<div class="card">' +
+            '<h2>Your picture</h2>' +
+            '<div class="with-avatar">' +
+            avatarHtml(state.user ? state.user.displayName : '', state.user && state.user.hasAvatar ? '/api/account/avatar' : null, 'big') +
+            '<p class="small muted">Shown next to your name to everyone you share a group with. Nobody else can fetch it.</p>' +
+            '</div>' +
+            '<label for="avatar-file">Choose a picture</label>' +
+            '<input id="avatar-file" name="avatar" type="file" accept="image/jpeg,image/png,image/webp" />' +
+            '<p class="small muted" id="avatar-status">Shrunk on this device before it is sent, which also drops the EXIF a camera writes.</p>' +
+            (state.user && state.user.hasAvatar
+              ? '<button type="button" class="link" id="remove-avatar">Remove your picture</button>'
+              : '') +
+            '</div>' +
             '<div class="card">' +
             '<h2>Your name</h2>' +
             '<p class="small muted">Shown next to your quotes, and used when you create or join a group from now on. It does not rename you inside groups you are already in &mdash; names have to stay unique within a group, so that is the owner&rsquo;s control.</p>' +
@@ -595,6 +682,9 @@ const appScript = `
           return (
             headerHtml() +
             '<button class="link" id="back-to-groups">&larr; All groups</button>' +
+            (group.hasPicture
+              ? '<div class="group-picture" data-group-picture="' + escapeHtml(group.id) + '"></div>'
+              : '') +
             '<h1 class="group-title">' + escapeHtml(group.name) + '</h1>' +
             '<p class="muted small">' +
             (group.locked
@@ -694,8 +784,15 @@ const appScript = `
 
           var items = group.members
             .map(function (member) {
+              // A guest has no account, so no picture can exist for them: the
+              // initials are the answer, not a placeholder for a failed load.
+              var source = member.isGuest
+                ? null
+                : '/api/groups/' + encodeURIComponent(group.id) + '/members/' + encodeURIComponent(member.id) + '/avatar';
+
               return (
-                '<li><span>' + escapeHtml(member.name) + (member.isYou ? ' <span class="pill">you</span>' : '') + '</span>' +
+                '<li><span class="with-avatar">' + avatarHtml(member.name, source) +
+                '<span>' + escapeHtml(member.name) + (member.isYou ? ' <span class="pill">you</span>' : '') + '</span></span>' +
                 '<span class="pill">' + (member.isGuest ? 'not signed up' : member.role) + '</span></li>'
               );
             })
@@ -723,6 +820,12 @@ const appScript = `
                 '<input id="group-rename" name="name" required value="' + escapeHtml(group.name) + '" />' +
                 '<button class="secondary" type="submit">Rename group</button>' +
                 '</form>' +
+                '<label for="group-picture">Group picture</label>' +
+                '<input id="group-picture" name="picture" type="file" accept="image/jpeg,image/png,image/webp" />' +
+                '<p class="small muted" id="group-picture-status">Shown to everyone in the group. Shrunk on this device before it is sent.</p>' +
+                (group.hasPicture
+                  ? '<button type="button" class="link" id="remove-group-picture">Remove the group picture</button>'
+                  : '') +
                 (handoverOptions
                   ? '<form id="transfer-form">' +
                     '<label for="transfer-to">Hand the group over</label>' +
@@ -1381,6 +1484,60 @@ const appScript = `
             loadQuotePhotos();
           }
 
+          loadAvatars();
+
+          document.querySelectorAll('[data-group-picture]').forEach(function (holder) {
+            fetch('/api/groups/' + encodeURIComponent(holder.getAttribute('data-group-picture')) + '/picture', {
+              headers: { authorization: 'Bearer ' + state.token },
+            })
+              .then(function (response) { return response.ok ? response.blob() : null; })
+              .then(function (blob) {
+                if (!blob) {
+                  return;
+                }
+                var image = document.createElement('img');
+                var url = URL.createObjectURL(blob);
+                image.src = url;
+                image.alt = '';
+                image.addEventListener('load', function () { URL.revokeObjectURL(url); });
+                holder.appendChild(image);
+              })
+              .catch(function () {});
+          });
+
+          bindPicturePicker('avatar-file', 'avatar-status', 256, function (blob) {
+            return uploadPicture('/api/account/avatar', blob);
+          });
+
+          bindPicturePicker('group-picture', 'group-picture-status', 1024, function (blob) {
+            return uploadPicture('/api/groups/' + encodeURIComponent(state.group.id) + '/picture', blob);
+          });
+
+          onClick('remove-avatar', async function () {
+            try {
+              await api('/api/account/avatar/remove', { method: 'POST', body: {} });
+              await loadGroups();
+              notify('Your picture was removed.', 'ok');
+            } catch (error) {
+              notify(error.message, 'error');
+            }
+            render();
+          });
+
+          onClick('remove-group-picture', async function () {
+            try {
+              await api('/api/groups/' + encodeURIComponent(state.group.id) + '/picture/remove', {
+                method: 'POST',
+                body: {},
+              });
+              await openGroup(state.group.id, 'members');
+              notify('The group picture was removed.', 'ok');
+            } catch (error) {
+              notify(error.message, 'error');
+            }
+            render();
+          });
+
           clearQuizClock();
           onClick('quiz-start', function () { startQuiz(); });
           onClick('quiz-again', function () { startQuiz(); });
@@ -1454,24 +1611,27 @@ const appScript = `
          * the quality a step at a time until it fits rather than refusing a
          * picture that is merely detailed.
          */
-        async function prepareImage(file) {
+        async function prepareImage(file, edge) {
           var bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
           var longestEdge = Math.max(bitmap.width, bitmap.height);
-          var scale = Math.min(1, MAX_IMAGE_EDGE / longestEdge);
+          var scale = Math.min(1, (edge || MAX_IMAGE_EDGE) / longestEdge);
           var canvas = document.createElement('canvas');
           canvas.width = Math.max(1, Math.round(bitmap.width * scale));
           canvas.height = Math.max(1, Math.round(bitmap.height * scale));
           canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
           bitmap.close();
 
+          // An avatar is capped far below a quote's picture, and the shrink has
+          // to land under whichever cap applies or the upload is refused.
+          var ceiling = edge && edge <= 256 ? 256 * 1024 : edge && edge <= 1024 ? 512 * 1024 : MAX_IMAGE_BYTES;
           var quality = 0.82;
           var blob = await blobFromCanvas(canvas, quality);
-          while (blob && blob.size > MAX_IMAGE_BYTES && quality > 0.4) {
+          while (blob && blob.size > ceiling && quality > 0.4) {
             quality -= 0.15;
             blob = await blobFromCanvas(canvas, quality);
           }
 
-          if (!blob || blob.size > MAX_IMAGE_BYTES) {
+          if (!blob || blob.size > ceiling) {
             throw new Error('That picture is too large, even after shrinking it');
           }
 
@@ -1725,6 +1885,64 @@ const appScript = `
               holder.appendChild(image);
             })
             .catch(function () {});
+        }
+
+        /**
+         * Shared by both pickers. The picture is shrunk on the device first —
+         * an avatar needs nothing like a photo's resolution, and re-encoding
+         * through a canvas drops the EXIF block a camera writes.
+         */
+        function bindPicturePicker(fieldId, statusId, edge, upload) {
+          var field = document.getElementById(fieldId);
+          if (!field) {
+            return;
+          }
+
+          field.addEventListener('change', async function () {
+            var file = field.files && field.files[0];
+            if (!file) {
+              return;
+            }
+
+            var status = document.getElementById(statusId);
+            if (status) {
+              status.textContent = 'Preparing the picture\u2026';
+              status.className = 'small muted';
+            }
+
+            try {
+              var blob = await prepareImage(file, edge);
+              await upload(blob);
+              // Someone who had no picture now does.
+              state.avatarMisses = [];
+              await loadGroups();
+              if (state.group) {
+                await openGroup(state.group.id, state.tab);
+              }
+              notify('Picture saved.', 'ok');
+            } catch (error) {
+              notify(error.message || 'That picture could not be used', 'error');
+            }
+            render();
+          });
+        }
+
+        async function uploadPicture(path, blob) {
+          var response = await fetch(path, {
+            method: 'POST',
+            headers: { authorization: 'Bearer ' + state.token, 'content-type': blob.type || 'image/jpeg' },
+            body: blob,
+          });
+
+          if (!response.ok) {
+            var payload = {};
+            try {
+              payload = await response.json();
+            } catch (error) {
+              payload = {};
+            }
+            throw new Error(payload.error || 'The picture could not be saved');
+          }
         }
 
         function showInvite(code) {
@@ -2066,7 +2284,7 @@ const privacyHtml = `<!doctype html>
   <body>
     <main>
       <h1>Privacy</h1>
-      <p class="muted">Quotes Journal &middot; last updated 8 September 2026</p>
+      <p class="muted">Quotes Journal &middot; last updated 27 September 2026</p>
 
       <p>Quotes Journal is a small app for recording things your friends said and
       reading them back at the end of the year. This page describes every piece of
@@ -2082,11 +2300,16 @@ const privacyHtml = `<!doctype html>
         hash with a random salt. The password itself is never written down.</li>
         <li><strong>The groups you belong to</strong>, the names of members in
         them, and the quotes recorded in them.</li>
+        <li><strong>A profile picture and a group picture</strong>, both
+        optional. A profile picture is visible only to people you share a group
+        with; a group picture only to that group's members. Neither is readable
+        by anyone else, and neither is ever public.</li>
         <li><strong>Pictures you choose to attach to a quote</strong>, which are
         optional. A picture is re-encoded in your browser before it is uploaded,
         which removes the EXIF metadata a camera writes into a photo file &mdash;
         including the GPS coordinates of where it was taken. Only the resized
-        image reaches the server.</li>
+        image reaches the server. The same is true of profile and group
+        pictures.</li>
       </ul>
 
       <h2>What is not collected</h2>

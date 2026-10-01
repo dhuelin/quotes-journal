@@ -2127,3 +2127,179 @@ describe('settings (L11)', () => {
     expect(response.status).toBe(403);
   });
 });
+
+/**
+ * Profile and group pictures. Every test here is a way one could have been
+ * readable by someone who should not see it.
+ */
+describe('profile and group pictures (L12)', () => {
+  const setAvatar = (player: TestUser, bytes: Uint8Array) =>
+    rawRequest('/api/account/avatar', {
+      method: 'POST',
+      token: player.token,
+      contentType: 'image/jpeg',
+      body: bytes,
+    });
+
+  it('stores a profile picture and serves it back to its owner', async () => {
+    const alice = await registerUser('Alice');
+    const png = fakeImage('png', 200);
+
+    expect((await setAvatar(alice, png)).status).toBe(201);
+
+    const mine = await rawRequest('/api/account/avatar', { token: alice.token });
+    expect(mine.status).toBe(200);
+    // The type its bytes actually are, not the one the upload claimed.
+    expect(mine.headers.get('content-type')).toBe('image/png');
+    expect(new Uint8Array(await mine.arrayBuffer())).toEqual(png);
+
+    const account = await request('/api/auth/me', { token: alice.token });
+    expect(account.body.user.hasAvatar).toBe(true);
+  });
+
+  it('shows a member their picture to someone in the same group', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Faces', nextYear);
+    await joinGroup(alice, bob, group.id);
+    await setAvatar(bob, fakeImage('jpeg', 300));
+
+    const fresh = await request(`/api/groups/${group.id}`, { token: alice.token });
+    const bobMember = (fresh.body.group.members as { id: string; name: string }[]).find((m) => m.name === 'Bob')!;
+
+    const seen = await rawRequest(`/api/groups/${group.id}/members/${bobMember.id}/avatar`, { token: alice.token });
+
+    expect(seen.status).toBe(200);
+    expect(seen.headers.get('content-type')).toBe('image/jpeg');
+    expect((await seen.arrayBuffer()).byteLength).toBe(300);
+  });
+
+  it('hides it from someone outside the group, behind the group’s own 404', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const stranger = await registerUser('Mallory');
+    const group = await createGroup(alice, 'Private faces', nextYear);
+    await joinGroup(alice, bob, group.id);
+    await setAvatar(bob, fakeImage('jpeg', 300));
+
+    const fresh = await request(`/api/groups/${group.id}`, { token: alice.token });
+    const bobMember = (fresh.body.group.members as { id: string; name: string }[]).find((m) => m.name === 'Bob')!;
+
+    const denied = await rawRequest(`/api/groups/${group.id}/members/${bobMember.id}/avatar`, {
+      token: stranger.token,
+    });
+
+    // Stopped at the first hop, by the same check that hides the group itself.
+    expect(denied.status).toBe(404);
+    expect((await denied.json<{ error: string }>()).error).toBe('Group not found');
+  });
+
+  it('answers 404 for a guest, who has no account to have a picture', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Guests', nextYear);
+    const guest = await request(`/api/groups/${group.id}/members`, {
+      method: 'POST',
+      token: alice.token,
+      body: { name: 'Cleo' },
+    });
+
+    const response = await rawRequest(`/api/groups/${group.id}/members/${guest.body.member.id}/avatar`, {
+      token: alice.token,
+    });
+
+    expect(response.status).toBe(404);
+  });
+
+  it('refuses a profile picture that is too large or is not a picture', async () => {
+    const alice = await registerUser('Alice');
+
+    expect((await setAvatar(alice, fakeImage('jpeg', LIMITS.avatarBytes + 1))).status).toBe(413);
+
+    const svg = new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>');
+    expect((await setAvatar(alice, svg)).status).toBe(415);
+  });
+
+  it('removes a profile picture', async () => {
+    const alice = await registerUser('Alice');
+    await setAvatar(alice, fakeImage('jpeg', 200));
+
+    const removed = await request('/api/account/avatar/remove', { method: 'POST', token: alice.token, body: {} });
+    expect(removed.status).toBe(200);
+    expect(removed.body.user.hasAvatar).toBe(false);
+
+    expect((await rawRequest('/api/account/avatar', { token: alice.token })).status).toBe(404);
+  });
+
+  it('lets the owner set a group picture, and every member read it', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Group face', nextYear);
+    await joinGroup(alice, bob, group.id);
+
+    const set = await rawRequest(`/api/groups/${group.id}/picture`, {
+      method: 'POST',
+      token: alice.token,
+      contentType: 'image/jpeg',
+      body: fakeImage('webp', 400),
+    });
+    expect(set.status).toBe(201);
+
+    const seen = await rawRequest(`/api/groups/${group.id}/picture`, { token: bob.token });
+    expect(seen.status).toBe(200);
+    expect(seen.headers.get('content-type')).toBe('image/webp');
+
+    const overview = await request(`/api/groups/${group.id}`, { token: bob.token });
+    expect(overview.body.group.hasPicture).toBe(true);
+  });
+
+  it('is not gated on the reveal: a group picture spoils nothing', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Still sealed', nextYear);
+    await rawRequest(`/api/groups/${group.id}/picture`, {
+      method: 'POST',
+      token: alice.token,
+      contentType: 'image/jpeg',
+      body: fakeImage('jpeg', 400),
+    });
+
+    // Unlike a quote's picture, which is as secret as the quote.
+    expect((await rawRequest(`/api/groups/${group.id}/picture`, { token: alice.token })).status).toBe(200);
+  });
+
+  it('lets nobody but the owner change the group picture', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Not yours', nextYear);
+    await joinGroup(alice, bob, group.id);
+
+    const set = await rawRequest(`/api/groups/${group.id}/picture`, {
+      method: 'POST',
+      token: bob.token,
+      contentType: 'image/jpeg',
+      body: fakeImage('jpeg', 400),
+    });
+    expect(set.status).toBe(403);
+
+    const removed = await request(`/api/groups/${group.id}/picture/remove`, {
+      method: 'POST',
+      token: bob.token,
+      body: {},
+    });
+    expect(removed.status).toBe(403);
+  });
+
+  it('keeps the picture bytes out of the stored group value', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Budget', nextYear);
+    const before = await storedGroupSize(group.id);
+
+    await rawRequest(`/api/groups/${group.id}/picture`, {
+      method: 'POST',
+      token: alice.token,
+      contentType: 'image/jpeg',
+      body: fakeImage('jpeg', LIMITS.groupPictureBytes - 1),
+    });
+
+    expect((await storedGroupSize(group.id)) - before).toBeLessThan(200);
+  });
+});

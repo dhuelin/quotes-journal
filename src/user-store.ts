@@ -1,4 +1,5 @@
-import { LIMITS } from './domain';
+import { LIMITS, type ImageContentType, type StoredImage } from './domain';
+import { imageResponseHeaders } from './images';
 import { hashPassword, readHashIterations, resolvePbkdf2Iterations, verifyPassword } from './auth';
 import { readJsonBody } from './validation';
 
@@ -14,6 +15,8 @@ export type UserRecord = {
   passwordHash: string;
   createdAt: string;
   groups: UserGroupRef[];
+  /** Metadata only; the bytes are their own key, as every stored picture is. */
+  avatar?: StoredImage;
 };
 
 export type UserGroupRef = {
@@ -42,7 +45,10 @@ const publicUser = (user: UserRecord) => ({
   id: user.id,
   email: user.email,
   displayName: user.displayName,
+  hasAvatar: user.avatar !== undefined,
 });
+
+const AVATAR_KEY = 'avatar';
 
 export class UserStore {
   constructor(private readonly ctx: DurableObjectState, private readonly _env: unknown) {}
@@ -126,6 +132,36 @@ export class UserStore {
       }
 
       return jsonResponse({ user: publicUser(user) });
+    }
+
+    /**
+     * A userId -> address pointer, so that one member's avatar can be served to
+     * another.
+     *
+     * A group stores account ids and this namespace is keyed by address, so
+     * there is otherwise no way from "the person who said this" to their
+     * account. The pointer is a second object in the *same* namespace, named
+     * `uid:<id>` — no new class and no migration — holding nothing but the
+     * address. It is deliberately not reachable from any public route: only the
+     * Worker addresses it, and only to resolve an avatar.
+     */
+    if (url.pathname === '/link') {
+      if (request.method === 'POST') {
+        const body = await readJsonBody(request);
+        if (!body.ok) {
+          return jsonResponse({ error: body.error }, 400);
+        }
+        if (typeof body.value.email !== 'string') {
+          return jsonResponse({ error: 'Invalid link' }, 400);
+        }
+        await this.ctx.storage.put('link', body.value.email);
+        return jsonResponse({ linked: true });
+      }
+
+      if (request.method === 'GET') {
+        const email = await this.ctx.storage.get<string>('link');
+        return email ? jsonResponse({ email }) : jsonResponse({ error: 'Not found' }, 404);
+      }
     }
 
     if (!user) {
@@ -230,6 +266,46 @@ export class UserStore {
       cached.revealYear = revealYear;
       await this.ctx.storage.put('user', user);
       return jsonResponse({ groups: user.groups });
+    }
+
+    if (url.pathname === '/avatar' && request.method === 'GET') {
+      const bytes = await this.ctx.storage.get<Uint8Array>(AVATAR_KEY);
+      if (!user.avatar || !bytes) {
+        return jsonResponse({ error: 'No picture' }, 404);
+      }
+      return new Response(bytes.slice().buffer as ArrayBuffer, {
+        headers: imageResponseHeaders(user.avatar.contentType),
+      });
+    }
+
+    // Size-checked and sniffed by the Worker; re-checked here because the object
+    // is the last place anything is trusted before it is stored.
+    if (url.pathname === '/avatar' && request.method === 'POST') {
+      const declaredType = request.headers.get('x-image-type') ?? '';
+      if (!['image/jpeg', 'image/png', 'image/webp'].includes(declaredType)) {
+        return jsonResponse({ error: 'Only JPEG, PNG and WebP pictures can be used' }, 415);
+      }
+
+      const bytes = new Uint8Array(await request.arrayBuffer());
+      if (bytes.byteLength === 0 || bytes.byteLength > LIMITS.avatarBytes) {
+        return jsonResponse({ error: 'That picture is too large' }, 413);
+      }
+
+      user.avatar = {
+        contentType: declaredType as ImageContentType,
+        bytes: bytes.byteLength,
+        addedAt: new Date().toISOString(),
+      };
+      await this.ctx.storage.put(AVATAR_KEY, bytes);
+      await this.ctx.storage.put('user', user);
+      return jsonResponse({ user: publicUser(user) }, 201);
+    }
+
+    if (url.pathname === '/avatar/remove' && request.method === 'POST') {
+      delete user.avatar;
+      await this.ctx.storage.delete(AVATAR_KEY);
+      await this.ctx.storage.put('user', user);
+      return jsonResponse({ user: publicUser(user) });
     }
 
     return jsonResponse({ error: 'Not found' }, 404);
