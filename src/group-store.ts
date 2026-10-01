@@ -77,6 +77,17 @@ const quizKey = (memberId: string): string => `quiz:${memberId}`;
  */
 const quizBestKey = (memberId: string): string => `best:${memberId}`;
 
+/** The group's own picture. Its own key, like every other stored picture. */
+const GROUP_PICTURE_KEY = 'picture';
+
+/** Matches `/members/<id>/account`, which resolves a member to their account. */
+const readMemberAccountPath = (pathname: string): string | null => {
+  const parts = pathname.split('/').filter(Boolean);
+  return parts[0] === 'members' && parts[1] && parts[2] === 'account' && parts.length === 3
+    ? decodeURIComponent(parts[1])
+    : null;
+};
+
 /** Matches `/quotes/<id>/image` and `/quotes/<id>/image/remove`. */
 const readQuoteImagePath = (pathname: string): { quoteId: string; remove: boolean } | null => {
   const parts = pathname.split('/').filter(Boolean);
@@ -97,6 +108,8 @@ const publicMember = (member: Member, viewerMemberId: string) => ({
   id: member.id,
   name: member.name,
   role: member.role,
+  // A guest has no account, so no profile picture to fetch; the client shows
+  // initials rather than asking for one that cannot exist.
   isGuest: member.userId === null,
   isYou: member.id === viewerMemberId,
 });
@@ -223,6 +236,35 @@ export class GroupStore {
         return lockedResponse(group, 'Statistics');
       }
       return jsonResponse(buildStats(group));
+    }
+
+    if (url.pathname === '/picture' && request.method === 'GET') {
+      return this.getGroupPicture(group);
+    }
+
+    if (url.pathname === '/picture' && request.method === 'POST') {
+      return member.role === 'owner'
+        ? this.putGroupPicture(request, group)
+        : jsonResponse({ error: 'Only the group owner can change the group picture' }, 403);
+    }
+
+    if (url.pathname === '/picture/remove' && request.method === 'POST') {
+      return member.role === 'owner'
+        ? this.removeGroupPicture(group)
+        : jsonResponse({ error: 'Only the group owner can change the group picture' }, 403);
+    }
+
+    /**
+     * Which account a member belongs to. Members-only, and never part of a
+     * public payload: the Worker uses it to resolve one member's avatar for
+     * another, and nothing else. A guest has no account and answers 404.
+     */
+    const accountFor = readMemberAccountPath(url.pathname);
+    if (accountFor && request.method === 'GET') {
+      const target = group.members.find((entry) => entry.id === accountFor);
+      return target?.userId
+        ? jsonResponse({ userId: target.userId })
+        : jsonResponse({ error: 'That member has no account' }, 404);
     }
 
     if (url.pathname === '/leave' && request.method === 'POST') {
@@ -981,6 +1023,52 @@ export class GroupStore {
     return jsonResponse({ group: this.overview(group, owner) });
   }
 
+  /** Members-only, like the group's name. Not gated on the reveal: a group's
+   * own picture spoils nothing, and it is what the group looks like all year. */
+  private async getGroupPicture(group: GroupState): Promise<Response> {
+    const bytes = await this.ctx.storage.get<Uint8Array>(GROUP_PICTURE_KEY);
+    if (!group.picture || !bytes) {
+      return jsonResponse({ error: 'This group has no picture' }, 404);
+    }
+
+    return new Response(bytes.slice().buffer as ArrayBuffer, {
+      headers: imageResponseHeaders(group.picture.contentType),
+    });
+  }
+
+  private async putGroupPicture(request: Request, group: GroupState): Promise<Response> {
+    const declaredType = request.headers.get('x-image-type') ?? '';
+    if (!(IMAGE_CONTENT_TYPES as readonly string[]).includes(declaredType)) {
+      return jsonResponse({ error: 'Only JPEG, PNG and WebP pictures can be used' }, 415);
+    }
+
+    const bytes = new Uint8Array(await request.arrayBuffer());
+    if (bytes.byteLength === 0 || bytes.byteLength > LIMITS.groupPictureBytes) {
+      return jsonResponse({ error: 'That picture is too large' }, 413);
+    }
+
+    group.picture = {
+      contentType: declaredType as ImageContentType,
+      bytes: bytes.byteLength,
+      addedAt: new Date().toISOString(),
+    };
+
+    await this.ctx.storage.put(GROUP_PICTURE_KEY, bytes);
+    await this.ctx.storage.put('group', group);
+    return jsonResponse({ picture: { bytes: bytes.byteLength, contentType: declaredType } }, 201);
+  }
+
+  private async removeGroupPicture(group: GroupState): Promise<Response> {
+    if (!group.picture) {
+      return jsonResponse({ error: 'This group has no picture' }, 404);
+    }
+
+    delete group.picture;
+    await this.ctx.storage.delete(GROUP_PICTURE_KEY);
+    await this.ctx.storage.put('group', group);
+    return jsonResponse({ removed: true });
+  }
+
   private overview(group: GroupState, viewer: Member) {
     const locked = !areQuotesVisible(group);
 
@@ -992,6 +1080,7 @@ export class GroupStore {
       // Shown to every member, not just the owner: a date that can move is only
       // honest if everyone can see that it did.
       revealMovedAt: group.revealMovedAt ?? null,
+      hasPicture: group.picture !== undefined,
       locked,
       createdAt: group.createdAt,
       inviteVersion: group.inviteVersion,

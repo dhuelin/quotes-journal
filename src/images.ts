@@ -37,9 +37,12 @@ export type ImageUpload = { ok: true; bytes: Uint8Array; contentType: ImageConte
  * recognisably an image. Content-Length is only a hint — a chunked upload has
  * none at all — so the decoded body is measured too.
  */
-export const readImageUpload = async (request: Request): Promise<ImageUpload> => {
+export const readImageUpload = async (
+  request: Request,
+  maxBytes: number = LIMITS.quoteImageBytes,
+): Promise<ImageUpload> => {
   const declared = Number(request.headers.get('content-length') ?? '0');
-  if (Number.isFinite(declared) && declared > LIMITS.quoteImageBytes) {
+  if (Number.isFinite(declared) && declared > maxBytes) {
     return { ok: false, error: 'That picture is too large', status: 413 };
   }
 
@@ -54,7 +57,7 @@ export const readImageUpload = async (request: Request): Promise<ImageUpload> =>
     return { ok: false, error: 'No picture was sent', status: 400 };
   }
 
-  if (buffer.byteLength > LIMITS.quoteImageBytes) {
+  if (buffer.byteLength > maxBytes) {
     return { ok: false, error: 'That picture is too large', status: 413 };
   }
 

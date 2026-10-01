@@ -105,6 +105,34 @@ the group value. That value is read and rewritten on every write and has a hard
 only the picture's size and type live there. R2 would be the natural home if
 this grows, and is not used today because R2 is not enabled on the account.
 
+### Profile and group pictures
+
+Both optional, both small, both private. A profile picture is readable only by
+someone who shares a group with you; a group picture only by that group's
+members. Neither is ever public, and neither is addressed by a URL that carries
+a credential — the client fetches with its bearer token and renders an object
+URL, exactly as quote pictures do.
+
+The bytes live under their own Durable Object key, like every other picture
+here, so **no R2 bucket is involved**. That is worth stating because the issue
+that asked for this assumed otherwise.
+
+Serving one member's picture to another takes three hops, and each is a check:
+the group answers only to its own members and turns a member id into an account
+id; a `uid:<id>` pointer object — a second object in the existing accounts
+namespace, so no new class and no migration — turns that into an address; the
+account holds the bytes. Someone outside the group stops at the first hop with
+the same `404` the group itself gives. The pointer is written on registration
+and on every login, which also backfills accounts that predate it.
+
+A member with no picture shows their initials, and so does a guest — a guest has
+no account, so no picture can exist for them. That is the ordinary case rather
+than a failure, and the client remembers which members have none so it does not
+ask again on every render.
+
+A group picture is **not** behind the reveal lock, unlike a quote's: it spoils
+nothing and it is what the group looks like all year.
+
 ### Settings, and leaving a group
 
 An account can change its display name. That name is what you are called on new
@@ -320,6 +348,10 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | `POST` | `/api/auth/login` | `{ email, password }` → `{ token, user }` |
 | `GET` | `/api/auth/me` | the account and the groups it belongs to |
 | `POST` | `/api/account/display-name` | `{ displayName }` → a fresh `{ token, user }` |
+| `POST` | `/api/account/avatar` | raw JPEG/PNG/WebP bytes, 256KB cap |
+| `GET` | `/api/account/avatar` | your own picture |
+| `POST` | `/api/account/avatar/remove` | |
+| `GET` | `/api/groups/:groupId/members/:memberId/avatar` | a member's picture, to a member |
 | `GET` | `/api/groups` | groups you belong to |
 | `POST` | `/api/groups` | `{ name, revealYear, revealAt? }`; the creator becomes owner |
 | `GET` | `/api/groups/:groupId` | members, your role, and progress while locked |
@@ -338,6 +370,9 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | `GET` | `/api/groups/:groupId/quiz/scores` | every member's best round |
 | `GET` | `/api/groups/:groupId/stats` | `423` until the reveal |
 | `GET` | `/api/groups/:groupId/invite` | current invite code; the client builds the link |
+| `POST` | `/api/groups/:groupId/picture` | raw bytes, 512KB cap; owner only |
+| `GET` | `/api/groups/:groupId/picture` | members only, not gated on the reveal |
+| `POST` | `/api/groups/:groupId/picture/remove` | owner only |
 | `POST` | `/api/groups/:groupId/rename` | `{ name }`; owner only |
 | `POST` | `/api/groups/:groupId/leave` | keeps your member row; owners must hand over first |
 | `POST` | `/api/groups/:groupId/members/transfer` | `{ memberId }`; owner only, account holders only |

@@ -227,6 +227,36 @@ const accountHasGroupCapacity = async (env: Env, user: SessionUser, groupId?: st
   return account.groups.length < LIMITS.groupsPerUser || account.groups.some((ref) => ref.groupId === groupId);
 };
 
+/**
+ * Records which account an id belongs to, so that a member's avatar can be
+ * resolved from the id a group stores. Written on register and on every login,
+ * which also backfills accounts that predate it — nobody can set an avatar
+ * without signing in first, so a missing pointer is never a missing picture.
+ */
+const linkAccount = async (env: Env, userId: string, email: string): Promise<void> => {
+  const stub = env.USERS.get(env.USERS.idFromName(`uid:${userId}`));
+  await stub.fetch(
+    new Request('https://user/link', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email }),
+    }),
+  );
+};
+
+const emailForUserId = async (env: Env, userId: string): Promise<string | null> => {
+  const stub = env.USERS.get(env.USERS.idFromName(`uid:${userId}`));
+  const response = await stub.fetch('https://user/link');
+  if (!response.ok) {
+    return null;
+  }
+  return ((await response.json()) as { email: string }).email;
+};
+
+/** Passes a stored picture back untouched, headers included. */
+const passThroughImage = (response: Response): Response =>
+  new Response(response.body, { status: response.status, headers: response.headers });
+
 const passThrough = async (response: Response): Promise<Response> =>
   new Response(await response.text(), { status: response.status, headers: JSON_HEADERS });
 
@@ -480,6 +510,7 @@ app.post('/api/auth/register', async (c) => {
   }
 
   const created = (await response.json()) as { user: SessionUser };
+  await linkAccount(c.env, created.user.id, email.value);
   const token = await createSessionToken(secret, created.user);
   return c.json({ token, user: created.user }, 201);
 });
@@ -525,6 +556,8 @@ app.post('/api/auth/login', async (c) => {
   }
 
   const authenticated = (await response.json()) as { user: SessionUser };
+  // Also the backfill for accounts created before pointers existed.
+  await linkAccount(c.env, authenticated.user.id, email.value);
   const token = await createSessionToken(secret, authenticated.user);
   return c.json({ token, user: authenticated.user });
 });
@@ -753,6 +786,106 @@ app.post('/api/account/display-name', async (c) => {
   const token = await createSessionToken(secret, updated.user);
   return c.json({ token, user: updated.user });
 });
+
+/* ---------- pictures: the group's, and people's ---------- */
+
+/** Your own profile picture. Sniffed and size-checked before it is stored. */
+app.post('/api/account/avatar', async (c) => {
+  const user = c.get('user');
+  const { limit, windowMs } = writeLimit(c.env);
+  const decision = await checkRateLimit(c.env, `write:${user.id}`, limit, windowMs);
+  if (!decision.allowed) {
+    return tooManyRequests(decision);
+  }
+
+  const upload = await readImageUpload(c.req.raw, LIMITS.avatarBytes);
+  if (!upload.ok) {
+    return jsonError(upload.error, upload.status);
+  }
+
+  const stub = c.env.USERS.get(c.env.USERS.idFromName(user.email));
+  return passThrough(
+    await stub.fetch(
+      new Request('https://user/avatar', {
+        method: 'POST',
+        headers: { 'x-image-type': upload.contentType },
+        body: upload.bytes as BodyInit,
+      }),
+    ),
+  );
+});
+
+app.get('/api/account/avatar', async (c) => {
+  const user = c.get('user');
+  const stub = c.env.USERS.get(c.env.USERS.idFromName(user.email));
+  const response = await stub.fetch('https://user/avatar');
+  return response.ok ? passThroughImage(response) : passThrough(response);
+});
+
+app.post('/api/account/avatar/remove', async (c) =>
+  passThrough(await callUserStore(c.env, c.get('user').email, '/avatar/remove', {})),
+);
+
+/**
+ * One member's picture, to another member of the same group.
+ *
+ * Three hops, and each is a check: the group answers only to its own members
+ * and is what turns a member id into an account id; the pointer turns that into
+ * an address; the account holds the bytes. Someone outside the group stops at
+ * the first hop with the same 404 the group itself gives.
+ */
+app.get('/api/groups/:groupId/members/:memberId/avatar', async (c) => {
+  const user = c.get('user');
+  const memberId = c.req.param('memberId');
+  const owner = await callGroupStore(
+    c.env,
+    c.req.param('groupId'),
+    `/members/${encodeURIComponent(memberId)}/account`,
+    user,
+  );
+
+  if (!owner.ok) {
+    return passThrough(owner);
+  }
+
+  const { userId } = (await owner.json()) as { userId: string };
+  const email = await emailForUserId(c.env, userId);
+  if (!email) {
+    return jsonError('No picture', 404);
+  }
+
+  const stub = c.env.USERS.get(c.env.USERS.idFromName(email));
+  const response = await stub.fetch('https://user/avatar');
+  return response.ok ? passThroughImage(response) : jsonError('No picture', 404);
+});
+
+/** The group's own picture. Owner-only to set, members-only to read. */
+app.post('/api/groups/:groupId/picture', async (c) => {
+  const user = c.get('user');
+  const { limit, windowMs } = writeLimit(c.env);
+  const decision = await checkRateLimit(c.env, `write:${user.id}`, limit, windowMs);
+  if (!decision.allowed) {
+    return tooManyRequests(decision);
+  }
+
+  const upload = await readImageUpload(c.req.raw, LIMITS.groupPictureBytes);
+  if (!upload.ok) {
+    return jsonError(upload.error, upload.status);
+  }
+
+  return passThrough(
+    await callGroupStoreRaw(c.env, c.req.param('groupId'), '/picture', user, 'POST', upload.bytes as BodyInit, {
+      'x-image-type': upload.contentType,
+    }),
+  );
+});
+
+app.get('/api/groups/:groupId/picture', async (c) => {
+  const response = await callGroupStoreRaw(c.env, c.req.param('groupId'), '/picture', c.get('user'), 'GET');
+  return response.ok ? passThroughImage(response) : passThrough(response);
+});
+
+app.post('/api/groups/:groupId/picture/remove', (c) => forwardWrite(c, '/picture/remove'));
 
 app.post('/api/groups/:groupId/quiz/start', (c) => forwardWrite(c, '/quiz/start'));
 app.post('/api/groups/:groupId/quiz/answer', (c) => forwardWrite(c, '/quiz/answer'));
