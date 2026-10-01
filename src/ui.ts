@@ -330,7 +330,11 @@ const appScript = `
           }
 
           if (response.status === 401 && state.token) {
-            signOut('Your session expired. Please sign in again.');
+            // The server's reason, when it gave one: a session revoked from
+            // another device is not the same event as one that ran out, and
+            // telling someone the wrong one sends them looking for the wrong
+            // problem.
+            signOut(payload.error || 'Your session expired. Please sign in again.');
             throw new Error('unauthenticated');
           }
 
@@ -573,9 +577,24 @@ const appScript = `
               : '<p class="muted">You are not in any groups yet.</p>') +
             '</div>' +
             '<div class="card">' +
+            '<h2>Change your password</h2>' +
+            '<form id="password-form">' +
+            '<label for="current-password">Current password</label>' +
+            '<input id="current-password" name="currentPassword" type="password" autocomplete="current-password" required />' +
+            '<label for="new-password">New password</label>' +
+            '<input id="new-password" name="newPassword" type="password" autocomplete="new-password" minlength="10" required />' +
+            '<label for="new-password-confirm">Repeat the new password</label>' +
+            '<input id="new-password-confirm" name="newPasswordConfirm" type="password" autocomplete="new-password" required />' +
+            '<p class="small muted">At least 10 characters. Changing it signs out every other device, so a password you think someone else has really stops working.</p>' +
+            '<button type="submit">Change password</button>' +
+            '</form>' +
+            '</div>' +
+            '<div class="card">' +
             '<h2>Your account</h2>' +
             '<p class="small muted">Signed in as ' + escapeHtml(state.user ? state.user.email : '') + '.</p>' +
-            '<p class="small muted">Changing your password and deleting your account are not built yet.</p>' +
+            '<button class="secondary" id="sign-out-everywhere">Sign out all devices</button>' +
+            '<p class="small muted">Ends every session except this one. Use it if you have signed in somewhere you no longer trust.</p>' +
+            '<p class="small muted">There is no password reset by email yet, and no self-service account deletion.</p>' +
             '</div>'
           );
         }
@@ -1211,6 +1230,47 @@ const appScript = `
             state.view = 'settings';
             state.group = null;
             history.pushState({}, '', '/settings');
+            render();
+          });
+
+          onSubmit('password-form', async function (form) {
+            // Checked here and never sent, exactly as at registration: the
+            // confirmation exists to catch a typo in the browser.
+            if (form.newPassword.value !== form.newPasswordConfirm.value) {
+              throw new Error('Those two passwords do not match');
+            }
+
+            var result = await api('/api/account/password', {
+              method: 'POST',
+              body: {
+                currentPassword: form.currentPassword.value,
+                newPassword: form.newPassword.value,
+              },
+            });
+
+            // The change ended every session including this one, so the fresh
+            // token is what keeps this device signed in.
+            state.token = result.token;
+            state.user = result.user;
+            localStorage.setItem(TOKEN_KEY, result.token);
+            notify('Your password was changed, and every other device was signed out.', 'ok');
+            render();
+          });
+
+          onClick('sign-out-everywhere', async function () {
+            if (!confirm('Sign out every other device? You will stay signed in here.')) {
+              return;
+            }
+
+            try {
+              var result = await api('/api/account/sign-out-everywhere', { method: 'POST', body: {} });
+              state.token = result.token;
+              state.user = result.user;
+              localStorage.setItem(TOKEN_KEY, result.token);
+              notify('Every other device was signed out.', 'ok');
+            } catch (error) {
+              notify(error.message, 'error');
+            }
             render();
           });
 
@@ -2284,7 +2344,7 @@ const privacyHtml = `<!doctype html>
   <body>
     <main>
       <h1>Privacy</h1>
-      <p class="muted">Quotes Journal &middot; last updated 27 September 2026</p>
+      <p class="muted">Quotes Journal &middot; last updated 1 October 2026</p>
 
       <p>Quotes Journal is a small app for recording things your friends said and
       reading them back at the end of the year. This page describes every piece of
@@ -2332,6 +2392,12 @@ const privacyHtml = `<!doctype html>
       <p>On Cloudflare Workers infrastructure, reachable only through
       <a href="https://quotes.huelin.dev">quotes.huelin.dev</a> over HTTPS. The
       app is run by an individual, not a company.</p>
+
+      <h2>Your sessions</h2>
+      <p>Signing in creates a session that lasts 30 days. You can end every other
+      session from the settings page at any time, and changing your password ends
+      them too. There is no password reset by email yet, so a forgotten password
+      means the account cannot be recovered &mdash; contact the maintainer below.</p>
 
       <h2>Deleting your data</h2>
       <p>There is no self-service delete yet. Email the address below and your

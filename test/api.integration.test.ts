@@ -2303,3 +2303,155 @@ describe('profile and group pictures (L12)', () => {
     expect((await storedGroupSize(group.id)) - before).toBeLessThan(200);
   });
 });
+
+/**
+ * Signing out other devices, and changing a password. Both rest on the token
+ * version: bump it and every token carrying an older one stops working, for
+ * this account and nobody else.
+ */
+describe('sessions and the password (L13)', () => {
+  const signIn = async (user: TestUser): Promise<string> => {
+    const response = await request('/api/auth/login', {
+      method: 'POST',
+      body: { email: user.user.email, password: 'correct horse battery staple' },
+    });
+    expect(response.status).toBe(200);
+    return response.body.token as string;
+  };
+
+  it('ends every other session, and keeps the one that asked', async () => {
+    const alice = await registerUser('Alice');
+    const phone = await signIn(alice);
+
+    // Both tokens work before.
+    expect((await request('/api/auth/me', { token: alice.token })).status).toBe(200);
+    expect((await request('/api/auth/me', { token: phone })).status).toBe(200);
+
+    const revoked = await request('/api/account/sign-out-everywhere', {
+      method: 'POST',
+      token: alice.token,
+      body: {},
+    });
+    expect(revoked.status).toBe(200);
+
+    // The old tokens are dead, including the one that made the request.
+    for (const dead of [alice.token, phone]) {
+      const response = await request('/api/auth/me', { token: dead });
+      expect(response.status).toBe(401);
+      expect(response.body.error).toContain('signed out');
+    }
+
+    // The fresh one handed back keeps this device signed in, which is what
+    // "sign out my other devices" has to mean.
+    expect((await request('/api/auth/me', { token: revoked.body.token })).status).toBe(200);
+  });
+
+  it('revokes one account and leaves everyone else alone', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+
+    await request('/api/account/sign-out-everywhere', { method: 'POST', token: alice.token, body: {} });
+
+    // The old instrument was rotating AUTH_SECRET, which signed out the world.
+    expect((await request('/api/auth/me', { token: bob.token })).status).toBe(200);
+  });
+
+  it('blocks a revoked token on reads, not only on writes', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Readable', nextYear);
+    await unlockGroup(group.id);
+    const stale = alice.token;
+
+    const revoked = await request('/api/account/sign-out-everywhere', {
+      method: 'POST',
+      token: alice.token,
+      body: {},
+    });
+
+    // A leaked token that could still read would still open every quote in
+    // every group, which is the thing the whole app exists to keep shut.
+    for (const path of [`/api/groups/${group.id}/quotes`, `/api/groups/${group.id}/stats`, '/api/groups']) {
+      expect((await request(path, { token: stale })).status, path).toBe(401);
+    }
+
+    expect((await request(`/api/groups/${group.id}/quotes`, { token: revoked.body.token })).status).toBe(200);
+  });
+
+  it('changes a password, and signs the old sessions out with it', async () => {
+    const alice = await registerUser('Alice');
+    const phone = await signIn(alice);
+
+    const changed = await request('/api/account/password', {
+      method: 'POST',
+      token: alice.token,
+      body: { currentPassword: 'correct horse battery staple', newPassword: 'a different long password' },
+    });
+    expect(changed.status).toBe(200);
+
+    // Changing a password you believe compromised has to end the sessions
+    // opened with it, or the change achieves nothing.
+    expect((await request('/api/auth/me', { token: phone })).status).toBe(401);
+
+    const withNew = await request('/api/auth/login', {
+      method: 'POST',
+      body: { email: alice.user.email, password: 'a different long password' },
+    });
+    expect(withNew.status).toBe(200);
+
+    const withOld = await request('/api/auth/login', {
+      method: 'POST',
+      body: { email: alice.user.email, password: 'correct horse battery staple' },
+    });
+    expect(withOld.status).toBe(401);
+  });
+
+  it('will not change a password without the current one', async () => {
+    const alice = await registerUser('Alice');
+
+    // A session token alone must not be enough, or a borrowed laptop is a
+    // permanent account takeover.
+    const wrong = await request('/api/account/password', {
+      method: 'POST',
+      token: alice.token,
+      body: { currentPassword: 'not the password', newPassword: 'a different long password' },
+    });
+    // 403, not 401: the session is perfectly valid, the supplied credential is
+    // not. The client signs out on a 401, so mistyping here must not be one.
+    expect(wrong.status).toBe(403);
+
+    // And the account is untouched, session included.
+    expect((await request('/api/auth/me', { token: alice.token })).status).toBe(200);
+  });
+
+  it('refuses a new password that is too short, or the same as the old one', async () => {
+    const alice = await registerUser('Alice');
+
+    const short = await request('/api/account/password', {
+      method: 'POST',
+      token: alice.token,
+      body: { currentPassword: 'correct horse battery staple', newPassword: 'short' },
+    });
+    expect(short.status).toBe(400);
+
+    const same = await request('/api/account/password', {
+      method: 'POST',
+      token: alice.token,
+      body: { currentPassword: 'correct horse battery staple', newPassword: 'correct horse battery staple' },
+    });
+    expect(same.status).toBe(400);
+  });
+
+  it('keeps working for a token minted before versions existed', async () => {
+    const alice = await registerUser('Alice');
+
+    // An account stored without a version reads as generation zero, which is
+    // what an unversioned token carries — so the deploy signs nobody out.
+    await runInDurableObject(accountStub(alice), async (_instance, state) => {
+      const record = (await state.storage.get<UserRecord>('user')) as UserRecord;
+      delete record.tokenVersion;
+      await state.storage.put('user', record);
+    });
+
+    expect((await request('/api/auth/me', { token: alice.token })).status).toBe(200);
+  });
+});

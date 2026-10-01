@@ -257,6 +257,19 @@ const emailForUserId = async (env: Env, userId: string): Promise<string | null> 
 const passThroughImage = (response: Response): Response =>
   new Response(response.body, { status: response.status, headers: response.headers });
 
+/**
+ * The account's current session generation. `null` when the account cannot be
+ * read at all, which is treated as "do not block": a storage hiccup should not
+ * sign the whole deployment out.
+ */
+const tokenVersionFor = async (env: Env, email: string): Promise<number | null> => {
+  const response = await callUserStore(env, email, '/token-version');
+  if (!response.ok) {
+    return null;
+  }
+  return ((await response.json()) as { tokenVersion: number }).tokenVersion;
+};
+
 const passThrough = async (response: Response): Promise<Response> =>
   new Response(await response.text(), { status: response.status, headers: JSON_HEADERS });
 
@@ -435,10 +448,31 @@ const requireUser: MiddlewareHandler<AppEnv> = async (c, next) => {
   // Authenticated reads had no ceiling at all, and /quiz and /stats rebuild over
   // the whole quote array on every call. Every authenticated route passes
   // through here, so this bucket also backstops the write routes.
+  //
+  // The token version is read alongside it rather than after it: both are
+  // Durable Object calls to different objects, so in parallel they cost one
+  // round trip rather than two.
   const { limit, windowMs } = readLimit(c.env);
-  const decision = await checkRateLimit(c.env, `read:${user.id}`, limit, windowMs);
+  const [decision, currentVersion] = await Promise.all([
+    checkRateLimit(c.env, `read:${user.id}`, limit, windowMs),
+    tokenVersionFor(c.env, user.email),
+  ]);
+
   if (!decision.allowed) {
     return tooManyRequests(decision);
+  }
+
+  /**
+   * Checked on every authenticated request, not only on writes.
+   *
+   * The issue asking for this (#6) raises the alternative, and reads are
+   * exactly where it would fail: a leaked token that can no longer write but
+   * can still read would still open every quote in every group the account
+   * belongs to, which is the one thing this app exists to keep shut. The cost
+   * is a subrequest that runs in parallel with one already being made.
+   */
+  if (currentVersion !== null && user.tokenVersion !== currentVersion) {
+    return jsonError('You were signed out on this device. Please sign in again.', 401);
   }
 
   c.set('user', user);
@@ -509,9 +543,9 @@ app.post('/api/auth/register', async (c) => {
     return passThrough(response);
   }
 
-  const created = (await response.json()) as { user: SessionUser };
+  const created = (await response.json()) as { user: SessionUser; tokenVersion: number };
   await linkAccount(c.env, created.user.id, email.value);
-  const token = await createSessionToken(secret, created.user);
+  const token = await createSessionToken(secret, created.user, created.tokenVersion);
   return c.json({ token, user: created.user }, 201);
 });
 
@@ -555,10 +589,10 @@ app.post('/api/auth/login', async (c) => {
     return jsonError('Email or password is incorrect', 401);
   }
 
-  const authenticated = (await response.json()) as { user: SessionUser };
+  const authenticated = (await response.json()) as { user: SessionUser; tokenVersion: number };
   // Also the backfill for accounts created before pointers existed.
   await linkAccount(c.env, authenticated.user.id, email.value);
-  const token = await createSessionToken(secret, authenticated.user);
+  const token = await createSessionToken(secret, authenticated.user, authenticated.tokenVersion);
   return c.json({ token, user: authenticated.user });
 });
 
@@ -782,9 +816,93 @@ app.post('/api/account/display-name', async (c) => {
   // The session token carries the display name, and it is what names the
   // creator of a group or the joiner of one. Without a fresh token the new name
   // would not reach either until the next sign-in.
-  const updated = (await response.json()) as { user: SessionUser };
-  const token = await createSessionToken(secret, updated.user);
+  const updated = (await response.json()) as { user: SessionUser; tokenVersion: number };
+  const token = await createSessionToken(secret, updated.user, updated.tokenVersion);
   return c.json({ token, user: updated.user });
+});
+
+/* ---------- sessions and the password ---------- */
+
+/**
+ * Ends every other session this account has. The caller gets a fresh token, so
+ * the device asking to sign the others out is not signed out by its own
+ * request — which is what "sign out my other devices" has to mean.
+ */
+app.post('/api/account/sign-out-everywhere', async (c) => {
+  const secret = requireSecret(c.env);
+  if (!secret) {
+    return jsonError('Authentication is not configured on this deployment', 503);
+  }
+
+  const user = c.get('user');
+  const { limit, windowMs } = writeLimit(c.env);
+  const decision = await checkRateLimit(c.env, `write:${user.id}`, limit, windowMs);
+  if (!decision.allowed) {
+    return tooManyRequests(decision);
+  }
+
+  const response = await callUserStore(c.env, user.email, '/revoke', {});
+  if (!response.ok) {
+    return passThrough(response);
+  }
+
+  const revoked = (await response.json()) as { user: SessionUser; tokenVersion: number };
+  const token = await createSessionToken(secret, revoked.user, revoked.tokenVersion);
+  return c.json({ token, user: revoked.user });
+});
+
+/**
+ * Changes the password of someone already signed in. The current password is
+ * required and checked in the account object: a session token alone must not be
+ * enough, or a borrowed laptop would be a permanent takeover.
+ *
+ * Succeeding also ends every other session, so changing a password you think is
+ * compromised actually closes the sessions opened with it.
+ */
+app.post('/api/account/password', async (c) => {
+  const secret = requireSecret(c.env);
+  if (!secret) {
+    return jsonError('Authentication is not configured on this deployment', 503);
+  }
+
+  const user = c.get('user');
+  const { limit, windowMs } = writeLimit(c.env);
+  const decision = await checkRateLimit(c.env, `write:${user.id}`, limit, windowMs);
+  if (!decision.allowed) {
+    return tooManyRequests(decision);
+  }
+
+  const body = await readJsonBody(c.req.raw);
+  if (!body.ok) {
+    return jsonError(body.error, 400);
+  }
+
+  const next = validatePassword(body.value.newPassword);
+  if (!next.ok) {
+    return jsonError(next.error, 400);
+  }
+
+  if (typeof body.value.currentPassword !== 'string') {
+    return jsonError('Your current password is required', 400);
+  }
+
+  if (body.value.currentPassword === next.value) {
+    return jsonError('The new password has to be different from the current one', 400);
+  }
+
+  const response = await callUserStore(c.env, user.email, '/password', {
+    currentPassword: body.value.currentPassword,
+    newPassword: next.value,
+    iterations: resolvePbkdf2Iterations(c.env.PBKDF2_ITERATIONS),
+  });
+
+  if (!response.ok) {
+    return passThrough(response);
+  }
+
+  const changed = (await response.json()) as { user: SessionUser; tokenVersion: number };
+  const token = await createSessionToken(secret, changed.user, changed.tokenVersion);
+  return c.json({ token, user: changed.user });
 });
 
 /* ---------- pictures: the group's, and people's ---------- */
