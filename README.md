@@ -107,6 +107,30 @@ the group value. That value is read and rewritten on every write and has a hard
 only the picture's size and type live there. R2 would be the natural home if
 this grows, and is not used today because R2 is not enabled on the account.
 
+### Keyboard and screen readers
+
+The whole app used to sit inside one `aria-live` region, so a screen reader
+re-announced the entire page on every render — including the renders the quote
+counter fires while someone is still typing. Announcements now come from a small
+region outside the app that is never replaced, and carry only the notice.
+
+The tab strips implement the **whole** ARIA tabs pattern: each tab points at a
+real `tabpanel`, the panel points back, and a roving tabindex plus
+arrow/Home/End keys move between them. Half a pattern was worse than none,
+because `role="tab"` promises a keyboard interaction that was not there.
+
+Focus is restored after a render. Every render replaces the document, which
+dropped a keyboard user back to the top of the page each time a form was
+submitted or a counter updated.
+
+Avatar initials are `aria-hidden`: they are a visual stand-in for a picture and
+the name is announced right beside them, so without it every member row read as
+"A L Alice you owner".
+
+Colour contrast was measured rather than eyeballed, and every pair passes AA for
+body text — `--muted` on the three surfaces it is used on comes out at 7.75,
+7.02 and 6.35 to one.
+
 ### Ending a session
 
 A token carries the account's **token version**. Bumping the stored version

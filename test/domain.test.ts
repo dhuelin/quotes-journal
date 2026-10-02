@@ -332,6 +332,45 @@ describe('the inlined client under CSP', () => {
     expect(() => new Function(appInline.script)).not.toThrow();
   });
 
+  it('announces from a region outside the app, not the whole app', async () => {
+    const { renderAppHtml } = await import('../src/ui');
+    const page = renderAppHtml();
+
+    // aria-live on #app re-announced the entire application on every render —
+    // including the renders the quote counter fires while someone is typing.
+    expect(page).toContain('<main id="app"></main>');
+    expect(page).toContain('id="announcer"');
+    expect(page).toMatch(/id="announcer"[^>]*aria-live="polite"/);
+  });
+
+  it('either implements the whole tabs pattern or does not claim one', async () => {
+    const { renderAppHtml } = await import('../src/ui');
+    const page = renderAppHtml();
+
+    // Half a pattern is worse than none: role="tab" promises arrow keys and a
+    // panel relationship, so every piece has to be there.
+    // Only the rendered buttons, not the selector string the keydown handler
+    // uses to find them.
+    const tabs = page.match(/<button role="tab"/g) ?? [];
+    expect(tabs.length).toBeGreaterThan(0);
+    expect(page.match(/aria-controls="panel-/g)?.length).toBe(tabs.length);
+    expect(page).toContain('role="tabpanel"');
+    expect(page).toContain('aria-labelledby="tab-');
+    // The roving tabindex is what makes the arrow keys necessary rather than
+    // decorative, and the keydown handler is what makes them work.
+    expect(page).toContain("querySelectorAll('[role=\"tablist\"]')");
+    expect(page).toContain("'ArrowLeft'");
+  });
+
+  it('does not read the avatar initials out alongside the name', async () => {
+    const { renderAppHtml } = await import('../src/ui');
+
+    // They are a visual stand-in for a picture, and the name is announced right
+    // beside them — without this a member row reads "A L Alice you owner".
+    // The avatar markup is built at runtime, so the guard is on the builder.
+    expect(renderAppHtml()).toMatch(/class="avatar[\s\S]{0,80}aria-hidden="true"/);
+  });
+
   it('carries no backtick or interpolation into the inlined blocks', async () => {
     const { appInline, privacyInline } = await import('../src/ui');
 
