@@ -30,7 +30,9 @@ app and the HTTP API; a Flutter app talks to the same API on Android and iOS.
 ## Security model
 
 - Passwords are hashed with PBKDF2-HMAC-SHA256; sessions are stateless
-  HMAC-signed bearer tokens valid for 30 days.
+  HMAC-signed bearer tokens valid for 30 days. Each token carries the account's
+  session generation, so one account can end its own sessions without rotating
+  `AUTH_SECRET` and signing out the whole deployment.
 - Every group route requires membership. A non-member gets `404`, not `403`, so
   group ids cannot be probed.
 - Invite codes are signed, carry a version number and expire after 7 days;
@@ -104,6 +106,34 @@ the group value. That value is read and rewritten on every write and has a hard
 ~2.2MB ceiling ([#10](https://github.com/dhuelin/quotes-journal/issues/10)) —
 only the picture's size and type live there. R2 would be the natural home if
 this grows, and is not used today because R2 is not enabled on the account.
+
+### Ending a session
+
+A token carries the account's **token version**. Bumping the stored version
+leaves every token holding an older one invalid — for that account and nobody
+else. Two things bump it: "sign out all devices", and changing the password.
+
+The version is checked on **every authenticated request**, not only on writes.
+Reads are exactly where the cheaper option would fail: a leaked token that can
+no longer write but can still read would still open every quote in every group
+the account belongs to, which is the one thing this app exists to keep shut. The
+check is a Durable Object read, issued in parallel with the rate-limit read that
+every authenticated request already makes, so it costs a subrequest rather than
+a round trip.
+
+Changing the password requires the current one. A session token alone is not
+enough, or a borrowed laptop would be a permanent account takeover — and a wrong
+current password answers **403, not 401**, because the client signs out on a 401
+and mistyping it must not log you out of the page you are standing on.
+
+Tokens minted before versions existed carry none and read as generation zero,
+which is what a never-revoked account is on — so the deploy that introduced this
+signed nobody out.
+
+**Still missing: password reset by email.** A forgotten password is still a lost
+account. It needs an email provider, which this deployment does not have; the
+same gap keeps registration answering `409` for a taken address. Tracked in
+[#6](https://github.com/dhuelin/quotes-journal/issues/6).
 
 ### Profile and group pictures
 
@@ -348,6 +378,8 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | `POST` | `/api/auth/login` | `{ email, password }` → `{ token, user }` |
 | `GET` | `/api/auth/me` | the account and the groups it belongs to |
 | `POST` | `/api/account/display-name` | `{ displayName }` → a fresh `{ token, user }` |
+| `POST` | `/api/account/password` | `{ currentPassword, newPassword }`; `403` if the current one is wrong |
+| `POST` | `/api/account/sign-out-everywhere` | ends every other session, returns a fresh token |
 | `POST` | `/api/account/avatar` | raw JPEG/PNG/WebP bytes, 256KB cap |
 | `GET` | `/api/account/avatar` | your own picture |
 | `POST` | `/api/account/avatar/remove` | |
@@ -391,7 +423,7 @@ Tracked in [the issue tracker](https://github.com/dhuelin/quotes-journal/issues)
 - [#3](https://github.com/dhuelin/quotes-journal/issues/3) timezone-aware reveal (today it unlocks at midnight UTC)
 - [#4](https://github.com/dhuelin/quotes-journal/issues/4) year-end countdown and unlock notifications
 - [#5](https://github.com/dhuelin/quotes-journal/issues/5) richer analytics beyond the leaderboard
-- [#6](https://github.com/dhuelin/quotes-journal/issues/6) session revocation and password reset
+- [#6](https://github.com/dhuelin/quotes-journal/issues/6) password reset by email (revocation and password change are done)
 - [#7](https://github.com/dhuelin/quotes-journal/issues/7) persist the mobile session across restarts
 - [#8](https://github.com/dhuelin/quotes-journal/issues/8) store submission setup for the mobile app
 - [#19](https://github.com/dhuelin/quotes-journal/issues/19) publishing to the app stores (low priority)

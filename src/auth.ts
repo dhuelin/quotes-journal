@@ -138,16 +138,31 @@ export const verifyPassword = async (password: string, stored: string): Promise<
   return timingSafeEqual(toBase64Url(bits), digestRaw);
 };
 
-type TokenPayload = SessionUser & { exp: number };
+/**
+ * `v` is the account's token version at the moment the token was minted.
+ * Bumping the stored version leaves every token carrying an older one invalid,
+ * which is how one account signs its other devices out without rotating
+ * AUTH_SECRET and signing out everybody on the deployment.
+ *
+ * Tokens issued before versions existed carry none, and are read as version 0 —
+ * the same value a never-revoked account has — so nobody is signed out by the
+ * deploy that introduces this.
+ */
+type TokenPayload = SessionUser & { exp: number; v?: number };
+
+/** A verified session: who it is, and which generation of their sessions. */
+export type VerifiedSession = SessionUser & { tokenVersion: number };
 
 export const createSessionToken = async (
   secret: string,
   user: SessionUser,
+  tokenVersion = 0,
   now: Date = new Date(),
 ): Promise<string> => {
   const payload: TokenPayload = {
     ...user,
     exp: Math.floor(now.getTime() / 1000) + SESSION_TTL_SECONDS,
+    v: tokenVersion,
   };
 
   const body = toBase64Url(encoder.encode(JSON.stringify(payload)));
@@ -159,7 +174,7 @@ export const verifySessionToken = async (
   secret: string,
   token: string,
   now: Date = new Date(),
-): Promise<SessionUser | null> => {
+): Promise<VerifiedSession | null> => {
   const [body, signature] = token.split('.');
   if (!body || !signature) {
     return null;
@@ -185,7 +200,12 @@ export const verifySessionToken = async (
     return null;
   }
 
-  return { id: payload.id, email: payload.email, displayName: payload.displayName };
+  return {
+    id: payload.id,
+    email: payload.email,
+    displayName: payload.displayName,
+    tokenVersion: typeof payload.v === 'number' ? payload.v : 0,
+  };
 };
 
 /**

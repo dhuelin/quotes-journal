@@ -44,7 +44,8 @@ describe('session tokens', () => {
 
   it('round-trips the signed user', async () => {
     const token = await createSessionToken(secret, user);
-    expect(await verifySessionToken(secret, token)).toEqual(user);
+    // Plus the session generation, which a default token is the first of.
+    expect(await verifySessionToken(secret, token)).toEqual({ ...user, tokenVersion: 0 });
   });
 
   it('rejects a token signed with a different secret', async () => {
@@ -65,11 +66,11 @@ describe('session tokens', () => {
 
   it('rejects expired tokens', async () => {
     const issued = new Date('2026-01-01T00:00:00.000Z');
-    const token = await createSessionToken(secret, user, issued);
+    const token = await createSessionToken(secret, user, 0, issued);
     const afterExpiry = new Date(issued.getTime() + (SESSION_TTL_SECONDS + 1) * 1000);
 
     expect(await verifySessionToken(secret, token, afterExpiry)).toBeNull();
-    expect(await verifySessionToken(secret, token, issued)).toEqual(user);
+    expect(await verifySessionToken(secret, token, issued)).toEqual({ ...user, tokenVersion: 0 });
   });
 
   it('rejects structurally invalid tokens', async () => {
@@ -141,5 +142,55 @@ describe('PBKDF2 configuration', () => {
     // Both keep verifying: a hash is always replayed at its own round count.
     expect(await verifyPassword('a long enough password', low)).toBe(true);
     expect(await verifyPassword('a long enough password', high)).toBe(true);
+  });
+});
+
+/**
+ * The token version is what lets one account end its own sessions without
+ * rotating AUTH_SECRET, which would sign out everybody on the deployment.
+ */
+describe('session generations', () => {
+  const secret = 'a-secret-only-the-worker-knows';
+  const user = { id: 'u1', email: 'alice@example.com', displayName: 'Alice' };
+
+  it('carries the generation the token was minted in', async () => {
+    const token = await createSessionToken(secret, user, 4);
+
+    expect(await verifySessionToken(secret, token)).toEqual({ ...user, tokenVersion: 4 });
+  });
+
+  it('reads a token minted before versions existed as generation zero', async () => {
+    // Which is what a never-revoked account is on, so the deploy that
+    // introduces this signs nobody out.
+    const legacy = await createSessionToken(secret, user, 0);
+    const payload = JSON.parse(atob(legacy.split('.')[0].replaceAll('-', '+').replaceAll('_', '/')));
+    delete payload.v;
+
+    const body = btoa(JSON.stringify(payload)).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+    const key = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign'],
+    );
+    const signed = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(body));
+    const signature = btoa(String.fromCharCode(...new Uint8Array(signed)))
+      .replaceAll('+', '-')
+      .replaceAll('/', '_')
+      .replaceAll('=', '');
+
+    expect(await verifySessionToken(secret, `${body}.${signature}`)).toEqual({ ...user, tokenVersion: 0 });
+  });
+
+  it('cannot have its generation edited without breaking the signature', async () => {
+    const token = await createSessionToken(secret, user, 1);
+    const [body, signature] = token.split('.');
+    const payload = JSON.parse(atob(body.replaceAll('-', '+').replaceAll('_', '/')));
+    payload.v = 99;
+
+    const forged = btoa(JSON.stringify(payload)).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+
+    expect(await verifySessionToken(secret, `${forged}.${signature}`)).toBeNull();
   });
 });

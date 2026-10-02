@@ -15,6 +15,12 @@ export type UserRecord = {
   passwordHash: string;
   createdAt: string;
   groups: UserGroupRef[];
+  /**
+   * Bumped to invalidate every session this account has issued so far. Absent
+   * on accounts created before revocation existed, which read as 0 — the same
+   * value a never-revoked account has, so nobody is signed out by the deploy.
+   */
+  tokenVersion?: number;
   /** Metadata only; the bytes are their own key, as every stored picture is. */
   avatar?: StoredImage;
 };
@@ -49,6 +55,8 @@ const publicUser = (user: UserRecord) => ({
 });
 
 const AVATAR_KEY = 'avatar';
+
+const versionOf = (user: UserRecord): number => user.tokenVersion ?? 0;
 
 export class UserStore {
   constructor(private readonly ctx: DurableObjectState, private readonly _env: unknown) {}
@@ -97,7 +105,7 @@ export class UserStore {
       };
 
       await this.ctx.storage.put('user', record);
-      return jsonResponse({ user: publicUser(record) }, 201);
+      return jsonResponse({ user: publicUser(record), tokenVersion: 0 }, 201);
     }
 
     if (url.pathname === '/login' && request.method === 'POST') {
@@ -131,7 +139,7 @@ export class UserStore {
         await this.ctx.storage.put('user', user);
       }
 
-      return jsonResponse({ user: publicUser(user) });
+      return jsonResponse({ user: publicUser(user), tokenVersion: versionOf(user) });
     }
 
     /**
@@ -266,6 +274,58 @@ export class UserStore {
       cached.revealYear = revealYear;
       await this.ctx.storage.put('user', user);
       return jsonResponse({ groups: user.groups });
+    }
+
+    /**
+     * The cheapest possible read, because every authenticated request makes it.
+     * Returning the whole account would mean carrying the groups list and the
+     * password hash through a hot path that needs one integer.
+     */
+    if (url.pathname === '/token-version' && request.method === 'GET') {
+      return jsonResponse({ tokenVersion: versionOf(user) });
+    }
+
+    /** Signs out every other device, and this one too unless it takes a new token. */
+    if (url.pathname === '/revoke' && request.method === 'POST') {
+      user.tokenVersion = versionOf(user) + 1;
+      await this.ctx.storage.put('user', user);
+      return jsonResponse({ user: publicUser(user), tokenVersion: user.tokenVersion });
+    }
+
+    /**
+     * Changes the password for someone already signed in, which means proving
+     * they know the current one: a session token alone is not enough, or a
+     * borrowed laptop would be a permanent account takeover.
+     *
+     * A successful change bumps the token version. Changing a password you
+     * believe to be compromised has to end the sessions opened with it, or the
+     * change achieves nothing.
+     */
+    if (url.pathname === '/password' && request.method === 'POST') {
+      const body = await readJsonBody(request);
+      if (!body.ok) {
+        return jsonResponse({ error: body.error }, 400);
+      }
+
+      const { currentPassword, newPassword, iterations: rounds } = body.value;
+      if (typeof currentPassword !== 'string' || typeof newPassword !== 'string') {
+        return jsonResponse({ error: 'Invalid payload' }, 400);
+      }
+
+      const iterations = resolvePbkdf2Iterations(rounds);
+      // 403 rather than 401 on purpose. The client's rule is that a 401 means
+      // the session is gone, and acts on it by signing out — so a route that
+      // rejects a credential in the *body* must not use that status, or
+      // mistyping your current password would log you out of the page you are
+      // standing on.
+      if (!(await verifyPassword(currentPassword, user.passwordHash))) {
+        return jsonResponse({ error: 'Your current password is not right' }, 403);
+      }
+
+      user.passwordHash = await hashPassword(newPassword, iterations);
+      user.tokenVersion = versionOf(user) + 1;
+      await this.ctx.storage.put('user', user);
+      return jsonResponse({ user: publicUser(user), tokenVersion: user.tokenVersion });
     }
 
     if (url.pathname === '/avatar' && request.method === 'GET') {
