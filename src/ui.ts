@@ -47,6 +47,12 @@ const appStyles = `
       p { margin: 0 0 .75rem; }
 
       .muted { color: var(--muted); }
+
+      /* Present to a screen reader, absent from the page. */
+      .visually-hidden {
+        position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+        overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+      }
       .small { font-size: .85rem; }
       .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
 
@@ -288,6 +294,14 @@ const appScript = `
 
         function notify(message, kind) {
           state.notice = message ? { message: message, kind: kind || 'error' } : null;
+
+          // Spoken from the region outside #app, which survives re-renders. A
+          // live region that is created along with its text does not reliably
+          // announce; one that already exists and then changes does.
+          var announcer = document.getElementById('announcer');
+          if (announcer) {
+            announcer.textContent = message || '';
+          }
         }
 
         function noticeHtml() {
@@ -416,8 +430,12 @@ const appScript = `
          * a URL that could would be a credential in the browser history.
          */
         function avatarHtml(name, source, extraClass) {
+          // Hidden from assistive technology on purpose. The initials are a
+          // visual stand-in for a picture and the name is read out right next
+          // to them, so announcing both turns every member row into
+          // "A L Alice you owner".
           return (
-            '<span class="avatar' + (extraClass ? ' ' + extraClass : '') + '"' +
+            '<span class="avatar' + (extraClass ? ' ' + extraClass : '') + '" aria-hidden="true"' +
             (source ? ' data-avatar="' + escapeHtml(source) + '"' : '') + '>' +
             escapeHtml(initials(name)) +
             '</span>'
@@ -488,11 +506,18 @@ const appScript = `
             '<p class="muted">Everything your group records stays sealed until January 1st. Then the quotes, the stats and the quiz open up at once.</p>' +
             '</div>' +
             '<div class="card">' +
-            '<div class="tabs" role="tablist">' +
-            '<button role="tab" data-auth-tab="login" aria-selected="' + (state.authTab !== 'register') + '">Sign in</button>' +
-            '<button role="tab" data-auth-tab="register" aria-selected="' + (state.authTab === 'register') + '">Create account</button>' +
+            '<div class="tabs" role="tablist" aria-label="Sign in or create an account">' +
+            '<button role="tab" id="tab-login" data-auth-tab="login"' +
+            ' aria-selected="' + (state.authTab !== 'register') + '"' +
+            ' aria-controls="panel-auth" tabindex="' + (state.authTab !== 'register' ? '0' : '-1') + '">Sign in</button>' +
+            '<button role="tab" id="tab-register" data-auth-tab="register"' +
+            ' aria-selected="' + (state.authTab === 'register') + '"' +
+            ' aria-controls="panel-auth" tabindex="' + (state.authTab === 'register' ? '0' : '-1') + '">Create account</button>' +
             '</div>' +
+            '<div role="tabpanel" id="panel-auth" aria-labelledby="tab-' +
+            (state.authTab === 'register' ? 'register' : 'login') + '">' +
             (state.authTab === 'register' ? registerFormHtml() : loginFormHtml()) +
+            '</div>' +
             '</div>'
           );
         }
@@ -676,11 +701,19 @@ const appScript = `
             state.tab = tabs[0];
           }
 
+          // The full tabs pattern, not half of it: aria-controls pointing at a
+          // real tabpanel, and a roving tabindex so Tab reaches the strip once
+          // and the arrow keys move within it. Half a pattern is worse than
+          // none, because it promises a keyboard interaction that is not there.
           var tabsHtml = tabs
             .map(function (tab) {
               var labels = { collect: 'Add a quote', members: 'Members', reveal: 'The reveal', quiz: 'Quiz' };
+              var selected = state.tab === tab;
               return (
-                '<button role="tab" data-tab="' + tab + '" aria-selected="' + (state.tab === tab) + '">' +
+                '<button role="tab" id="tab-' + tab + '" data-tab="' + tab + '"' +
+                ' aria-selected="' + selected + '"' +
+                ' aria-controls="panel-' + tab + '"' +
+                ' tabindex="' + (selected ? '0' : '-1') + '">' +
                 labels[tab] +
                 '</button>'
               );
@@ -712,8 +745,10 @@ const appScript = `
             (group.revealMovedAt ? ' <span class="pill">date moved</span>' : '') +
             '</p>' +
             noticeHtml() +
-            '<div class="tabs" role="tablist">' + tabsHtml + '</div>' +
-            body
+            '<div class="tabs" role="tablist" aria-label="Group sections">' + tabsHtml + '</div>' +
+            '<div role="tabpanel" id="panel-' + state.tab + '" aria-labelledby="tab-' + state.tab + '">' +
+            body +
+            '</div>'
           );
         }
 
@@ -1145,6 +1180,10 @@ const appScript = `
         function render(options) {
           var keepInput = options && options.keepInput;
           var snapshot = keepInput ? readForms() : null;
+          // Every render replaces the document, which drops focus to the body
+          // and loses a keyboard user's place entirely. Elements are rebuilt
+          // with the same ids, so the id is enough to put it back.
+          var focused = document.activeElement ? document.activeElement.id : null;
 
           if (!state.token) {
             app.innerHTML = authView();
@@ -1158,6 +1197,13 @@ const appScript = `
 
           if (snapshot) {
             writeForms(snapshot);
+          }
+
+          if (focused) {
+            var again = document.getElementById(focused);
+            if (again) {
+              again.focus();
+            }
           }
 
           state.notice = null;
@@ -1200,6 +1246,40 @@ const appScript = `
         }
 
         function bind() {
+          /**
+           * Arrow keys within a tab strip, which the tabs pattern expects and
+           * which Tab alone does not give: the roving tabindex deliberately
+           * takes the unselected tabs out of the tab order, so without this
+           * they would be unreachable from the keyboard entirely.
+           */
+          document.querySelectorAll('[role="tablist"]').forEach(function (strip) {
+            strip.addEventListener('keydown', function (event) {
+              var keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End'];
+              if (keys.indexOf(event.key) === -1) {
+                return;
+              }
+
+              var tabs = Array.prototype.slice.call(strip.querySelectorAll('[role="tab"]'));
+              var here = tabs.indexOf(document.activeElement);
+              if (here === -1) {
+                return;
+              }
+
+              event.preventDefault();
+              var next =
+                event.key === 'Home'
+                  ? 0
+                  : event.key === 'End'
+                    ? tabs.length - 1
+                    : (here + (event.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length;
+
+              // Selection follows focus, which is the pattern's default and the
+              // right call here: every panel is already loaded or loads itself.
+              tabs[next].focus();
+              tabs[next].click();
+            });
+          });
+
           document.querySelectorAll('[data-auth-tab]').forEach(function (button) {
             button.addEventListener('click', function () {
               state.authTab = button.getAttribute('data-auth-tab');
@@ -2295,7 +2375,11 @@ const html = `<!doctype html>
     <style>${appStyles}</style>
   </head>
   <body>
-    <main id="app" aria-live="polite"></main>
+    <main id="app"></main>
+    <!-- A live region that is never replaced. Announcing from inside #app meant
+         re-announcing the entire application on every render, including the
+         renders the quote counter fires while someone is still typing. -->
+    <div id="announcer" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
     <script>${appScript}</script>
   </body>
 </html>`;
