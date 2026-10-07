@@ -154,6 +154,27 @@ Tokens minted before versions existed carry none and read as generation zero,
 which is what a never-revoked account is on — so the deploy that introduced this
 signed nobody out.
 
+### Telling a group its year is up
+
+A group sets a **Durable Object alarm** for its own reveal instant. A cron would
+have to scan every group and there is no index of them — and an alarm lands on
+the minute for a group that chose an odd date, rather than whenever a sweep
+happened to run.
+
+The alarm is armed when a group is created, moved when the owner postpones, and
+set on first access for any group that predates it — the same heal-on-access the
+cached group name uses, and for the same reason.
+
+The announcement says **nothing about what is inside**. A preview line on a lock
+screen would hand over the ending that the whole year was spent protecting. It
+is written as sent before anything goes out, so a crash halfway through a
+members list cannot replay the whole list on the retry: people would rather miss
+one announcement than get four.
+
+One message per group, per year, and a switch in settings to stop even that.
+Guests have no account to mail, and someone who left the group is no longer in
+it in any sense that should produce mail.
+
 ### Forgetting a password
 
 `/api/auth/forgot` answers **identically** whether or not the address has an
@@ -430,6 +451,7 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | `POST` | `/api/auth/reset` | `{ token, newPassword }` → `{ token, user }`; the link is single use |
 | `GET` | `/api/auth/me` | the account and the groups it belongs to |
 | `POST` | `/api/account/display-name` | `{ displayName }` → a fresh `{ token, user }` |
+| `POST` | `/api/account/notifications` | `{ notifyOnReveal }` |
 | `POST` | `/api/account/password` | `{ currentPassword, newPassword }`; `403` if the current one is wrong |
 | `POST` | `/api/account/sign-out-everywhere` | ends every other session, returns a fresh token |
 | `POST` | `/api/account/avatar` | raw JPEG/PNG/WebP bytes, 256KB cap |
@@ -473,7 +495,6 @@ store data-safety declarations must match what that page says.
 Tracked in [the issue tracker](https://github.com/dhuelin/quotes-journal/issues):
 
 - [#3](https://github.com/dhuelin/quotes-journal/issues/3) timezone-aware reveal (today it unlocks at midnight UTC)
-- [#4](https://github.com/dhuelin/quotes-journal/issues/4) year-end countdown and unlock notifications
 - [#5](https://github.com/dhuelin/quotes-journal/issues/5) richer analytics beyond the leaderboard
 - [#7](https://github.com/dhuelin/quotes-journal/issues/7) persist the mobile session across restarts
 - [#8](https://github.com/dhuelin/quotes-journal/issues/8) store submission setup for the mobile app

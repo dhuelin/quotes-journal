@@ -109,3 +109,46 @@ export const sendEmail = async (config: EmailConfig, message: EmailMessage): Pro
     return false;
   }
 };
+
+/**
+ * The one message this app exists to send: the vault is open.
+ *
+ * Deliberately says nothing about what is inside. The whole year's point is
+ * that nobody reads a quote early, and a preview line in a notification would
+ * hand the ending to anyone glancing at a lock screen.
+ */
+export const buildRevealEmail = (
+  to: string,
+  displayName: string,
+  groupName: string,
+  quoteCount: number,
+  link: string,
+): EmailMessage => {
+  const name = displayName || 'there';
+  const count = `${quoteCount} ${quoteCount === 1 ? 'quote' : 'quotes'}`;
+  const text = [
+    `Hello ${name},`,
+    '',
+    `${groupName} is open.`,
+    '',
+    `${count} went in over the year, and none of them have been read yet.`,
+    'Open the group to read them all, see who said what, and play the quiz:',
+    '',
+    link,
+    '',
+    'Quotes Journal',
+    'You can turn these off in your settings.',
+  ].join('\n');
+
+  const html = [
+    `<p>Hello ${escapeHtml(name)},</p>`,
+    `<p><strong>${escapeHtml(groupName)} is open.</strong></p>`,
+    `<p>${escapeHtml(count)} went in over the year, and none of them have been read yet. `,
+    'Open the group to read them all, see who said what, and play the quiz:</p>',
+    `<p><a href="${escapeHtml(link)}">Open ${escapeHtml(groupName)}</a></p>`,
+    `<p style="word-break:break-all">${escapeHtml(link)}</p>`,
+    '<p>Quotes Journal<br />You can turn these off in your settings.</p>',
+  ].join('');
+
+  return { to, toName: displayName, subject: `${groupName} is open`, text, html };
+};

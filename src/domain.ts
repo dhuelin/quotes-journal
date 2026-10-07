@@ -77,6 +77,12 @@ export type GroupState = {
   revealAt?: string;
   /** When the owner last postponed the reveal, if they ever did. */
   revealMovedAt?: string;
+  /**
+   * When the "it is open" mail went out. Present means it has, which is what
+   * stops a second alarm — a retry, or a postponement that lands in the past —
+   * from sending the same announcement twice.
+   */
+  revealNotifiedAt?: string;
   createdAt: string;
   /** The group's own picture, if the owner set one. */
   picture?: StoredImage;

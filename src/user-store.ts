@@ -21,6 +21,12 @@ export type UserRecord = {
    * value a never-revoked account has, so nobody is signed out by the deploy.
    */
   tokenVersion?: number;
+  /**
+   * Whether to mail this account when one of its groups opens. Absent means
+   * yes: it is the one message the app exists to send, and somebody who joined
+   * a group expects to hear when the thing they were waiting for happens.
+   */
+  notifyOnReveal?: boolean;
   /** Metadata only; the bytes are their own key, as every stored picture is. */
   avatar?: StoredImage;
 };
@@ -52,6 +58,7 @@ const publicUser = (user: UserRecord) => ({
   email: user.email,
   displayName: user.displayName,
   hasAvatar: user.avatar !== undefined,
+  notifyOnReveal: user.notifyOnReveal !== false,
 });
 
 const AVATAR_KEY = 'avatar';
@@ -283,6 +290,29 @@ export class UserStore {
      */
     if (url.pathname === '/token-version' && request.method === 'GET') {
       return jsonResponse({ tokenVersion: versionOf(user) });
+    }
+
+    /** What a reveal notification needs: who to greet, and whether to at all. */
+    if (url.pathname === '/notify-target' && request.method === 'GET') {
+      return jsonResponse({
+        email: user.email,
+        displayName: user.displayName,
+        notifyOnReveal: user.notifyOnReveal !== false,
+      });
+    }
+
+    if (url.pathname === '/notify-preference' && request.method === 'POST') {
+      const body = await readJsonBody(request);
+      if (!body.ok) {
+        return jsonResponse({ error: body.error }, 400);
+      }
+      if (typeof body.value.notifyOnReveal !== 'boolean') {
+        return jsonResponse({ error: 'Invalid preference' }, 400);
+      }
+
+      user.notifyOnReveal = body.value.notifyOnReveal;
+      await this.ctx.storage.put('user', user);
+      return jsonResponse({ user: publicUser(user) });
     }
 
     /** What the reset mail needs: who to greet, and which generation to sign. */
