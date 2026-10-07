@@ -272,3 +272,77 @@ export const readInviteCode = async (secret: string, code: string, now: Date = n
 
   return { ok: true, groupId, version };
 };
+
+/**
+ * A password-reset link, signed like an invite code and short-lived like one.
+ *
+ * It carries the account's **token version**, which is what makes it single
+ * use: redeeming it bumps that version, so the link stops verifying the moment
+ * it works. The same bump signs out every existing session, which is the right
+ * outcome — someone resetting a password they have lost, or believe is known,
+ * wants whatever was signed in with it gone.
+ *
+ * An hour, not a week. A reset link is a live credential for the account, where
+ * an invite only grants membership of one group.
+ */
+export const RESET_TTL_SECONDS = 60 * 60;
+
+export type ResetRead =
+  | { ok: true; email: string; tokenVersion: number }
+  | { ok: false; reason: 'invalid' | 'expired' };
+
+const invalidReset = { ok: false, reason: 'invalid' } as const;
+
+export const createResetToken = async (
+  secret: string,
+  email: string,
+  tokenVersion: number,
+  now: Date = new Date(),
+): Promise<string> => {
+  const expiresAt = Math.floor(now.getTime() / 1000) + RESET_TTL_SECONDS;
+  const body = `${email}.${tokenVersion}.${expiresAt}`;
+  // A distinct prefix, so a signature minted for one purpose cannot be
+  // presented as another: an invite code must never read as a reset link.
+  const signature = await hmac(secret, `reset:${body}`);
+  return `${toBase64Url(encoder.encode(body))}.${signature}`;
+};
+
+export const readResetToken = async (secret: string, token: string, now: Date = new Date()): Promise<ResetRead> => {
+  const [body, signature] = token.split('.');
+  if (!body || !signature) {
+    return invalidReset;
+  }
+
+  let decoded: string;
+  try {
+    decoded = new TextDecoder().decode(fromBase64Url(body));
+  } catch {
+    return invalidReset;
+  }
+
+  const expected = await hmac(secret, `reset:${decoded}`);
+  if (!timingSafeEqual(expected, signature)) {
+    return invalidReset;
+  }
+
+  // An address may contain dots, so the trailing fields are peeled off the
+  // right rather than splitting the payload.
+  const expirySeparator = decoded.lastIndexOf('.');
+  const versionSeparator = decoded.lastIndexOf('.', expirySeparator - 1);
+  if (versionSeparator <= 0) {
+    return invalidReset;
+  }
+
+  const email = decoded.slice(0, versionSeparator);
+  const tokenVersion = Number(decoded.slice(versionSeparator + 1, expirySeparator));
+  const expiresAt = Number(decoded.slice(expirySeparator + 1));
+  if (!email || !Number.isInteger(tokenVersion) || tokenVersion < 0 || !Number.isInteger(expiresAt)) {
+    return invalidReset;
+  }
+
+  if (expiresAt * 1000 <= now.getTime()) {
+    return { ok: false, reason: 'expired' };
+  }
+
+  return { ok: true, email, tokenVersion };
+};
