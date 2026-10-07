@@ -22,6 +22,11 @@ export default defineWorkersConfig({
             // Small on purpose: a test that drains this bucket should cost a
             // handful of requests, not 121. Production defaults live in src.
             RATE_LIMIT_READ: '20',
+            // Password reset needs a configured mailer to be offered at all.
+            // The key is fake and every send is intercepted by fetchMock; no
+            // test reaches Brevo.
+            BREVO_API_KEY: 'test-key-not-used-in-production',
+            EMAIL_FROM: 'no-reply@example.com',
           },
         },
         wrangler: {

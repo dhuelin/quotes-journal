@@ -107,6 +107,30 @@ the group value. That value is read and rewritten on every write and has a hard
 only the picture's size and type live there. R2 would be the natural home if
 this grows, and is not used today because R2 is not enabled on the account.
 
+### Keyboard and screen readers
+
+The whole app used to sit inside one `aria-live` region, so a screen reader
+re-announced the entire page on every render — including the renders the quote
+counter fires while someone is still typing. Announcements now come from a small
+region outside the app that is never replaced, and carry only the notice.
+
+The tab strips implement the **whole** ARIA tabs pattern: each tab points at a
+real `tabpanel`, the panel points back, and a roving tabindex plus
+arrow/Home/End keys move between them. Half a pattern was worse than none,
+because `role="tab"` promises a keyboard interaction that was not there.
+
+Focus is restored after a render. Every render replaces the document, which
+dropped a keyboard user back to the top of the page each time a form was
+submitted or a counter updated.
+
+Avatar initials are `aria-hidden`: they are a visual stand-in for a picture and
+the name is announced right beside them, so without it every member row read as
+"A L Alice you owner".
+
+Colour contrast was measured rather than eyeballed, and every pair passes AA for
+body text — `--muted` on the three surfaces it is used on comes out at 7.75,
+7.02 and 6.35 to one.
+
 ### Ending a session
 
 A token carries the account's **token version**. Bumping the stored version
@@ -130,10 +154,28 @@ Tokens minted before versions existed carry none and read as generation zero,
 which is what a never-revoked account is on — so the deploy that introduced this
 signed nobody out.
 
-**Still missing: password reset by email.** A forgotten password is still a lost
-account. It needs an email provider, which this deployment does not have; the
-same gap keeps registration answering `409` for a taken address. Tracked in
-[#6](https://github.com/dhuelin/quotes-journal/issues/6).
+### Forgetting a password
+
+`/api/auth/forgot` answers **identically** whether or not the address has an
+account, and the send happens in `waitUntil` so the response does not take
+longer when there was something to send — otherwise the timing would say what
+the body refuses to.
+
+The emailed link is signed like an invite code, lives for an hour rather than a
+week, and carries the account's token version. That version is what makes it
+**single use**: redeeming it bumps the version, so the link stops verifying the
+moment it works, and every session opened under the old password dies with it.
+What is signed carries a `reset:` prefix, so an invite code — same shape, same
+signer, and passed around a group chat — can never be presented as a reset link.
+
+The token travels in the URL fragment, which browsers never send to a server,
+and the client lifts it into memory and cleans the address bar on load.
+
+One gap remains, and it is not about reset: registering with an address that
+already has an account still answers `409`, which tells an attacker whether a
+given person uses the app. Closing it properly means registration becoming a
+two-step confirm-by-email flow, which is a real change to how signing up feels —
+worth deciding deliberately rather than as a side effect.
 
 ### Profile and group pictures
 
@@ -345,11 +387,19 @@ and, because the Worker runs on a custom domain rather than `workers.dev`:
 
 - **Zone → Workers Routes → Edit**, on the `huelin.dev` zone
 
-Set the app secret once, against the same account:
+Set the app secrets once, against the same account:
 
 ```bash
 npx wrangler secret put AUTH_SECRET
+npx wrangler secret put BREVO_API_KEY   # optional; without it, reset is not offered
 ```
+
+`BREVO_API_KEY` is a [Brevo](https://www.brevo.com) transactional-email key.
+Without it `/api/auth/forgot` answers `503` and says plainly that reset is not
+configured — a fact about the deployment, not about any account, so it leaks
+nothing. `EMAIL_FROM` and `EMAIL_FROM_NAME` are optional `[vars]`, defaulting to
+`no-reply@huelin.dev` and "Quotes Journal"; the sender address has to be one
+Brevo has verified for the domain.
 
 Without it the auth endpoints answer `503`. Rotating it signs everyone out and
 invalidates every outstanding invite link.
@@ -376,6 +426,8 @@ All `/api/groups` and `/api/invites` routes need an `Authorization: Bearer
 | --- | --- | --- |
 | `POST` | `/api/auth/register` | `{ displayName, email, password }` → `{ token, user }` |
 | `POST` | `/api/auth/login` | `{ email, password }` → `{ token, user }` |
+| `POST` | `/api/auth/forgot` | `{ email }`; always the same answer, mails a one-hour link |
+| `POST` | `/api/auth/reset` | `{ token, newPassword }` → `{ token, user }`; the link is single use |
 | `GET` | `/api/auth/me` | the account and the groups it belongs to |
 | `POST` | `/api/account/display-name` | `{ displayName }` → a fresh `{ token, user }` |
 | `POST` | `/api/account/password` | `{ currentPassword, newPassword }`; `403` if the current one is wrong |
@@ -423,7 +475,6 @@ Tracked in [the issue tracker](https://github.com/dhuelin/quotes-journal/issues)
 - [#3](https://github.com/dhuelin/quotes-journal/issues/3) timezone-aware reveal (today it unlocks at midnight UTC)
 - [#4](https://github.com/dhuelin/quotes-journal/issues/4) year-end countdown and unlock notifications
 - [#5](https://github.com/dhuelin/quotes-journal/issues/5) richer analytics beyond the leaderboard
-- [#6](https://github.com/dhuelin/quotes-journal/issues/6) password reset by email (revocation and password change are done)
 - [#7](https://github.com/dhuelin/quotes-journal/issues/7) persist the mobile session across restarts
 - [#8](https://github.com/dhuelin/quotes-journal/issues/8) store submission setup for the mobile app
 - [#19](https://github.com/dhuelin/quotes-journal/issues/19) publishing to the app stores (low priority)

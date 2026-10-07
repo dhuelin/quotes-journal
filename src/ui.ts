@@ -47,6 +47,12 @@ const appStyles = `
       p { margin: 0 0 .75rem; }
 
       .muted { color: var(--muted); }
+
+      /* Present to a screen reader, absent from the page. */
+      .visually-hidden {
+        position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+        overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+      }
       .small { font-size: .85rem; }
       .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
 
@@ -257,6 +263,8 @@ const appScript = `
           pendingImage: null,
           /** 'settings' when the settings page is open, otherwise null. */
           view: null,
+          /** The token from a reset link, read out of the fragment on load. */
+          resetToken: null,
           /** How many lines the quote form is showing. One is the common case. */
           lineCount: 1,
           /** The round in progress, if the quiz tab is being played. */
@@ -288,6 +296,14 @@ const appScript = `
 
         function notify(message, kind) {
           state.notice = message ? { message: message, kind: kind || 'error' } : null;
+
+          // Spoken from the region outside #app, which survives re-renders. A
+          // live region that is created along with its text does not reliably
+          // announce; one that already exists and then changes does.
+          var announcer = document.getElementById('announcer');
+          if (announcer) {
+            announcer.textContent = message || '';
+          }
         }
 
         function noticeHtml() {
@@ -416,8 +432,12 @@ const appScript = `
          * a URL that could would be a credential in the browser history.
          */
         function avatarHtml(name, source, extraClass) {
+          // Hidden from assistive technology on purpose. The initials are a
+          // visual stand-in for a picture and the name is read out right next
+          // to them, so announcing both turns every member row into
+          // "A L Alice you owner".
           return (
-            '<span class="avatar' + (extraClass ? ' ' + extraClass : '') + '"' +
+            '<span class="avatar' + (extraClass ? ' ' + extraClass : '') + '" aria-hidden="true"' +
             (source ? ' data-avatar="' + escapeHtml(source) + '"' : '') + '>' +
             escapeHtml(initials(name)) +
             '</span>'
@@ -488,11 +508,36 @@ const appScript = `
             '<p class="muted">Everything your group records stays sealed until January 1st. Then the quotes, the stats and the quiz open up at once.</p>' +
             '</div>' +
             '<div class="card">' +
-            '<div class="tabs" role="tablist">' +
-            '<button role="tab" data-auth-tab="login" aria-selected="' + (state.authTab !== 'register') + '">Sign in</button>' +
-            '<button role="tab" data-auth-tab="register" aria-selected="' + (state.authTab === 'register') + '">Create account</button>' +
+            authPanelHtml() +
+            '</div>'
+          );
+        }
+
+        /**
+         * Sign in and Create account are tabs; asking for a reset link is not —
+         * it is somewhere you go from the sign-in form and come back from. So
+         * the strip is absent there rather than showing a third tab that is
+         * selected but unlisted, and the panel is a plain region, because
+         * an aria-labelledby pointing at a tab that is not on the page is
+         * worse than no label at all.
+         */
+        function authPanelHtml() {
+          if (state.authTab === 'forgot') {
+            return '<h2>Reset your password</h2>' + forgotFormHtml();
+          }
+
+          var registering = state.authTab === 'register';
+          return (
+            '<div class="tabs" role="tablist" aria-label="Sign in or create an account">' +
+            '<button role="tab" id="tab-login" data-auth-tab="login"' +
+            ' aria-selected="' + !registering + '"' +
+            ' aria-controls="panel-auth" tabindex="' + (registering ? '-1' : '0') + '">Sign in</button>' +
+            '<button role="tab" id="tab-register" data-auth-tab="register"' +
+            ' aria-selected="' + registering + '"' +
+            ' aria-controls="panel-auth" tabindex="' + (registering ? '0' : '-1') + '">Create account</button>' +
             '</div>' +
-            (state.authTab === 'register' ? registerFormHtml() : loginFormHtml()) +
+            '<div role="tabpanel" id="panel-auth" aria-labelledby="tab-' + (registering ? 'register' : 'login') + '">' +
+            (registering ? registerFormHtml() : loginFormHtml()) +
             '</div>'
           );
         }
@@ -505,7 +550,48 @@ const appScript = `
             '<label for="login-password">Password</label>' +
             '<input id="login-password" name="password" type="password" autocomplete="current-password" required />' +
             '<button type="submit">Sign in</button>' +
-            '</form>'
+            '</form>' +
+            '<button class="link" id="show-forgot">I have forgotten my password</button>'
+          );
+        }
+
+        /**
+         * Asking for a reset link. The confirmation is deliberately the same
+         * whatever the server did, because the server deliberately answers the
+         * same way: an address that is not registered must not be revealed by
+         * a page that says so.
+         */
+        function forgotFormHtml() {
+          return (
+            '<form id="forgot-form">' +
+            '<label for="forgot-email">Email</label>' +
+            '<input id="forgot-email" name="email" type="email" autocomplete="email" required />' +
+            '<p class="small muted">If that address has an account, a link to choose a new password is on its way. It is good for an hour.</p>' +
+            '<button type="submit">Send me a link</button>' +
+            '</form>' +
+            '<button class="link" id="back-to-login">Back to signing in</button>'
+          );
+        }
+
+        /** The page the emailed link lands on. */
+        function resetView() {
+          return (
+            '<header class="bar"><div class="brand"><span class="mark">&#8220;&#8221;</span> Quotes Journal</div></header>' +
+            noticeHtml() +
+            '<div class="card">' +
+            '<h1>Choose a new password</h1>' +
+            (state.resetToken
+              ? '<form id="reset-form">' +
+                '<label for="reset-password">New password</label>' +
+                '<input id="reset-password" name="newPassword" type="password" autocomplete="new-password" minlength="10" required />' +
+                '<label for="reset-confirm">Repeat it</label>' +
+                '<input id="reset-confirm" name="newPasswordConfirm" type="password" autocomplete="new-password" required />' +
+                '<p class="small muted">At least 10 characters. Setting it signs out every device that was signed in before.</p>' +
+                '<button type="submit">Set the password</button>' +
+                '</form>'
+              : '<p class="muted">This link is missing its token. Ask for a new one from the sign-in page.</p>' +
+                '<button class="link" id="back-to-login">Back to signing in</button>') +
+            '</div>'
           );
         }
 
@@ -676,11 +762,19 @@ const appScript = `
             state.tab = tabs[0];
           }
 
+          // The full tabs pattern, not half of it: aria-controls pointing at a
+          // real tabpanel, and a roving tabindex so Tab reaches the strip once
+          // and the arrow keys move within it. Half a pattern is worse than
+          // none, because it promises a keyboard interaction that is not there.
           var tabsHtml = tabs
             .map(function (tab) {
               var labels = { collect: 'Add a quote', members: 'Members', reveal: 'The reveal', quiz: 'Quiz' };
+              var selected = state.tab === tab;
               return (
-                '<button role="tab" data-tab="' + tab + '" aria-selected="' + (state.tab === tab) + '">' +
+                '<button role="tab" id="tab-' + tab + '" data-tab="' + tab + '"' +
+                ' aria-selected="' + selected + '"' +
+                ' aria-controls="panel-' + tab + '"' +
+                ' tabindex="' + (selected ? '0' : '-1') + '">' +
                 labels[tab] +
                 '</button>'
               );
@@ -712,8 +806,10 @@ const appScript = `
             (group.revealMovedAt ? ' <span class="pill">date moved</span>' : '') +
             '</p>' +
             noticeHtml() +
-            '<div class="tabs" role="tablist">' + tabsHtml + '</div>' +
-            body
+            '<div class="tabs" role="tablist" aria-label="Group sections">' + tabsHtml + '</div>' +
+            '<div role="tabpanel" id="panel-' + state.tab + '" aria-labelledby="tab-' + state.tab + '">' +
+            body +
+            '</div>'
           );
         }
 
@@ -1145,8 +1241,14 @@ const appScript = `
         function render(options) {
           var keepInput = options && options.keepInput;
           var snapshot = keepInput ? readForms() : null;
+          // Every render replaces the document, which drops focus to the body
+          // and loses a keyboard user's place entirely. Elements are rebuilt
+          // with the same ids, so the id is enough to put it back.
+          var focused = document.activeElement ? document.activeElement.id : null;
 
-          if (!state.token) {
+          if (state.view === 'reset') {
+            app.innerHTML = resetView();
+          } else if (!state.token) {
             app.innerHTML = authView();
           } else if (state.view === 'settings') {
             app.innerHTML = settingsView();
@@ -1158,6 +1260,13 @@ const appScript = `
 
           if (snapshot) {
             writeForms(snapshot);
+          }
+
+          if (focused) {
+            var again = document.getElementById(focused);
+            if (again) {
+              again.focus();
+            }
           }
 
           state.notice = null;
@@ -1200,6 +1309,40 @@ const appScript = `
         }
 
         function bind() {
+          /**
+           * Arrow keys within a tab strip, which the tabs pattern expects and
+           * which Tab alone does not give: the roving tabindex deliberately
+           * takes the unselected tabs out of the tab order, so without this
+           * they would be unreachable from the keyboard entirely.
+           */
+          document.querySelectorAll('[role="tablist"]').forEach(function (strip) {
+            strip.addEventListener('keydown', function (event) {
+              var keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End'];
+              if (keys.indexOf(event.key) === -1) {
+                return;
+              }
+
+              var tabs = Array.prototype.slice.call(strip.querySelectorAll('[role="tab"]'));
+              var here = tabs.indexOf(document.activeElement);
+              if (here === -1) {
+                return;
+              }
+
+              event.preventDefault();
+              var next =
+                event.key === 'Home'
+                  ? 0
+                  : event.key === 'End'
+                    ? tabs.length - 1
+                    : (here + (event.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length;
+
+              // Selection follows focus, which is the pattern's default and the
+              // right call here: every panel is already loaded or loads itself.
+              tabs[next].focus();
+              tabs[next].click();
+            });
+          });
+
           document.querySelectorAll('[data-auth-tab]').forEach(function (button) {
             button.addEventListener('click', function () {
               state.authTab = button.getAttribute('data-auth-tab');
@@ -1222,6 +1365,50 @@ const appScript = `
             button.addEventListener('click', function () {
               openGroup(button.getAttribute('data-open-group'));
             });
+          });
+
+          onClick('show-forgot', function () {
+            state.authTab = 'forgot';
+            render();
+          });
+
+          onClick('back-to-login', function () {
+            state.authTab = 'login';
+            state.view = null;
+            history.replaceState({}, '', '/app');
+            render();
+          });
+
+          onSubmit('forgot-form', async function (form) {
+            await api('/api/auth/forgot', { method: 'POST', body: { email: form.email.value } });
+            state.authTab = 'login';
+            // The same words whatever happened, because the server answers the
+            // same way: a page that says "no such account" undoes the point.
+            notify('If that address has an account, a link is on its way. It is good for an hour.', 'ok');
+            render();
+          });
+
+          onSubmit('reset-form', async function (form) {
+            if (form.newPassword.value !== form.newPasswordConfirm.value) {
+              throw new Error('Those two passwords do not match');
+            }
+
+            var result = await api('/api/auth/reset', {
+              method: 'POST',
+              body: { token: state.resetToken, newPassword: form.newPassword.value },
+            });
+
+            // Signed in by the reset itself: proving control of the mailbox is
+            // the credential, so asking them to type it again is ceremony.
+            state.token = result.token;
+            state.user = result.user;
+            state.resetToken = null;
+            state.view = null;
+            localStorage.setItem(TOKEN_KEY, result.token);
+            history.replaceState({}, '', '/app');
+            await loadGroups();
+            notify('Your password is set, and every other device was signed out.', 'ok');
+            render();
           });
 
           onClick('sign-out', function () { signOut(); });
@@ -2052,6 +2239,24 @@ const appScript = `
           }
         }
 
+        /**
+         * The token rides in the fragment, which browsers never send to a
+         * server — so it stays out of access logs, referrers and proxies, the
+         * same reasoning as an invite code. It is lifted into memory and the
+         * address bar is cleaned, so a shoulder-surfer or a screenshot of the
+         * open page does not carry a live credential.
+         */
+        function readResetFromLocation() {
+          var marker = location.hash.indexOf('token=');
+          if (marker === -1) {
+            return null;
+          }
+
+          var token = decodeURIComponent(location.hash.slice(marker + 'token='.length));
+          history.replaceState({}, '', location.pathname);
+          return token;
+        }
+
         function forgetPendingInvite() {
           state.pendingInvite = null;
           try {
@@ -2147,6 +2352,9 @@ const appScript = `
         // backslash in a regex here is eaten before the browser ever sees it.
         function locationTarget() {
           var parts = location.pathname.split('/').filter(Boolean);
+          if (parts[0] === 'reset') {
+            return { reset: true };
+          }
           if (parts[0] === 'settings') {
             return { settings: true };
           }
@@ -2243,6 +2451,18 @@ const appScript = `
         });
 
         async function boot() {
+          // Before any session handling: someone following a reset link may
+          // already be signed in on this device, and the link still has to win.
+          if (locationTarget() && locationTarget().reset) {
+            state.view = 'reset';
+            state.resetToken = readResetFromLocation();
+            if (!state.resetToken) {
+              notify('That reset link is missing its token. Ask for a new one.', 'error');
+            }
+            render();
+            return;
+          }
+
           if (!state.token) {
             render();
             return;
@@ -2295,7 +2515,11 @@ const html = `<!doctype html>
     <style>${appStyles}</style>
   </head>
   <body>
-    <main id="app" aria-live="polite"></main>
+    <main id="app"></main>
+    <!-- A live region that is never replaced. Announcing from inside #app meant
+         re-announcing the entire application on every render, including the
+         renders the quote counter fires while someone is still typing. -->
+    <div id="announcer" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
     <script>${appScript}</script>
   </body>
 </html>`;
@@ -2344,7 +2568,7 @@ const privacyHtml = `<!doctype html>
   <body>
     <main>
       <h1>Privacy</h1>
-      <p class="muted">Quotes Journal &middot; last updated 1 October 2026</p>
+      <p class="muted">Quotes Journal &middot; last updated 7 October 2026</p>
 
       <p>Quotes Journal is a small app for recording things your friends said and
       reading them back at the end of the year. This page describes every piece of
@@ -2378,7 +2602,8 @@ const privacyHtml = `<!doctype html>
         <li>No contacts, location, microphone or camera access. Attaching a
         picture to a quote uses your device's own file picker, one photo at a
         time, on your explicit choice &mdash; the app never reads your library.</li>
-        <li>No third-party services. Nothing is shared with anyone.</li>
+        <li>No analytics or advertising service, and no third party at all
+        apart from Brevo, which delivers password-reset mail and nothing else.</li>
         <li>Nothing is sold, ever.</li>
       </ul>
 
@@ -2396,8 +2621,13 @@ const privacyHtml = `<!doctype html>
       <h2>Your sessions</h2>
       <p>Signing in creates a session that lasts 30 days. You can end every other
       session from the settings page at any time, and changing your password ends
-      them too. There is no password reset by email yet, so a forgotten password
-      means the account cannot be recovered &mdash; contact the maintainer below.</p>
+      them too.</p>
+      <p>If you forget your password, the app sends a reset link to your address
+      through <a href="https://www.brevo.com">Brevo</a>, which handles the
+      delivery. Brevo therefore sees your email address and the contents of that
+      message; it is the only third party involved anywhere in this app, and it
+      is used for nothing else &mdash; no newsletters, no marketing, no contact
+      lists. The link lasts an hour and stops working once used.</p>
 
       <h2>Deleting your data</h2>
       <p>There is no self-service delete yet. Email the address below and your

@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import {
   createInviteCode,
+  createResetToken,
   createSessionToken,
   DEFAULT_PBKDF2_ITERATIONS,
   hashPassword,
   INVITE_TTL_SECONDS,
   readHashIterations,
   readInviteCode,
+  readResetToken,
   resolvePbkdf2Iterations,
+  RESET_TTL_SECONDS,
   SESSION_TTL_SECONDS,
   verifyPassword,
   verifySessionToken,
@@ -192,5 +195,96 @@ describe('session generations', () => {
     const forged = btoa(JSON.stringify(payload)).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
 
     expect(await verifySessionToken(secret, `${forged}.${signature}`)).toBeNull();
+  });
+});
+
+/**
+ * A reset link is a live credential for the whole account, so it is bound
+ * tighter than an invite: an hour, one account, and one use.
+ */
+describe('password reset links', () => {
+  const secret = 'a-secret-only-the-worker-knows';
+
+  it('round-trips the address and the generation it was minted for', async () => {
+    const token = await createResetToken(secret, 'alice@example.com', 3);
+
+    expect(await readResetToken(secret, token)).toEqual({
+      ok: true,
+      email: 'alice@example.com',
+      tokenVersion: 3,
+    });
+  });
+
+  it('survives an address full of dots', async () => {
+    // The payload is three dot-joined fields and addresses contain dots, so the
+    // trailing two are peeled off the right rather than split on.
+    const token = await createResetToken(secret, 'a.b.c@mail.example.co.uk', 0);
+
+    expect(await readResetToken(secret, token)).toMatchObject({ email: 'a.b.c@mail.example.co.uk' });
+  });
+
+  it('expires after an hour', async () => {
+    const issued = new Date('2026-01-01T00:00:00.000Z');
+    const token = await createResetToken(secret, 'alice@example.com', 0, issued);
+
+    const justBefore = new Date(issued.getTime() + (RESET_TTL_SECONDS - 1) * 1000);
+    const justAfter = new Date(issued.getTime() + (RESET_TTL_SECONDS + 1) * 1000);
+
+    expect(await readResetToken(secret, token, justBefore)).toMatchObject({ ok: true });
+    expect(await readResetToken(secret, token, justAfter)).toEqual({ ok: false, reason: 'expired' });
+  });
+
+  it('rejects a token signed for another purpose', async () => {
+    // Invite codes are the same shape and the same signer. Without a distinct
+    // prefix in what is signed, one could be presented as the other — and an
+    // invite link is handed around a group chat.
+    const invite = await createInviteCode(secret, 'alice@example.com', 1);
+
+    expect(await readResetToken(secret, invite)).toEqual({ ok: false, reason: 'invalid' });
+  });
+
+  it('rejects a tampered generation or a different secret', async () => {
+    const token = await createResetToken(secret, 'alice@example.com', 1);
+    const [body, signature] = token.split('.');
+    const decoded = new TextDecoder().decode(
+      Uint8Array.from(atob(body.replaceAll('-', '+').replaceAll('_', '/')), (c) => c.charCodeAt(0)),
+    );
+    const forged = btoa(decoded.replace('.1.', '.0.'))
+      .replaceAll('+', '-')
+      .replaceAll('/', '_')
+      .replaceAll('=', '');
+
+    expect(await readResetToken(secret, `${forged}.${signature}`)).toEqual({ ok: false, reason: 'invalid' });
+    expect(await readResetToken('a-different-secret', token)).toEqual({ ok: false, reason: 'invalid' });
+  });
+});
+
+describe('the reset email', () => {
+  it('says that ignoring it is safe, because most of them are unexpected', async () => {
+    const { buildResetEmail } = await import('../src/email');
+    const message = buildResetEmail('alice@example.com', 'Alice', 'https://example.com/reset#token=abc');
+
+    expect(message.text).toContain('https://example.com/reset#token=abc');
+    expect(message.html).toContain('https://example.com/reset#token=abc');
+    // The likeliest recipient of one they did not ask for is someone whose
+    // address an attacker typed into the form.
+    expect(message.text).toContain('nothing has happened');
+    expect(message.text).toContain('has not been changed');
+    expect(message.text).toContain('within the next hour');
+  });
+
+  it('escapes a display name into the HTML body', async () => {
+    const { buildResetEmail } = await import('../src/email');
+    const message = buildResetEmail('a@example.com', '<script>alert(1)</script>', 'https://example.com/x');
+
+    expect(message.html).not.toContain('<script>');
+    expect(message.html).toContain('&lt;script&gt;');
+  });
+
+  it('is not configured without an API key, and says so rather than pretending', async () => {
+    const { emailConfig } = await import('../src/email');
+
+    expect(emailConfig({})).toBeNull();
+    expect(emailConfig({ BREVO_API_KEY: 'k' })).toMatchObject({ fromName: 'Quotes Journal' });
   });
 });

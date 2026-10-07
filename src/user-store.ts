@@ -285,6 +285,11 @@ export class UserStore {
       return jsonResponse({ tokenVersion: versionOf(user) });
     }
 
+    /** What the reset mail needs: who to greet, and which generation to sign. */
+    if (url.pathname === '/reset-subject' && request.method === 'GET') {
+      return jsonResponse({ displayName: user.displayName, tokenVersion: versionOf(user) });
+    }
+
     /** Signs out every other device, and this one too unless it takes a new token. */
     if (url.pathname === '/revoke' && request.method === 'POST') {
       user.tokenVersion = versionOf(user) + 1;
@@ -323,6 +328,37 @@ export class UserStore {
       }
 
       user.passwordHash = await hashPassword(newPassword, iterations);
+      user.tokenVersion = versionOf(user) + 1;
+      await this.ctx.storage.put('user', user);
+      return jsonResponse({ user: publicUser(user), tokenVersion: user.tokenVersion });
+    }
+
+    /**
+     * Sets a new password from a reset link.
+     *
+     * No current password: the whole point is that it has been forgotten. What
+     * stands in for it is the signed link, which the Worker has already checked
+     * — and the version in that link, re-checked here against the stored one so
+     * a link cannot be redeemed twice or used after a later reset supersedes it.
+     */
+    if (url.pathname === '/password/reset' && request.method === 'POST') {
+      const body = await readJsonBody(request);
+      if (!body.ok) {
+        return jsonResponse({ error: body.error }, 400);
+      }
+
+      const { newPassword, tokenVersion: presented, iterations: rounds } = body.value;
+      if (typeof newPassword !== 'string' || typeof presented !== 'number') {
+        return jsonResponse({ error: 'Invalid payload' }, 400);
+      }
+
+      if (presented !== versionOf(user)) {
+        return jsonResponse({ error: 'This reset link has already been used' }, 410);
+      }
+
+      user.passwordHash = await hashPassword(newPassword, resolvePbkdf2Iterations(rounds));
+      // Retires the link that got here, and every session opened with the old
+      // password along with it.
       user.tokenVersion = versionOf(user) + 1;
       await this.ctx.storage.put('user', user);
       return jsonResponse({ user: publicUser(user), tokenVersion: user.tokenVersion });

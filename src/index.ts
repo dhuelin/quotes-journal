@@ -7,9 +7,11 @@ import { policies } from './csp';
 import { LIMITS } from './domain';
 import {
   createInviteCode,
+  createResetToken,
   createSessionToken,
   hashPassword,
   readInviteCode,
+  readResetToken,
   resolvePbkdf2Iterations,
   verifySessionToken,
   type SessionUser,
@@ -23,6 +25,7 @@ import {
   validateText,
 } from './validation';
 import { readImageUpload } from './images';
+import { buildResetEmail, emailConfig, sendEmail } from './email';
 
 export { GroupStore, UserStore, RateLimiter };
 
@@ -39,6 +42,10 @@ export type Env = {
   RATE_LIMIT_READ?: string;
   /** PBKDF2 rounds; see `DEFAULT_PBKDF2_ITERATIONS` for the free-plan trade-off. */
   PBKDF2_ITERATIONS?: string;
+  /** Brevo, for password-reset mail. Absent means reset is simply not offered. */
+  BREVO_API_KEY?: string;
+  EMAIL_FROM?: string;
+  EMAIL_FROM_NAME?: string;
 };
 
 type AppEnv = { Bindings: Env; Variables: { user: SessionUser } };
@@ -405,6 +412,7 @@ const appShell = async (): Promise<Response> => htmlResponse(renderAppHtml(), (a
 app.get('/', () => appShell());
 app.get('/app', () => appShell());
 app.get('/join', () => appShell());
+app.get('/reset', () => appShell());
 // Both app stores require a reachable privacy policy URL in the listing.
 app.get('/privacy', async () => htmlResponse(renderPrivacyHtml(), (await policies()).privacy));
 app.get('/manifest.webmanifest', (c) =>
@@ -594,6 +602,124 @@ app.post('/api/auth/login', async (c) => {
   await linkAccount(c.env, authenticated.user.id, email.value);
   const token = await createSessionToken(secret, authenticated.user, authenticated.tokenVersion);
   return c.json({ token, user: authenticated.user });
+});
+
+/**
+ * Starts a password reset.
+ *
+ * Answers the same way whether or not the address has an account. That is the
+ * whole point: an endpoint that says "no such account" is a membership oracle,
+ * and this one is reachable without signing in.
+ *
+ * The send happens in `waitUntil`, so the response does not take longer when
+ * there was something to send — otherwise the timing would say what the body
+ * refuses to.
+ */
+app.post('/api/auth/forgot', async (c) => {
+  const secret = requireSecret(c.env);
+  if (!secret) {
+    return jsonError('Authentication is not configured on this deployment', 503);
+  }
+
+  const config = emailConfig(c.env);
+  if (!config) {
+    // A deployment fact, not a fact about any account, so saying it plainly
+    // leaks nothing and beats pretending a mail was sent.
+    return jsonError('Password reset is not configured on this deployment', 503);
+  }
+
+  const { limit, windowMs } = authLimit(c.env);
+  const decision = await checkRateLimit(c.env, `auth:${clientKey(c.req.raw)}`, limit, windowMs);
+  if (!decision.allowed) {
+    return tooManyRequests(decision);
+  }
+
+  const body = await readJsonBody(c.req.raw);
+  const email = body.ok ? validateEmail(body.value.email) : ({ ok: false } as const);
+
+  // Neutral from here on, including for an address that is not an address.
+  const neutral = c.json({ sent: true });
+  if (!email.ok) {
+    return neutral;
+  }
+
+  // Per-address, so one mailbox cannot be buried under reset mail by someone
+  // hammering the form.
+  const account = await peekAccountLimit(c.env, 'reset', email.value, c.req.raw);
+  if (!account.allowed) {
+    return tooManyRequests(account);
+  }
+  await spendAccountLimit(c.env, 'reset', email.value, c.req.raw);
+
+  const origin = new URL(c.req.url).origin;
+  c.executionCtx.waitUntil(
+    (async () => {
+      const subject = await callUserStore(c.env, email.value, '/reset-subject');
+      if (!subject.ok) {
+        return;
+      }
+
+      const { displayName, tokenVersion } = (await subject.json()) as {
+        displayName: string;
+        tokenVersion: number;
+      };
+      const token = await createResetToken(secret, email.value, tokenVersion);
+      // In the fragment, like an invite: browsers never send it to a server, so
+      // it stays out of access logs, referrers and proxies.
+      const link = `${origin}/reset#token=${encodeURIComponent(token)}`;
+      await sendEmail(config, buildResetEmail(email.value, displayName, link));
+    })(),
+  );
+
+  return neutral;
+});
+
+/** Finishes a reset: the signed link stands in for the password nobody has. */
+app.post('/api/auth/reset', async (c) => {
+  const secret = requireSecret(c.env);
+  if (!secret) {
+    return jsonError('Authentication is not configured on this deployment', 503);
+  }
+
+  const { limit, windowMs } = authLimit(c.env);
+  const decision = await checkRateLimit(c.env, `auth:${clientKey(c.req.raw)}`, limit, windowMs);
+  if (!decision.allowed) {
+    return tooManyRequests(decision);
+  }
+
+  const body = await readJsonBody(c.req.raw);
+  if (!body.ok) {
+    return jsonError(body.error, 400);
+  }
+
+  const password = validatePassword(body.value.newPassword);
+  if (!password.ok) {
+    return jsonError(password.error, 400);
+  }
+
+  const token = typeof body.value.token === 'string' ? body.value.token.trim() : '';
+  const reset = token ? await readResetToken(secret, token) : ({ ok: false, reason: 'invalid' } as const);
+  if (!reset.ok) {
+    return reset.reason === 'expired'
+      ? jsonError('This reset link has expired. Ask for a new one.', 410)
+      : jsonError('This reset link is not valid', 400);
+  }
+
+  const response = await callUserStore(c.env, reset.email, '/password/reset', {
+    newPassword: password.value,
+    tokenVersion: reset.tokenVersion,
+    iterations: resolvePbkdf2Iterations(c.env.PBKDF2_ITERATIONS),
+  });
+
+  if (!response.ok) {
+    return passThrough(response);
+  }
+
+  // Signed straight in: having just proved control of the mailbox, making them
+  // type the password they have only this second chosen is ceremony.
+  const changed = (await response.json()) as { user: SessionUser; tokenVersion: number };
+  const sessionToken = await createSessionToken(secret, changed.user, changed.tokenVersion);
+  return c.json({ token: sessionToken, user: changed.user });
 });
 
 app.get('/api/auth/me', async (c) => {

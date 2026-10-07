@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest';
-import { env, runInDurableObject, SELF } from 'cloudflare:test';
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { env, fetchMock, runInDurableObject, SELF } from 'cloudflare:test';
 import { groupByteSize, LIMITS, type GroupState, type Quote } from '../src/domain';
 import {
   createInviteCode,
+  createResetToken,
   DEFAULT_PBKDF2_ITERATIONS,
   hashPassword,
   INVITE_TTL_SECONDS,
@@ -2453,5 +2454,174 @@ describe('sessions and the password (L13)', () => {
     });
 
     expect((await request('/api/auth/me', { token: alice.token })).status).toBe(200);
+  });
+});
+
+/**
+ * Password reset. The flow is built around two refusals: never telling a
+ * stranger whether an address has an account, and never letting one link work
+ * twice.
+ */
+describe('password reset (L14)', () => {
+  /**
+   * One interceptor for the whole block, emptied between tests.
+   *
+   * Registering a persistent one per test does not work: fetchMock state
+   * outlives a test, so the first interceptor keeps serving and every later
+   * test watches an array nobody is filling — which is exactly the false
+   * failure this replaced.
+   */
+  const sent: any[] = [];
+
+  beforeAll(() => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+    fetchMock
+      .get('https://api.brevo.com')
+      .intercept({ path: '/v3/smtp/email', method: 'POST' })
+      .reply(201, (options: any) => {
+        sent.push(JSON.parse(options.body as string));
+        return {};
+      })
+      .persist();
+  });
+
+  beforeEach(() => {
+    sent.length = 0;
+  });
+
+  /** Waits for the send, which the route does in waitUntil. */
+  const posted = async () => {
+    await vi.waitUntil(() => sent.length > 0, { timeout: 5000 });
+    return sent[0];
+  };
+
+  const linkFrom = (body: any): string => {
+    const match = /https?:\/\/\S*\/reset#token=([^\s"<]+)/.exec(body.textContent);
+    expect(match, 'the mail should carry a reset link').toBeTruthy();
+    return decodeURIComponent(match![1]);
+  };
+
+  it('answers the same for an address with an account and one without', async () => {
+    const alice = await registerUser('Alice');
+
+    const known = await request('/api/auth/forgot', { method: 'POST', body: { email: alice.user.email } });
+    const unknown = await request('/api/auth/forgot', { method: 'POST', body: { email: 'nobody@example.com' } });
+
+    // Asserted outright, not just as "the two match": comparing them alone
+    // would pass just as happily if the endpoint were refusing both.
+    expect(known.status).toBe(200);
+    expect(unknown.status).toBe(200);
+    // An endpoint reachable without signing in that says "no such account" is
+    // a membership oracle, which is the thing this shape exists to avoid.
+    expect(known.body).toEqual(unknown.body);
+    expect(JSON.stringify(known.body)).not.toContain(alice.user.email);
+
+    // And only the real address was actually written to.
+    await posted();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].to[0].email).toBe(alice.user.email);
+  });
+
+  it('sends a link that signs the account in with a new password', async () => {
+    const alice = await registerUser('Alice');
+
+    await request('/api/auth/forgot', { method: 'POST', body: { email: alice.user.email } });
+    const mail = await posted();
+    expect(mail.subject).toContain('Reset');
+
+    const reset = await request('/api/auth/reset', {
+      method: 'POST',
+      body: { token: linkFrom(mail), newPassword: 'a brand new long password' },
+    });
+
+    expect(reset.status).toBe(200);
+    // Signed straight in: they have just proved control of the mailbox, so
+    // retyping the password chosen one second ago is ceremony.
+    expect((await request('/api/auth/me', { token: reset.body.token })).status).toBe(200);
+
+    const signIn = await request('/api/auth/login', {
+      method: 'POST',
+      body: { email: alice.user.email, password: 'a brand new long password' },
+    });
+    expect(signIn.status).toBe(200);
+  });
+
+  it('retires the link the moment it works, and every old session with it', async () => {
+    const alice = await registerUser('Alice');
+
+    await request('/api/auth/forgot', { method: 'POST', body: { email: alice.user.email } });
+    const link = linkFrom(await posted());
+
+    expect(
+      (await request('/api/auth/reset', { method: 'POST', body: { token: link, newPassword: 'first new password' } }))
+        .status,
+    ).toBe(200);
+
+    // The link carries the generation it was minted for, and redeeming it
+    // bumped that generation — so a second use finds a number that no longer
+    // matches. A link that reached the wrong inbox is spent, not reusable.
+    const again = await request('/api/auth/reset', {
+      method: 'POST',
+      body: { token: link, newPassword: 'second new password' },
+    });
+    expect(again.status).toBe(410);
+
+    // And the sessions that existed under the old password are gone.
+    expect((await request('/api/auth/me', { token: alice.token })).status).toBe(401);
+  });
+
+  it('refuses a forged, expired or wrong-purpose link', async () => {
+    const alice = await registerUser('Alice');
+
+    const forged = await request('/api/auth/reset', {
+      method: 'POST',
+      body: { token: 'not.a.token', newPassword: 'a brand new long password' },
+    });
+    expect(forged.status).toBe(400);
+
+    const expired = await createResetToken(TEST_SECRET, alice.user.email, 0, new Date(Date.now() - 2 * 60 * 60 * 1000));
+    const stale = await request('/api/auth/reset', {
+      method: 'POST',
+      body: { token: expired, newPassword: 'a brand new long password' },
+    });
+    expect(stale.status).toBe(410);
+
+    // An invite code is the same shape from the same signer, and gets passed
+    // around a group chat.
+    const invite = await createInviteCode(TEST_SECRET, alice.user.email, 1);
+    const crossUse = await request('/api/auth/reset', {
+      method: 'POST',
+      body: { token: invite, newPassword: 'a brand new long password' },
+    });
+    expect(crossUse.status).toBe(400);
+  });
+
+  it('refuses a new password that is too short', async () => {
+    const alice = await registerUser('Alice');
+    await request('/api/auth/forgot', { method: 'POST', body: { email: alice.user.email } });
+
+    const response = await request('/api/auth/reset', {
+      method: 'POST',
+      body: { token: linkFrom(await posted()), newPassword: 'short' },
+    });
+
+    expect(response.status).toBe(400);
+  });
+
+  it('will not bury one mailbox under reset mail', async () => {
+    const alice = await registerUser('Alice');
+
+    let throttled = false;
+    for (let attempt = 0; attempt < 12 && !throttled; attempt += 1) {
+      const response = await request('/api/auth/forgot', {
+        method: 'POST',
+        ip: alice.ip,
+        body: { email: alice.user.email },
+      });
+      throttled = response.status === 429;
+    }
+
+    expect(throttled).toBe(true);
   });
 });
