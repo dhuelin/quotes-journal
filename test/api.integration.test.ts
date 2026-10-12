@@ -1,5 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { env, fetchMock, runInDurableObject, SELF } from 'cloudflare:test';
+import { env, fetchMock, runDurableObjectAlarm, runInDurableObject, SELF } from 'cloudflare:test';
 import { groupByteSize, LIMITS, type GroupState, type Quote } from '../src/domain';
 import {
   createInviteCode,
@@ -26,6 +26,34 @@ const nextYear = new Date().getUTCFullYear();
 
 /** Matches the AUTH_SECRET the workers pool binds in vitest.config.ts. */
 const TEST_SECRET = 'test-secret-not-used-in-production';
+
+
+/**
+ * One mail interceptor for the whole file.
+ *
+ * fetchMock state outlives a describe, so a second block registering its own
+ * persistent interceptor never gets to serve — the first one keeps answering
+ * and the second block watches an array nobody fills. That failed silently
+ * once per block added, so there is exactly one, shared.
+ */
+const sentMail: any[] = [];
+
+beforeAll(() => {
+  fetchMock.activate();
+  fetchMock.disableNetConnect();
+  fetchMock
+    .get('https://api.brevo.com')
+    .intercept({ path: '/v3/smtp/email', method: 'POST' })
+    .reply(201, (options: any) => {
+      sentMail.push(JSON.parse(options.body as string));
+      return {};
+    })
+    .persist();
+});
+
+beforeEach(() => {
+  sentMail.length = 0;
+});
 
 const inviteCodeFor = async (owner: TestUser, groupId: string): Promise<string> => {
   const response = await request(`/api/groups/${groupId}/invite`, { token: owner.token });
@@ -2463,32 +2491,7 @@ describe('sessions and the password (L13)', () => {
  * twice.
  */
 describe('password reset (L14)', () => {
-  /**
-   * One interceptor for the whole block, emptied between tests.
-   *
-   * Registering a persistent one per test does not work: fetchMock state
-   * outlives a test, so the first interceptor keeps serving and every later
-   * test watches an array nobody is filling — which is exactly the false
-   * failure this replaced.
-   */
-  const sent: any[] = [];
-
-  beforeAll(() => {
-    fetchMock.activate();
-    fetchMock.disableNetConnect();
-    fetchMock
-      .get('https://api.brevo.com')
-      .intercept({ path: '/v3/smtp/email', method: 'POST' })
-      .reply(201, (options: any) => {
-        sent.push(JSON.parse(options.body as string));
-        return {};
-      })
-      .persist();
-  });
-
-  beforeEach(() => {
-    sent.length = 0;
-  });
+  const sent = sentMail;
 
   /** Waits for the send, which the route does in waitUntil. */
   const posted = async () => {
@@ -2623,5 +2626,130 @@ describe('password reset (L14)', () => {
     }
 
     expect(throttled).toBe(true);
+  });
+});
+
+/**
+ * The announcement when a group opens. A Durable Object alarm rather than a
+ * cron, because a cron would have to scan every group and there is no index of
+ * them — and because a group that chose an odd date deserves the mail on the
+ * minute rather than whenever a sweep ran.
+ */
+describe('the reveal announcement (L15)', () => {
+  const sent = sentMail;
+
+  const stubFor = (groupId: string) => env.GROUPS.get(env.GROUPS.idFromName(groupId));
+
+  it('arms an alarm for the reveal when a group is created', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Waiting', nextYear);
+
+    const due = await runInDurableObject(stubFor(group.id), async (_instance, state) => state.storage.getAlarm());
+
+    expect(due).toBe(new Date(group.revealAt).getTime());
+  });
+
+  it('mails every member with an account when it fires', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Opening night', nextYear);
+    await joinGroup(alice, bob, group.id);
+    // A guest has no account to mail.
+    await request(`/api/groups/${group.id}/members`, { method: 'POST', token: alice.token, body: { name: 'Cleo' } });
+    await request(`/api/groups/${group.id}/quotes`, {
+      method: 'POST',
+      token: alice.token,
+      body: { text: 'Worth the wait', saidByMemberId: group.you.memberId },
+    });
+
+    await unlockGroup(group.id);
+    await runDurableObjectAlarm(stubFor(group.id));
+    await vi.waitUntil(() => sent.length >= 2, { timeout: 5000 });
+
+    const recipients = sent.map((mail) => mail.to[0].email).sort();
+    expect(recipients).toEqual([alice.user.email, bob.user.email].sort());
+    expect(sent[0].subject).toContain('Opening night');
+
+    // Says nothing about what is inside. A preview line on a lock screen would
+    // hand over the ending the whole year was spent protecting.
+    const body = JSON.stringify(sent);
+    expect(body).not.toContain('Worth the wait');
+  });
+
+  it('announces once, however many times the alarm runs', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Only once', nextYear);
+    await unlockGroup(group.id);
+
+    await runDurableObjectAlarm(stubFor(group.id));
+    await vi.waitUntil(() => sent.length >= 1, { timeout: 5000 });
+    await runDurableObjectAlarm(stubFor(group.id));
+
+    expect(sent).toHaveLength(1);
+  });
+
+  it('re-arms rather than announcing a group that is still sealed', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Not yet', nextYear);
+
+    // An alarm can fire early if the owner postponed after it was set.
+    await runDurableObjectAlarm(stubFor(group.id));
+
+    expect(sent).toHaveLength(0);
+    const due = await runInDurableObject(stubFor(group.id), async (_instance, state) => state.storage.getAlarm());
+    expect(due).toBe(new Date(group.revealAt).getTime());
+  });
+
+  it('moves the alarm when the owner postpones', async () => {
+    const alice = await registerUser('Alice');
+    const created = await request('/api/groups', {
+      method: 'POST',
+      token: alice.token,
+      body: { name: 'Moved', revealYear: nextYear, revealAt: new Date(Date.now() + 86_400_000).toISOString() },
+    });
+    const group = created.body.group;
+
+    const later = new Date(Date.now() + 10 * 86_400_000).toISOString();
+    await request(`/api/groups/${group.id}/reveal`, { method: 'POST', token: alice.token, body: { revealAt: later } });
+
+    const due = await runInDurableObject(stubFor(group.id), async (_instance, state) => state.storage.getAlarm());
+    expect(due).toBe(new Date(later).getTime());
+  });
+
+  it('gives a group stored before alarms existed one the first time it is opened', async () => {
+    const alice = await registerUser('Alice');
+    const group = await createGroup(alice, 'Legacy', nextYear);
+
+    // As a group created before this feature would be: no alarm at all.
+    await runInDurableObject(stubFor(group.id), async (_instance, state) => state.storage.deleteAlarm());
+    expect(
+      await runInDurableObject(stubFor(group.id), async (_instance, state) => state.storage.getAlarm()),
+    ).toBeNull();
+
+    await request(`/api/groups/${group.id}`, { token: alice.token });
+
+    const due = await runInDurableObject(stubFor(group.id), async (_instance, state) => state.storage.getAlarm());
+    expect(due).toBe(new Date(group.revealAt).getTime());
+  });
+
+  it('mails nobody who turned it off', async () => {
+    const alice = await registerUser('Alice');
+    const bob = await registerUser('Bob');
+    const group = await createGroup(alice, 'Quiet please', nextYear);
+    await joinGroup(alice, bob, group.id);
+
+    const off = await request('/api/account/notifications', {
+      method: 'POST',
+      token: bob.token,
+      body: { notifyOnReveal: false },
+    });
+    expect(off.status).toBe(200);
+    expect(off.body.user.notifyOnReveal).toBe(false);
+
+    await unlockGroup(group.id);
+    await runDurableObjectAlarm(stubFor(group.id));
+    await vi.waitUntil(() => sent.length >= 1, { timeout: 5000 });
+
+    expect(sent.map((mail) => mail.to[0].email)).toEqual([alice.user.email]);
   });
 });

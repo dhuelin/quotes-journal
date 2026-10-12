@@ -133,6 +133,9 @@ const appStyles = `
       }
       .checks input { width: auto; }
 
+      .toggle { display: flex; align-items: center; gap: .55rem; color: var(--text); margin: 0 0 .4rem; }
+      .toggle input { width: auto; }
+
       .notice { padding: .7rem .8rem; border-radius: 10px; margin-bottom: 1rem; font-size: .9rem; }
       .notice.error { background: rgba(255, 123, 123, .12); border: 1px solid var(--danger); color: var(--danger); }
       .notice.ok { background: rgba(123, 220, 181, .12); border: 1px solid var(--ok); color: var(--ok); }
@@ -479,6 +482,29 @@ const appScript = `
           });
         }
 
+        /**
+         * Sharpens as it gets close. "95 days to go" is the right answer in
+         * March and a useless one at half past eleven on the night itself.
+         */
+        function countdown(iso) {
+          var ms = new Date(iso).getTime() - Date.now();
+          if (ms <= 0) {
+            return 'open now';
+          }
+
+          var minutes = Math.floor(ms / 60000);
+          if (minutes < 60) {
+            return minutes + (minutes === 1 ? ' minute to go' : ' minutes to go');
+          }
+
+          var hours = Math.floor(minutes / 60);
+          if (hours < 48) {
+            return hours + (hours === 1 ? ' hour to go' : ' hours to go');
+          }
+
+          return Math.ceil(hours / 24) + ' days to go';
+        }
+
         function daysUntil(iso) {
           var diff = new Date(iso).getTime() - Date.now();
           return Math.max(0, Math.ceil(diff / 86400000));
@@ -663,6 +689,13 @@ const appScript = `
               : '<p class="muted">You are not in any groups yet.</p>') +
             '</div>' +
             '<div class="card">' +
+            '<h2>Email</h2>' +
+            '<label class="toggle"><input type="checkbox" id="notify-reveal"' +
+            (state.user && state.user.notifyOnReveal === false ? '' : ' checked') +
+            ' /> Tell me when one of my groups opens</label>' +
+            '<p class="small muted">One message per group, on the day its quotes unlock. It is the only mail this app sends you besides a password reset you asked for.</p>' +
+            '</div>' +
+            '<div class="card">' +
             '<h2>Change your password</h2>' +
             '<form id="password-form">' +
             '<label for="current-password">Current password</label>' +
@@ -801,7 +834,7 @@ const appScript = `
             '<h1 class="group-title">' + escapeHtml(group.name) + '</h1>' +
             '<p class="muted small">' +
             (group.locked
-              ? 'Sealed until ' + escapeHtml(revealLabel(group.revealAt)) + ' &middot; ' + daysUntil(group.revealAt) + ' days to go'
+              ? 'Sealed until ' + escapeHtml(revealLabel(group.revealAt)) + ' &middot; ' + escapeHtml(countdown(group.revealAt))
               : 'Open since ' + escapeHtml(revealLabel(group.revealAt))) +
             (group.revealMovedAt ? ' <span class="pill">date moved</span>' : '') +
             '</p>' +
@@ -1443,6 +1476,28 @@ const appScript = `
             notify('Your password was changed, and every other device was signed out.', 'ok');
             render();
           });
+
+          var notifyToggle = document.getElementById('notify-reveal');
+          if (notifyToggle) {
+            notifyToggle.addEventListener('change', async function () {
+              try {
+                var result = await api('/api/account/notifications', {
+                  method: 'POST',
+                  body: { notifyOnReveal: notifyToggle.checked },
+                });
+                state.user = result.user;
+                notify(
+                  result.user.notifyOnReveal
+                    ? 'You will be told when a group opens.'
+                    : 'You will not be mailed when a group opens.',
+                  'ok',
+                );
+              } catch (error) {
+                notify(error.message, 'error');
+              }
+              render();
+            });
+          }
 
           onClick('sign-out-everywhere', async function () {
             if (!confirm('Sign out every other device? You will stay signed in here.')) {
@@ -2622,6 +2677,12 @@ const privacyHtml = `<!doctype html>
       <p>Signing in creates a session that lasts 30 days. You can end every other
       session from the settings page at any time, and changing your password ends
       them too.</p>
+      <p>When one of your groups reaches its reveal date, the app emails you to
+      say so. The message names the group and how many quotes are in it, and
+      deliberately says nothing about what any of them are. You can turn this
+      off in your settings; it is the only message the app sends you that you
+      did not directly ask for.</p>
+
       <p>If you forget your password, the app sends a reset link to your address
       through <a href="https://www.brevo.com">Brevo</a>, which handles the
       delivery. Brevo therefore sees your email address and the contents of that

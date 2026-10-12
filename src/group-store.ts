@@ -25,6 +25,8 @@ import {
 import { IMAGE_CONTENT_TYPES } from './domain';
 import { imageResponseHeaders } from './images';
 import { readJsonBody, validateMemberIdList, validateQuoteLines, validateText } from './validation';
+import { buildRevealEmail, emailConfig, sendEmail } from './email';
+import type { Env } from './env';
 
 const jsonResponse = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), {
@@ -115,7 +117,97 @@ const publicMember = (member: Member, viewerMemberId: string) => ({
 });
 
 export class GroupStore {
-  constructor(private readonly ctx: DurableObjectState, private readonly _env: unknown) {}
+  constructor(private readonly ctx: DurableObjectState, private readonly env: Env) {}
+
+  /**
+   * Announces the reveal to everyone in the group.
+   *
+   * A Durable Object alarm rather than a cron: a cron would have to scan every
+   * group and there is no index of them, while a group already knows its own
+   * reveal instant. It also means the announcement lands on the minute for a
+   * group that chose an odd date, instead of whenever a sweep happened to run.
+   */
+  async alarm(): Promise<void> {
+    const group = await this.ctx.storage.get<GroupState>('group');
+    if (!group || group.revealNotifiedAt) {
+      return;
+    }
+
+    // An alarm can fire early if the reveal was postponed after it was set.
+    // Re-arm rather than announce a group that is still sealed.
+    if (!areQuotesVisible(group)) {
+      await this.ctx.storage.setAlarm(new Date(revealInstant(group)));
+      return;
+    }
+
+    // Written before anything is sent. A crash midway through a members list
+    // would otherwise re-run the whole list on the retry, and people would
+    // rather miss one announcement than get four.
+    group.revealNotifiedAt = new Date().toISOString();
+    await this.ctx.storage.put('group', group);
+
+    const config = emailConfig(this.env);
+    if (!config) {
+      return;
+    }
+
+    const link = `${this.env.APP_ORIGIN ?? 'https://quotes.huelin.dev'}/groups/${encodeURIComponent(group.id)}/reveal`;
+    for (const member of group.members) {
+      // A guest has no account, and someone who left is no longer in the group
+      // in any sense that should produce mail.
+      if (!member.userId) {
+        continue;
+      }
+
+      const target = await this.notifyTarget(member.userId);
+      if (!target || !target.notifyOnReveal) {
+        continue;
+      }
+
+      await sendEmail(
+        config,
+        buildRevealEmail(target.email, target.displayName, group.name, group.quotes.length, link),
+      );
+    }
+  }
+
+  /** Resolves a member's account through the same pointer the avatars use. */
+  private async notifyTarget(
+    userId: string,
+  ): Promise<{ email: string; displayName: string; notifyOnReveal: boolean } | null> {
+    const pointer = this.env.USERS.get(this.env.USERS.idFromName(`uid:${userId}`));
+    const linked = await pointer.fetch('https://user/link');
+    if (!linked.ok) {
+      return null;
+    }
+
+    const { email } = (await linked.json()) as { email: string };
+    const account = this.env.USERS.get(this.env.USERS.idFromName(email));
+    const response = await account.fetch('https://user/notify-target');
+    return response.ok
+      ? ((await response.json()) as { email: string; displayName: string; notifyOnReveal: boolean })
+      : null;
+  }
+
+  /**
+   * Keeps the alarm pointing at the group's reveal.
+   *
+   * Called on every access, not only when the date is set: groups created
+   * before alarms existed have none, and this is what gives them one the first
+   * time anybody opens them — the same heal-on-access the cached group name
+   * uses, and for the same reason, that there is no way to enumerate groups.
+   */
+  private async ensureRevealAlarm(group: GroupState): Promise<void> {
+    if (group.revealNotifiedAt || areQuotesVisible(group)) {
+      return;
+    }
+
+    const due = new Date(revealInstant(group)).getTime();
+    const current = await this.ctx.storage.getAlarm();
+    if (current !== due) {
+      await this.ctx.storage.setAlarm(due);
+    }
+  }
 
   async fetch(request: Request): Promise<Response> {
     // A group and all of its quotes live in one stored value, so a write that
@@ -158,6 +250,8 @@ export class GroupStore {
     }
 
     if (url.pathname === '/group' && request.method === 'GET') {
+      // Where a group created before alarms existed gets one.
+      await this.ensureRevealAlarm(group);
       return jsonResponse({ group: this.overview(group, member) });
     }
 
@@ -340,6 +434,7 @@ export class GroupStore {
     };
 
     await this.ctx.storage.put('group', nextGroup);
+    await this.ensureRevealAlarm(nextGroup);
     return jsonResponse({ group: this.overview(nextGroup, owner) }, 201);
   }
 
@@ -935,6 +1030,8 @@ export class GroupStore {
     group.revealAt = body.value.revealAt;
     group.revealMovedAt = new Date().toISOString();
     await this.ctx.storage.put('group', group);
+    // Moved later, so the announcement has to move with it.
+    await this.ensureRevealAlarm(group);
     return jsonResponse({ group: this.overview(group, owner) });
   }
 

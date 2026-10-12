@@ -24,6 +24,17 @@ custom_domain = true
 # `wrangler secret put AUTH_SECRET` (and in .dev.vars for local development).
 # Declaring it as a plain var would overwrite the secret on every deploy.
 
+# Where links in scheduled mail point. A request-time handler reads the origin
+# from the request it is serving, but a reveal announcement is sent from a
+# Durable Object alarm, which has no request to read it from.
+[vars]
+APP_ORIGIN = "https://quotes.huelin.dev"
+
+# BREVO_API_KEY is a secret, set with `wrangler secret put BREVO_API_KEY`.
+# Without it no mail is sent at all: password reset answers 503 and a reveal
+# announcement is simply skipped. EMAIL_FROM and EMAIL_FROM_NAME are optional
+# and may go in [vars] above; the address has to be one Brevo has verified.
+
 # PBKDF2_ITERATIONS defaults to 30,000, which fits the free plan's 10ms of CPU.
 # On a paid plan raise it to OWASP's 600000 (about 90ms); stored hashes carry
 # their own round count, so existing accounts upgrade on their next login.

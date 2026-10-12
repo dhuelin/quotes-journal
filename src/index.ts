@@ -1,4 +1,5 @@
 import { Hono, type Context, type MiddlewareHandler } from 'hono';
+import type { Env } from './env';
 import { GroupStore } from './group-store';
 import { UserStore } from './user-store';
 import { RateLimiter, type RateLimitDecision } from './rate-limiter';
@@ -29,24 +30,7 @@ import { buildResetEmail, emailConfig, sendEmail } from './email';
 
 export { GroupStore, UserStore, RateLimiter };
 
-export type Env = {
-  GROUPS: DurableObjectNamespace;
-  USERS: DurableObjectNamespace;
-  RATE_LIMIT: DurableObjectNamespace;
-  /** Set with `wrangler secret put AUTH_SECRET`; locally via .dev.vars. */
-  AUTH_SECRET?: string;
-  RATE_LIMIT_AUTH?: string;
-  RATE_LIMIT_AUTH_ACCOUNT?: string;
-  RATE_LIMIT_AUTH_ACCOUNT_WIDE?: string;
-  RATE_LIMIT_WRITE?: string;
-  RATE_LIMIT_READ?: string;
-  /** PBKDF2 rounds; see `DEFAULT_PBKDF2_ITERATIONS` for the free-plan trade-off. */
-  PBKDF2_ITERATIONS?: string;
-  /** Brevo, for password-reset mail. Absent means reset is simply not offered. */
-  BREVO_API_KEY?: string;
-  EMAIL_FROM?: string;
-  EMAIL_FROM_NAME?: string;
-};
+export type { Env };
 
 type AppEnv = { Bindings: Env; Variables: { user: SessionUser } };
 
@@ -945,6 +929,20 @@ app.post('/api/account/display-name', async (c) => {
   const updated = (await response.json()) as { user: SessionUser; tokenVersion: number };
   const token = await createSessionToken(secret, updated.user, updated.tokenVersion);
   return c.json({ token, user: updated.user });
+});
+
+/** Whether to be mailed when a group opens. On unless turned off. */
+app.post('/api/account/notifications', async (c) => {
+  const body = await readJsonBody(c.req.raw);
+  if (!body.ok) {
+    return jsonError(body.error, 400);
+  }
+
+  return passThrough(
+    await callUserStore(c.env, c.get('user').email, '/notify-preference', {
+      notifyOnReveal: body.value.notifyOnReveal,
+    }),
+  );
 });
 
 /* ---------- sessions and the password ---------- */
